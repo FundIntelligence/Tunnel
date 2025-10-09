@@ -1,0 +1,49 @@
+# ==========================================
+# FundIQ MVP - Environment Variables Template
+# ==========================================
+#
+# INSTRUCTIONS:
+# 1. Copy this file's content into a new file named `.env.local` in the FundIQ directory
+# 2. Copy this file's content into a new file named `.env` in the backend directory
+# 3. Replace all placeholder values with your actual Supabase credentials
+# 4. NEVER commit these files to version control
+#
+# ==========================================
+
+# ==========================================
+# FRONTEND (.env.local)
+# ==========================================
+# Create a file named `.env.local` in the FundIQ root directory with:
+
+NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-public-key-here
+NEXT_PUBLIC_PARSER_API_URL=http://localhost:8000
+
+# ==========================================
+# BACKEND (backend/.env)
+# ==========================================
+# Create a file named `.env` in the backend directory with:
+
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key-here
+
+# ==========================================
+# WHERE TO FIND THESE VALUES
+# ==========================================
+#
+# 1. Log into your Supabase dashboard: https://supabase.com/dashboard
+# 2. Select your project
+# 3. Go to Settings → API
+# 4. Copy:
+#    - Project URL → use for SUPABASE_URL and NEXT_PUBLIC_SUPABASE_URL
+#    - anon public key → use for NEXT_PUBLIC_SUPABASE_ANON_KEY
+#    - service_role key → use for SUPABASE_SERVICE_ROLE_KEY
+#
+# ⚠️  IMPORTANT:
+# - Keep service_role key SECRET (only use in backend)
+# - The anon key is safe to use in frontend
+# - Never commit .env files to Git
+#
+# ==========================================
+
+

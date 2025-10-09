@@ -1,0 +1,5 @@
+# Test sample files directory
+# Place test files here:
+# - test.pdf (optional) - for PDF parser testing
+# - test.xlsx (will be auto-generated if not present)
+

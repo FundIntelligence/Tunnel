@@ -1,0 +1,23 @@
+Date,Transaction Type,Description,Amount,Category,Account
+2024-01-01,Debit,Office Supplies - Staples,250.00,Office Expenses,Business Checking
+2024-01-05,Credit,Client Payment - ABC Corp,5000.00,Revenue,Business Checking
+2024-01-10,Debit,Software License - Adobe,99.00,Software,Business Credit
+2024-01-15,Credit,Investment Returns - Fund A,1250.00,Investment Income,Investment Account
+2024-01-18,Debit,Professional Services - Legal,850.00,Professional Fees,Business Checking
+2024-01-22,Debit,Marketing - Google Ads,450.00,Marketing,Business Credit
+2024-01-25,Credit,Client Payment - XYZ Inc,7500.00,Revenue,Business Checking
+2024-01-28,Debit,Travel - Conference,1200.00,Travel & Entertainment,Business Credit
+2024-02-01,Debit,Rent - Office Space,3000.00,Rent,Business Checking
+2024-02-05,Credit,Consulting Services - Project B,4500.00,Revenue,Business Checking
+2024-02-08,Debit,Equipment Purchase - Laptop,2100.00,Equipment,Business Credit
+2024-02-12,Debit,Utilities - Internet & Phone,180.00,Utilities,Business Checking
+2024-02-15,Credit,Interest Income,45.50,Interest,Business Savings
+2024-02-18,Debit,Insurance - Business Liability,550.00,Insurance,Business Checking
+2024-02-22,Credit,Client Payment - DEF Ltd,6200.00,Revenue,Business Checking
+2024-02-25,Debit,Payroll - February,15000.00,Payroll,Business Checking
+2024-02-28,Debit,Accounting Services,400.00,Professional Fees,Business Checking
+2024-03-01,Debit,Office Supplies - General,175.00,Office Expenses,Business Checking
+2024-03-05,Credit,Product Sales - Q1,12500.00,Revenue,Business Checking
+2024-03-10,Debit,Cloud Services - AWS,320.00,Software,Business Credit
+
+
