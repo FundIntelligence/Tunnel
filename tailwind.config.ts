@@ -21,6 +21,14 @@ const config: Config = {
           800: '#075985',
           900: '#0c4a6e',
         },
+        dark: {
+          bg: '#0D0F12',
+          card: '#1B1E23',
+          cardHover: '#23272E',
+        },
+      },
+      backgroundImage: {
+        'gradient-cyan-green': 'linear-gradient(to right, #22d3ee, #4ade80)',
       },
     },
   },

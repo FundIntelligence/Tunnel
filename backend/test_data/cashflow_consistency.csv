@@ -1,0 +1,5 @@
+Date,Balance,Transaction,Description
+2024-01-01,100000,20000,Deposit
+2024-01-02,120000,-5000,Withdrawal
+2024-01-03,115000,0,None
+2024-01-04,200000,85000,Transfer

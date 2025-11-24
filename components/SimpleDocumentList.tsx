@@ -33,7 +33,8 @@ export default function SimpleDocumentList({ refreshTrigger }: SimpleDocumentLis
   const fetchDocuments = async () => {
     try {
       setLoading(true);
-      const response = await fetch('http://localhost:8002/documents');
+      const API_BASE = process.env.NEXT_PUBLIC_PARSER_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${API_BASE}/documents`);
       if (response.ok) {
         const data = await response.json();
         setDocuments(data);
@@ -48,7 +49,8 @@ export default function SimpleDocumentList({ refreshTrigger }: SimpleDocumentLis
   // Fetch extracted rows for a document
   const fetchExtractedRows = async (documentId: number) => {
     try {
-      const response = await fetch(`http://localhost:8002/documents/${documentId}/rows`);
+      const API_BASE = process.env.NEXT_PUBLIC_PARSER_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${API_BASE}/document/${documentId}/rows`);
       if (response.ok) {
         const data = await response.json();
         setExtractedRows(data);
@@ -61,7 +63,8 @@ export default function SimpleDocumentList({ refreshTrigger }: SimpleDocumentLis
   // Delete a document
   const deleteDocument = async (documentId: number) => {
     try {
-      const response = await fetch(`http://localhost:8002/documents/${documentId}`, {
+      const API_BASE = process.env.NEXT_PUBLIC_PARSER_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${API_BASE}/document/${documentId}`, {
         method: 'DELETE'
       });
       if (response.ok) {

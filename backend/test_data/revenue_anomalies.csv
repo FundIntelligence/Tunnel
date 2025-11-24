@@ -1,0 +1,21 @@
+account,date,amount
+Acme Corp,2024-01-01,10000
+Acme Corp,2024-02-01,12000
+Acme Corp,2024-03-01,35000
+Acme Corp,2024-04-01,11000
+Acme Corp,2024-05-01,13000
+Widgets Inc,2024-01-01,5000
+Widgets Inc,2024-02-01,-500
+Widgets Inc,2024-03-01,5500
+Widgets Inc,2024-04-01,0
+Widgets Inc,2024-05-01,6000
+Globex Ltd,2024-01-01,20000
+Globex Ltd,2024-02-01,22000
+Globex Ltd,2024-03-01,8000
+Globex Ltd,2024-04-01,21000
+Globex Ltd,2024-05-01,19000
+Startup Co,2024-01-01,1000
+Startup Co,2024-02-01,1200
+Startup Co,2024-03-01,50000
+Startup Co,2024-04-01,45000
+Startup Co,2024-05-01,48000

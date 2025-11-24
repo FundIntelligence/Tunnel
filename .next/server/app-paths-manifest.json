@@ -1,4 +1,6 @@
 {
-  "/page": "app/page.js",
-  "/simple-page/page": "app/simple-page/page.js"
+  "/connect-data/page": "app/connect-data/page.js",
+  "/reports/page": "app/reports/page.js",
+  "/rules/page": "app/rules/page.js",
+  "/companion/page": "app/companion/page.js"
 }

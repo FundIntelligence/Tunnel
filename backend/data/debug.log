@@ -1,0 +1,90 @@
+[2025-11-03 19:57:23] [INFO] [fundiq_debug] [2025-11-03 19:57:23] [INFO] [UPLOAD] File uploaded: Sample M-PESA Statement 12months.xlsx | {
+  "file_name": "Sample M-PESA Statement 12months.xlsx",
+  "file_type": "xlsx",
+  "file_size": 698330,
+  "document_id": "new"
+}
+[2025-11-03 19:57:24] [ERROR] [fundiq_debug] [2025-11-03 19:57:24] [ERROR] [PARSE] Error: Object of type datetime is not JSON serializable | {
+  "error_type": "TypeError",
+  "context": {
+    "filename": "Sample M-PESA Statement 12months.xlsx"
+  }
+}
+[2025-11-03 19:59:34] [INFO] [fundiq_debug] [2025-11-03 19:59:34] [INFO] [UPLOAD] File uploaded: M-PESA Statement Apr 23 2023 to Apr 23 2024.csv | {
+  "file_name": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv",
+  "file_type": "csv",
+  "file_size": 1006014,
+  "document_id": "new"
+}
+[2025-11-03 19:59:34] [ERROR] [fundiq_debug] [2025-11-03 19:59:34] [ERROR] [PARSE] Error: 'utf-8' codec can't decode byte 0xad in position 11: invalid start byte | {
+  "error_type": "UnicodeDecodeError",
+  "context": {
+    "filename": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv"
+  }
+}
+[2025-11-03 20:07:09] [INFO] [fundiq_debug] [2025-11-03 20:07:09] [INFO] [UPLOAD] File uploaded: Sample M-PESA Statement 12months.xlsx | {
+  "file_name": "Sample M-PESA Statement 12months.xlsx",
+  "file_type": "xlsx",
+  "file_size": 698330,
+  "document_id": "new"
+}
+[2025-11-03 21:18:20] [INFO] [fundiq_debug] [2025-11-03 21:18:20] [INFO] [UPLOAD] File uploaded: M-PESA Statement Apr 23 2023 to Apr 23 2024.csv | {
+  "file_name": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv",
+  "file_type": "csv",
+  "file_size": 1006014,
+  "document_id": "new"
+}
+[2025-11-03 21:18:20] [ERROR] [fundiq_debug] [2025-11-03 21:18:20] [ERROR] [PARSE] Error: Failed to parse CSV with any supported encoding | {
+  "error_type": "ValueError",
+  "context": {
+    "filename": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv"
+  }
+}
+[2025-11-03 21:32:20] [INFO] [fundiq_debug] [2025-11-03 21:32:20] [INFO] [UPLOAD] File uploaded: Sample M-PESA Statement 12months.xlsx | {
+  "file_name": "Sample M-PESA Statement 12months.xlsx",
+  "file_type": "xlsx",
+  "file_size": 698330,
+  "document_id": "new"
+}
+[2025-11-03 21:32:53] [INFO] [fundiq_debug] [2025-11-03 21:32:53] [INFO] [UPLOAD] File uploaded: M-PESA Statement Apr 23 2023 to Apr 23 2024.csv | {
+  "file_name": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv",
+  "file_type": "csv",
+  "file_size": 1006014,
+  "document_id": "new"
+}
+[2025-11-03 21:32:53] [ERROR] [fundiq_debug] [2025-11-03 21:32:53] [ERROR] [PARSE] Error: Failed to parse CSV with any supported encoding | {
+  "error_type": "ValueError",
+  "context": {
+    "filename": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv"
+  }
+}
+[2025-11-03 23:37:59] [INFO] [fundiq_debug] [2025-11-03 23:37:59] [INFO] [UPLOAD] File uploaded: Sample M-PESA Statement 12months.xlsx | {
+  "file_name": "Sample M-PESA Statement 12months.xlsx",
+  "file_type": "xlsx",
+  "file_size": 698330,
+  "document_id": "new"
+}
+[2025-11-04 00:02:08] [INFO] [fundiq_debug] [2025-11-04 00:02:08] [INFO] [UPLOAD] File uploaded: M-PESA Statement Apr 23 2023 to Apr 23 2024.csv | {
+  "file_name": "M-PESA Statement Apr 23 2023 to Apr 23 2024.csv",
+  "file_type": "csv",
+  "file_size": 1006014,
+  "document_id": "new"
+}
+[2025-11-04 15:28:32] [INFO] [fundiq_debug] [2025-11-04 15:28:32] [INFO] [UPLOAD] File uploaded: Sample M-PESA Statement 12months.xlsx | {
+  "file_name": "Sample M-PESA Statement 12months.xlsx",
+  "file_type": "xlsx",
+  "file_size": 698330,
+  "document_id": "new"
+}
+[2025-11-19 19:42:05] [INFO] [fundiq_debug] [2025-11-19 19:42:05] [INFO] [UPLOAD] File uploaded: Statement_All_Transactions_20241101_20250501.pdf | {
+  "file_name": "Statement_All_Transactions_20241101_20250501.pdf",
+  "file_type": "pdf",
+  "file_size": 117094,
+  "document_id": "new"
+}
+[2025-11-19 19:42:51] [INFO] [fundiq_debug] [2025-11-19 19:42:51] [INFO] [UPLOAD] File uploaded: Statement_All_Transactions_20250301_20250901.pdf | {
+  "file_name": "Statement_All_Transactions_20250301_20250901.pdf",
+  "file_type": "pdf",
+  "file_size": 109142,
+  "document_id": "new"
+}

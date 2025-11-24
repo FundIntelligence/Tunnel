@@ -1,0 +1,82 @@
+{
+  "rows": [
+    {
+      "period": "2024-01",
+      "revenue": 125000,
+      "expenses": 85000,
+      "category": "Operations",
+      "cash_balance": 450000,
+      "payroll": 45000
+    },
+    {
+      "period": "2024-02",
+      "revenue": 142000,
+      "expenses": 92000,
+      "category": "Operations",
+      "cash_balance": 493000,
+      "payroll": 47000
+    },
+    {
+      "period": "2024-03",
+      "revenue": 158000,
+      "expenses": 98000,
+      "category": "Operations",
+      "cash_balance": 553000,
+      "payroll": 48000
+    },
+    {
+      "period": "2024-04",
+      "revenue": 172000,
+      "expenses": 105000,
+      "category": "Growth",
+      "cash_balance": 620000,
+      "payroll": 52000
+    },
+    {
+      "period": "2024-05",
+      "revenue": 168000,
+      "expenses": 102000,
+      "category": "Growth",
+      "cash_balance": 686000,
+      "payroll": 51000
+    },
+    {
+      "period": "2024-06",
+      "revenue": 185000,
+      "expenses": 112000,
+      "category": "Growth",
+      "cash_balance": 759000,
+      "payroll": 54000
+    }
+  ],
+  "metrics": {
+    "avgRevenue": 158333,
+    "avgExpenses": 99917,
+    "growthRate": 12.5,
+    "stabilityScore": 82,
+    "expenseRatio": 63.1
+  },
+  "sampleCategories": [
+    {
+      "name": "Sales & Marketing",
+      "expenses": 35000,
+      "percentage": 35
+    },
+    {
+      "name": "Operations",
+      "expenses": 28000,
+      "percentage": 28
+    },
+    {
+      "name": "Research & Development",
+      "expenses": 22000,
+      "percentage": 22
+    },
+    {
+      "name": "Administration",
+      "expenses": 15000,
+      "percentage": 15
+    }
+  ]
+}
+

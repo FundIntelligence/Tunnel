@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { FileText, Trash2, Download, Eye, AlertCircle, CheckCircle, Clock, Loader2 } from 'lucide-react';
+import { FileText, Trash2, Download, Eye, AlertCircle, CheckCircle, Clock, Loader2, X, RefreshCw } from 'lucide-react';
 import { getDocuments, deleteDocument, Document } from '@/lib/supabase';
 import { format } from 'date-fns';
 
@@ -54,9 +54,14 @@ export default function DocumentList({ userId, onViewDocument, refreshTrigger }:
 
     try {
       await deleteDocument(documentId);
+      // Remove from local state immediately
       setDocuments(prev => prev.filter(doc => doc.id !== documentId));
+      // Optionally refresh the list
+      loadDocuments();
     } catch (err: any) {
-      alert(`Failed to delete document: ${err.message}`);
+      console.error('Delete error:', err);
+      const errorMessage = err.message || 'Failed to delete document. Please try again.';
+      alert(`Failed to delete document: ${errorMessage}`);
     }
   };
 
@@ -89,59 +94,59 @@ export default function DocumentList({ userId, onViewDocument, refreshTrigger }:
   const getStatusColor = (status: Document['status']) => {
     switch (status) {
       case 'uploaded':
-        return 'text-gray-600 bg-gray-100';
+        return 'text-gray-400 bg-gray-800';
       case 'processing':
-        return 'text-yellow-700 bg-yellow-100';
+        return 'text-yellow-400 bg-yellow-900/20';
       case 'completed':
-        return 'text-green-700 bg-green-100';
+        return 'text-green-400 bg-green-900/20';
       case 'failed':
-        return 'text-red-700 bg-red-100';
+        return 'text-red-400 bg-red-900/20';
     }
   };
 
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 text-primary-500 animate-spin" />
+        <Loader2 className="h-8 w-8 text-cyan-400 animate-spin" />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-        <p className="text-red-700">{error}</p>
+      <div className="bg-red-900/20 border border-red-800 rounded-lg p-4">
+        <p className="text-red-400">{error}</p>
       </div>
     );
   }
 
   if (documents.length === 0) {
     return (
-      <div className="text-center py-12 bg-gray-50 rounded-lg border-2 border-dashed border-gray-300">
-        <FileText className="mx-auto h-12 w-12 text-gray-400 mb-4" />
-        <p className="text-gray-600">No documents uploaded yet</p>
-        <p className="text-sm text-gray-500 mt-2">Upload your first document to get started</p>
+      <div className="text-center py-12 bg-[#1B1E23] rounded-lg border-2 border-dashed border-gray-700">
+        <FileText className="mx-auto h-12 w-12 text-gray-500 mb-4" />
+        <p className="text-gray-300">No documents uploaded yet</p>
+        <p className="text-sm text-gray-400 mt-2">Upload your first document to get started</p>
       </div>
     );
   }
 
   return (
     <div className="space-y-3">
-      <h2 className="text-lg font-semibold text-gray-800 mb-4">Your Documents</h2>
+      <h2 className="text-lg font-semibold text-gray-200 mb-4">Your Documents</h2>
       
       {documents.map((document) => (
         <div
           key={document.id}
-          className="bg-white border border-gray-200 rounded-lg p-4 hover:shadow-md transition-shadow"
+          className="bg-[#1B1E23] border border-gray-700 rounded-lg p-4 hover:bg-[#23272E] transition-colors"
         >
           <div className="flex items-start justify-between">
             <div className="flex items-start space-x-3 flex-1">
               <FileText className="h-6 w-6 text-gray-400 mt-1" />
               
               <div className="flex-1">
-                <h3 className="font-medium text-gray-900">{document.file_name}</h3>
+                <h3 className="font-medium text-white">{document.file_name}</h3>
                 
-                <div className="flex items-center space-x-4 mt-2 text-sm text-gray-500">
+                <div className="flex items-center space-x-4 mt-2 text-sm text-gray-400">
                   <span className="uppercase">{document.file_type}</span>
                   <span>•</span>
                   <span>{format(new Date(document.upload_date), 'MMM d, yyyy h:mm a')}</span>
@@ -160,14 +165,14 @@ export default function DocumentList({ userId, onViewDocument, refreshTrigger }:
                   </div>
                   
                   {document.format_detected && (
-                    <span className="text-xs text-gray-500">
+                    <span className="text-xs text-gray-400">
                       Format: {document.format_detected}
                     </span>
                   )}
                 </div>
 
                 {document.status === 'failed' && document.error_message && (
-                  <div className="mt-2 text-xs text-red-600 bg-red-50 p-2 rounded">
+                  <div className="mt-2 text-xs text-red-400 bg-red-900/20 border border-red-800 p-2 rounded">
                     {document.error_message}
                   </div>
                 )}
@@ -176,19 +181,82 @@ export default function DocumentList({ userId, onViewDocument, refreshTrigger }:
 
             {/* Actions */}
             <div className="flex items-center space-x-2 ml-4">
-              {document.status === 'completed' && (
+              {/* View button - show for completed files or files with data */}
+              {(document.status === 'completed' || document.rows_count > 0) && (
                 <button
                   onClick={() => onViewDocument(document)}
-                  className="p-2 text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
+                  className="p-2 text-cyan-400 hover:bg-cyan-400/10 rounded-lg transition-colors"
                   title="View Data"
                 >
                   <Eye className="h-5 w-5" />
                 </button>
               )}
               
+              {/* Cancel button - show for processing files */}
+              {document.status === 'processing' && (
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (confirm(`Cancel processing for "${document.file_name}"?`)) {
+                      try {
+                        const API_BASE = process.env.NEXT_PUBLIC_PARSER_API_URL || 'http://localhost:8000';
+                        const response = await fetch(`${API_BASE}/document/${document.id}/cancel`, {
+                          method: 'POST'
+                        });
+                        if (response.ok) {
+                          loadDocuments(); // Refresh list
+                        } else {
+                          alert('Failed to cancel processing');
+                        }
+                      } catch (err: any) {
+                        console.error('Failed to cancel:', err);
+                        alert(`Failed to cancel: ${err.message}`);
+                      }
+                    }
+                  }}
+                  className="p-2 text-orange-400 hover:bg-orange-400/10 rounded-lg transition-colors"
+                  title="Cancel Processing"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              )}
+              
+              {/* Retry button - show for failed files */}
+              {document.status === 'failed' && (
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (confirm(`Retry processing for "${document.file_name}"?`)) {
+                      try {
+                        const API_BASE = process.env.NEXT_PUBLIC_PARSER_API_URL || 'http://localhost:8000';
+                        const response = await fetch(`${API_BASE}/document/${document.id}/retry`, {
+                          method: 'POST'
+                        });
+                        if (response.ok) {
+                          loadDocuments(); // Refresh list
+                        } else {
+                          alert('Failed to retry processing');
+                        }
+                      } catch (err: any) {
+                        console.error('Failed to retry:', err);
+                        alert(`Failed to retry: ${err.message}`);
+                      }
+                    }
+                  }}
+                  className="p-2 text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors"
+                  title="Retry Processing"
+                >
+                  <RefreshCw className="h-5 w-5" />
+                </button>
+              )}
+              
+              {/* Delete button - always visible */}
               <button
-                onClick={() => handleDelete(document.id, document.file_name)}
-                className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation(); // Prevent event bubbling
+                  handleDelete(document.id, document.file_name);
+                }}
+                className="p-2 text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
                 title="Delete"
               >
                 <Trash2 className="h-5 w-5" />

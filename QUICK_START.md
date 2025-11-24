@@ -246,3 +246,4 @@ lsof -ti:3000,3001,8000,8001,8002 | xargs kill -9
 
 **🎉 You're all set! The MVP is production-ready!** 🚀
 
+
