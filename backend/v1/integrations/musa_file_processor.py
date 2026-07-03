@@ -16,12 +16,13 @@ Design notes
 """
 
 import asyncio
+import json
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -43,6 +44,95 @@ from .currency_utils import country_to_currency
 logger = logging.getLogger(__name__)
 
 _ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".pdf"}
+
+# Maintained display list of bank statement formats Parity can currently parse.
+# Surfaced back to Musa in the NO_TRANSACTIONS_PARSED diagnostic so submitters
+# know what to re-upload. Keep in sync with parity-ingestion parser coverage.
+SUPPORTED_BANK_FORMATS = [
+    "KCB", "Equity", "Co-operative Bank", "ABSA", "Stanbic", "M-Pesa", "SCB",
+]
+
+
+class MusaNoTransactionsError(Exception):
+    """
+    Raised when a Musa session ingested zero transactions.
+
+    Carries a structured diagnostic payload (per-document breakdown, likely
+    causes, supported formats) so the admin dashboard and Musa webhook get an
+    actionable explanation instead of a bare "ingestion may have failed".
+    """
+
+    def __init__(self, structured: Dict):
+        self.structured = structured
+        super().__init__(structured.get("message", "No transactions parsed"))
+
+
+def _classify_parse_status(doc_result: Dict) -> str:
+    """Map a per-document ingestion outcome to a coarse parse status."""
+    status = (doc_result.get("status") or "").lower()
+    next_action = doc_result.get("next_action") or ""
+    rows_parsed = doc_result.get("rows_parsed") or 0
+    if status == "completed":
+        return "PARSED" if rows_parsed > 0 else "PARSED_NO_ROWS"
+    if status == "failed":
+        if next_action == "request_parser":
+            return "UNSUPPORTED_FORMAT"
+        if next_action == "fix_csv_header":
+            return "BAD_SCHEMA"
+        return "PARSE_ERROR"
+    return "UNKNOWN"
+
+
+def _build_no_transactions_error(deal_id: str, doc_results: List[Dict]) -> Dict:
+    """
+    Build the structured NO_TRANSACTIONS_PARSED diagnostic from the per-document
+    ingestion outcomes captured during the Musa processing loop.
+    """
+    breakdown = []
+    for d in doc_results:
+        breakdown.append({
+            "filename": d.get("filename") or "unknown",
+            "file_type": d.get("file_type") or "unknown",
+            "parse_status": _classify_parse_status(d),
+            "detail": d.get("detail"),
+        })
+
+    unsupported = [d for d in breakdown if d["parse_status"] == "UNSUPPORTED_FORMAT"]
+    errored = [d for d in breakdown if d["parse_status"] in ("PARSE_ERROR", "BAD_SCHEMA")]
+    empty = [d for d in breakdown if d["parse_status"] == "PARSED_NO_ROWS"]
+
+    likely_causes: List[str] = []
+    if unsupported:
+        likely_causes.append(
+            f"{len(unsupported)} document(s) matched no available bank-statement parser "
+            f"(e.g. TBC Bank): " + ", ".join(d["filename"] for d in unsupported)
+        )
+    if errored:
+        likely_causes.append(
+            f"{len(errored)} document(s) could not be parsed as bank statements — they may be "
+            f"non-statement files (MOUs, audited accounts, business plans): "
+            + ", ".join(d["filename"] for d in errored)
+        )
+    if empty:
+        likely_causes.append(
+            f"{len(empty)} document(s) parsed but contained no transaction rows: "
+            + ", ".join(d["filename"] for d in empty)
+        )
+
+    return {
+        "error": "NO_TRANSACTIONS_PARSED",
+        "message": (
+            f"No transactions were extracted from the {len(doc_results)} submitted "
+            f"document(s) for deal {deal_id}."
+        ),
+        "documents_submitted": len(doc_results),
+        "breakdown": breakdown,
+        "likely_causes": likely_causes,
+        "action_required": (
+            "Resubmit with supported bank statement PDFs only. See supported_formats."
+        ),
+        "supported_formats": SUPPORTED_BANK_FORMATS,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +367,10 @@ async def process_musa_session(
         analysis_repo=AnalysisRunsRepo(),
     )
 
+    # Per-document ingestion outcomes, used to build an actionable diagnostic
+    # if the pipeline ends up with zero transactions.
+    doc_results: List[dict] = []
+
     try:
         for i, doc in enumerate(documents):
             url = doc.get("url", "") if isinstance(doc, dict) else getattr(doc, "url", "")
@@ -316,6 +410,8 @@ async def process_musa_session(
             # Run synchronously in the async context — blocks coroutine but
             # acceptable for background tasks.  Use asyncio.to_thread() here
             # once we validate the full pipeline end-to-end.
+            # process_document_background never raises — it records the outcome
+            # (status / error taxonomy / analytics) on the pds_documents row.
             await asyncio.to_thread(
                 ingestion_svc.process_document_background,
                 document_id=document_id,
@@ -327,9 +423,41 @@ async def process_musa_session(
                 deal_currency=deal_currency,
             )
 
+            # Read back the per-document outcome to build a diagnostic if the
+            # session ultimately yields zero transactions.
+            try:
+                doc_row = docs_repo.get_document(document_id) or {}
+            except Exception:
+                doc_row = {}
+            _analytics = doc_row.get("analytics") if isinstance(doc_row.get("analytics"), dict) else {}
+            _rows_parsed = (_analytics or {}).get("rows_parsed", 0)
+            doc_results.append({
+                "filename": file_name,
+                "file_type": file_type,
+                "status": doc_row.get("status") or "unknown",
+                "next_action": doc_row.get("next_action"),
+                "error_type": doc_row.get("error_type"),
+                "detail": doc_row.get("error_message"),
+                "rows_parsed": _rows_parsed,
+            })
+            logger.info(
+                "[MUSA] doc result session=%s file=%s status=%s next_action=%s rows=%s",
+                session_id, file_name, doc_row.get("status"),
+                doc_row.get("next_action"), _rows_parsed,
+            )
+
         # Run deterministic pipeline + build snapshot
         logger.info("[MUSA] Running export pipeline deal=%s session=%s", deal_id, session_id)
-        await asyncio.to_thread(_run_export, deal_id, service_uuid)
+        try:
+            await asyncio.to_thread(_run_export, deal_id, service_uuid)
+        except ValueError as exc:
+            # Turn the opaque "No transactions ..." failure into a structured,
+            # actionable diagnostic keyed on what each document actually did.
+            if "no transactions" in str(exc).lower():
+                raise MusaNoTransactionsError(
+                    _build_no_transactions_error(deal_id, doc_results)
+                ) from exc
+            raise
 
         # Mark session complete
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -358,7 +486,11 @@ async def process_musa_session(
 
         # Map common errors to friendly messages
         error_str = str(exc).lower()
-        if "name or service not known" in error_str or "failed to resolve" in error_str:
+        if isinstance(exc, MusaNoTransactionsError):
+            # Persist the structured diagnostic as JSON so the admin dashboard
+            # can render a readable per-document breakdown.
+            error_message = json.dumps(exc.structured)
+        elif "name or service not known" in error_str or "failed to resolve" in error_str:
             error_message = "Failed to download document: URL unreachable or invalid"
         elif "timeout" in error_str or "timed out" in error_str:
             error_message = "Failed to download document: Request timed out"
@@ -368,7 +500,7 @@ async def process_musa_session(
             # For unexpected errors, still include the original for debugging
             error_message = f"Processing failed: {exc}"
 
-        if "no transactions" in error_str or "unsupported" in error_str:
+        if isinstance(exc, MusaNoTransactionsError) or "no transactions" in error_str or "unsupported" in error_str:
             try:
                 _doc_url = documents[0].get("url") if documents else None
                 get_supabase().table("parser_requests").insert({

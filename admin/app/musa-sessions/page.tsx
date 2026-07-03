@@ -27,6 +27,112 @@ function documentUrlList(document_urls: unknown): string[] {
   )
 }
 
+interface DocBreakdownItem {
+  filename?: string
+  file_type?: string
+  parse_status?: string
+  detail?: string | null
+}
+
+interface StructuredSessionError {
+  error?: string
+  message?: string
+  documents_submitted?: number
+  breakdown?: DocBreakdownItem[]
+  likely_causes?: string[]
+  action_required?: string
+  supported_formats?: string[]
+}
+
+// Newer sessions store a structured JSON diagnostic in error_message; older
+// sessions store a plain string. Return the parsed object only when it looks
+// like our diagnostic, otherwise null so callers fall back to the raw string.
+function parseSessionError(raw: string): StructuredSessionError | null {
+  try {
+    const parsed = JSON.parse(raw)
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      (parsed.breakdown || parsed.likely_causes || parsed.error)
+    ) {
+      return parsed as StructuredSessionError
+    }
+  } catch {
+    // not JSON — legacy plain-string error
+  }
+  return null
+}
+
+const PARSE_STATUS_LABEL: Record<string, string> = {
+  UNSUPPORTED_FORMAT: 'unsupported bank — no parser',
+  PARSE_ERROR: 'not a bank statement',
+  BAD_SCHEMA: 'unreadable / bad format',
+  PARSED_NO_ROWS: 'parsed, no transactions',
+  PARSED: 'parsed OK',
+  UNKNOWN: 'unknown',
+}
+
+function SessionError({ raw }: { raw: string }) {
+  const structured = parseSessionError(raw)
+  if (!structured) {
+    // Legacy plain-string error — render as-is.
+    return <div style={{ color: 'var(--red)', whiteSpace: 'pre-wrap' }}>{raw}</div>
+  }
+
+  const mono = "'IBM Plex Mono', monospace"
+  return (
+    <div style={{ color: 'var(--t0)', fontSize: 13, lineHeight: 1.5 }}>
+      {structured.error && (
+        <div style={{ color: 'var(--red)', fontFamily: mono, fontSize: 12, letterSpacing: '0.04em', marginBottom: 6 }}>
+          {structured.error.replace(/_/g, ' ')}
+        </div>
+      )}
+      {structured.message && <div style={{ marginBottom: 8 }}>{structured.message}</div>}
+
+      {Array.isArray(structured.breakdown) && structured.breakdown.length > 0 && (
+        <ul style={{ margin: '0 0 8px', paddingLeft: 18 }}>
+          {structured.breakdown.map((d, i) => (
+            <li key={i} style={{ marginBottom: 2 }}>
+              <span style={{ fontFamily: mono, fontSize: 12 }}>{d.filename || 'unknown'}</span>
+              {' — '}
+              <span style={{ color: 'var(--t2)' }}>
+                {PARSE_STATUS_LABEL[d.parse_status || 'UNKNOWN'] || d.parse_status}
+              </span>
+              {d.detail && <span style={{ color: 'var(--t3)' }}>{` (${d.detail})`}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {Array.isArray(structured.likely_causes) && structured.likely_causes.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ color: 'var(--t2)', fontFamily: mono, fontSize: 11, letterSpacing: '0.06em', marginBottom: 2 }}>
+            LIKELY CAUSES
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {structured.likely_causes.map((c, i) => (
+              <li key={i}>{c}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {structured.action_required && (
+        <div style={{ marginBottom: 4 }}>
+          <span style={{ color: 'var(--t2)', fontFamily: mono, fontSize: 11, letterSpacing: '0.06em' }}>ACTION: </span>
+          <span>{structured.action_required}</span>
+        </div>
+      )}
+
+      {Array.isArray(structured.supported_formats) && structured.supported_formats.length > 0 && (
+        <div style={{ color: 'var(--t2)', fontSize: 12 }}>
+          Supported formats: {structured.supported_formats.join(', ')}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function MusaSessionsPage() {
   const [rows, setRows] = useState<MusaSession[]>([])
   const [loading, setLoading] = useState(true)
@@ -282,7 +388,7 @@ export default function MusaSessionsPage() {
                                     <div style={{ color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: '0.06em' }}>
                                       ERROR
                                     </div>
-                                    <div style={{ color: 'var(--red)', whiteSpace: 'pre-wrap' }}>{row.error_message}</div>
+                                    <SessionError raw={row.error_message} />
                                   </>
                                 )}
 

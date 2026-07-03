@@ -601,12 +601,14 @@ def generate_pdf(
     canonical: Dict[str, Any],
     snapshot_meta: Optional[Dict[str, Any]] = None,
     enrichment: Optional[Dict[str, Any]] = None,
+    account_coverage: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """
     Generate Parity snapshot PDF.
 
-    canonical      — output of json.loads(decompress_canonical_json_if_needed(stored_cj))
-    snapshot_meta  — optional dict with id / sha256_hash / financial_state_hash from snapshot row
+    canonical        — output of json.loads(decompress_canonical_json_if_needed(stored_cj))
+    snapshot_meta    — optional dict with id / sha256_hash / financial_state_hash from snapshot row
+    account_coverage — optional list of pds_account_coverage rows for this deal
 
     Returns raw PDF bytes.
     """
@@ -901,6 +903,20 @@ def generate_pdf(
         story.append(_p(f"<b>{label}</b> {value}", _S_SMALL))
         story.append(Spacer(1, 3))
     story.append(Spacer(1, 12))
+
+    # ── 12  ACCOUNT COVERAGE (conditional) ────────────────────────────────────
+    if account_coverage:
+        story += _section_header(f"12  ACCOUNT COVERAGE ({len(account_coverage)})")
+        ac_rows = [["Bank", "Declared Balance", "Status", "Materiality"]]
+        for a in account_coverage:
+            ac_rows.append([
+                _trunc(a.get("declared_bank_name") or "—", 32),
+                _fmt_cents(a.get("declared_balance_cents") or 0, currency),
+                "SUBMITTED" if a.get("is_submitted") else "MISSING",
+                a.get("materiality_tier") or "—",
+            ])
+        story.append(_table(ac_rows, [180, 120, 90, 90], right_cols=[1]))
+        story.append(Spacer(1, 12))
 
     # ── SECTION B  ANALYST ENRICHMENT (optional) ──────────────────────────────
     if enrichment:
