@@ -849,7 +849,9 @@ function V1DealPageInner() {
           )}
 
           {/* ── PARITY REVIEW TAB ── Intelligence Console */}
-          {activeTab === 'review' && (
+          {/* Keep mounted at all times so ParityReviewChat never loses its state
+              (chat history, conversation context) when the user switches tabs. */}
+          <div style={{ display: activeTab === 'review' ? 'block' : 'none' }}>
             <ParityReviewTab
               deal={deal}
               entities={entities}
@@ -862,7 +864,7 @@ function V1DealPageInner() {
               onGoToQueue={() => setActiveTab('queue')}
               onGoToSnapshot={() => setActiveTab('snapshot')}
             />
-          )}
+          </div>
 
           {/* ── REVIEW QUEUE TAB ── Override / Reclassify */}
           {activeTab === 'queue' && (

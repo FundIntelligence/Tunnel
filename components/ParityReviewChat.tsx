@@ -51,7 +51,7 @@ function renderTable(rows: string[]): string {
   const bodyStart = sepIdx >= 0 ? sepIdx + 1 : (headerCells ? 1 : 0)
   const bodyRows = rows.slice(bodyStart).filter(r => !/^\|[\s\-:|]+\|$/.test(r))
 
-  const thStyle = 'padding:5px 10px;border:1px solid var(--b1);font-size:11px;font-weight:600;color:var(--accent);background:#0F172A;text-align:left;white-space:nowrap'
+  const thStyle = 'padding:5px 10px;border:1px solid var(--b1);font-size:11px;font-weight:600;color:var(--accent);text-align:left;white-space:nowrap'
   const tdStyle = 'padding:4px 10px;border:1px solid var(--b1);font-size:12px;color:var(--t1);white-space:nowrap'
 
   let html = '<table style="border-collapse:collapse;width:100%;margin:8px 0;font-family:\'IBM Plex Mono\',monospace">'
@@ -168,6 +168,7 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
     const storageKey = `parity_chat_${dealId}`
 
     // Try to load cached chat from localStorage first (fast restore when navigating between tabs)
+    let localHistoryLength = 0
     if (typeof window !== 'undefined') {
       try {
         const raw = localStorage.getItem(storageKey)
@@ -177,7 +178,7 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
             setChatHistory(parsed.chatHistory as ChatMessage[])
             setConversationHistory(parsed.conversationHistory ?? [])
             setProactiveTriggered(true) // don't re-trigger proactive since we have history
-            // Continue to try fetching server session and prefer server if it has data
+            localHistoryLength = parsed.chatHistory.length
           }
         }
       } catch (e) {
@@ -188,21 +189,31 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
     ;(async () => {
       try {
         const session = await getParityChatSession(dealId)
-        if (session.chat_history && session.chat_history.length > 0) {
-          // Prefer the server session if present (authoritative)
+        // The server saves chat_history BEFORE the parity response is appended (it only receives
+        // the request body which doesn't include the answer yet), so local storage is always at
+        // least as up-to-date. Only switch to the server version when it genuinely has more
+        // messages — i.e. when another session (different device/browser) built a longer history.
+        if (session.chat_history && session.chat_history.length > localHistoryLength) {
           setChatHistory(session.chat_history as ChatMessage[])
           setConversationHistory(session.conversation_history)
-          setProactiveTriggered(true)  // don't re-trigger proactive
-          // Persist authoritative server session locally so subsequent tab switches restore quickly
+          setProactiveTriggered(true)
           try { if (typeof window !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ chatHistory: session.chat_history, conversationHistory: session.conversation_history })) } catch (e) { /* ignore */ }
+          return
+        }
+        // Server has same or fewer messages — localStorage is more complete, keep it.
+        if (localHistoryLength > 0) {
+          setProactiveTriggered(true)
           return
         }
       } catch {
         // no server session — if we already loaded local data above, keep it; otherwise fall through to proactive
+        if (localHistoryLength > 0) {
+          setProactiveTriggered(true)
+          return
+        }
       }
 
-      // No existing session from server — if we didn't restore from localStorage above, trigger proactive analysis
-      // (if we did restore local, proactiveTriggered will already be true)
+      // No history anywhere — trigger proactive opening analysis
       setProactiveTriggered(true)
       doAsk('start')
     })()
