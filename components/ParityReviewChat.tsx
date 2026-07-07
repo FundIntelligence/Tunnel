@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback, memo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { askParityReview, getParityChatSession, clearParityChatSession } from '@/lib/v1-api'
 
 // ── Lightweight markdown → HTML ────────────────────────────────────────────
@@ -86,6 +87,14 @@ function mdToHtml(md: string): string {
 
 type ChatMessage = { role: 'analyst' | 'parity'; text: string; time: string }
 
+type ChatCache = {
+  chatHistory: ChatMessage[]
+  conversationHistory: Array<{ role: string; content: unknown }>
+  proactiveTriggered: boolean
+}
+
+const chatCacheKey = (id: string) => ['parity-chat', id] as const
+
 interface Props {
   dealId: string
   corpusReady: boolean
@@ -105,14 +114,18 @@ const SUGGESTION_CHIPS = [
 // ── Component ────────────────────────────────────────────────────────────────
 
 function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Props) {
+  const queryClient = useQueryClient()
+  const cached = queryClient.getQueryData<ChatCache>(chatCacheKey(dealId))
+
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
-  const [conversationHistory, setConversationHistory] = useState<Array<{ role: string; content: unknown }>>([])
-  const [proactiveTriggered, setProactiveTriggered] = useState(false)
-  const [sessionLoaded, setSessionLoaded] = useState(false)
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(cached?.chatHistory ?? [])
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: string; content: unknown }>>(cached?.conversationHistory ?? [])
+  const [proactiveTriggered, setProactiveTriggered] = useState(cached?.proactiveTriggered ?? false)
+  const [sessionLoaded, setSessionLoaded] = useState(cached != null)
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const prevDealIdRef = useRef(dealId)
 
   // Persisted analysis state (so reloading the Analysis tab doesn't force re-run)
   const [localCorpusReady, setLocalCorpusReady] = useState<boolean>(false)
@@ -154,6 +167,22 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
       } catch (e) { /* ignore */ }
     }
   }, [corpusReady, dealId, txnTotal, statementCount])
+
+  // Sync chat state to QueryClient cache so it survives full-page navigation
+  useEffect(() => {
+    queryClient.setQueryData(chatCacheKey(dealId), { chatHistory, conversationHistory, proactiveTriggered })
+  }, [dealId, chatHistory, conversationHistory, proactiveTriggered, queryClient])
+
+  // Handle dealId prop change: swap in state for the new deal from cache
+  useEffect(() => {
+    if (prevDealIdRef.current === dealId) return
+    prevDealIdRef.current = dealId
+    const next = queryClient.getQueryData<ChatCache>(chatCacheKey(dealId))
+    setChatHistory(next?.chatHistory ?? [])
+    setConversationHistory(next?.conversationHistory ?? [])
+    setProactiveTriggered(next?.proactiveTriggered ?? false)
+    setSessionLoaded(next != null)
+  }, [dealId, queryClient])
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -272,9 +301,9 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
     setConversationHistory([])
     setProactiveTriggered(false)
     setSessionLoaded(false)
-    // remove persisted local state
+    queryClient.removeQueries({ queryKey: chatCacheKey(dealId) })
     try { if (typeof window !== 'undefined') localStorage.removeItem(`parity_chat_${dealId}`) } catch (e) { /* ignore */ }
-  }, [dealId])
+  }, [dealId, queryClient])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doAsk() }
