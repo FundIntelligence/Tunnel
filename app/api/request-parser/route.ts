@@ -109,6 +109,32 @@ export async function POST(request: NextRequest) {
       ...(attachments.length > 0 ? { attachments } : {}),
     });
 
+    // ── Notify Slack (best-effort; never blocks or fails the request) ─────────
+    //    Same firing point as the Resend email above. Reads SLACK_PARSER_WEBHOOK_URL
+    //    (unset = no-op). The admin queue has no per-request route, so the link
+    //    points at the queue list page, not a guessed per-request URL.
+    const slackWebhook = process.env.SLACK_PARSER_WEBHOOK_URL;
+    if (slackWebhook) {
+      const adminBase = process.env.ADMIN_DASHBOARD_URL || 'https://parity-admin-three.vercel.app';
+      const slackText = [
+        `:wrench: *Parser Request${partnerTag}:* ${bankName}`,
+        accountType ? `• Account type: ${accountType}` : '',
+        country ? `• Country: ${country}` : '',
+        contactEmail ? `• Contact: ${contactEmail}` : '',
+        `• File: ${originalFilename || fileName || '—'}`,
+        `• <${adminBase}/parser-requests|Open the parser-request queue>`,
+      ].filter(Boolean).join('\n');
+      try {
+        await fetch(slackWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: slackText }),
+        });
+      } catch (slackErr) {
+        console.error('[api/request-parser] slack notify failed:', slackErr);
+      }
+    }
+
     // ── Send confirmation to requester (if email provided) ────────────────────
     if (contactEmail) {
       await resend.emails.send({
