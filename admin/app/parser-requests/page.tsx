@@ -6,8 +6,11 @@ import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
 import { toEAT, timeSince, refreshedLabel, downloadCSV } from './utils'
 
-type Status = 'pending' | 'in_progress' | 'done'
+type Status = 'pending' | 'in_progress' | 'done' | 'new' | 'processing' | 'processed'
+// Auto (parser_requests) and manual (pds_parser_requests) rows use different
+// status vocabularies. Cycle each within its own set.
 const STATUS_CYCLE: Status[] = ['pending', 'in_progress', 'done']
+const MANUAL_STATUS_CYCLE: Status[] = ['new', 'processing', 'processed']
 
 // Raw shape from `parser_requests` ("auto" / Musa table)
 interface AutoRequest {
@@ -52,6 +55,7 @@ interface Row {
   status: Status | null
   date: string
   isAuto: boolean
+  storage_path: string | null
   [key: string]: unknown
 }
 
@@ -59,9 +63,10 @@ type ApiResponse =
   | AutoRequest[]
   | { auto: AutoRequest[]; manual: ManualRequest[]; env?: string; fetched_at?: string }
 
-function nextStatus(current: Status): Status {
-  const idx = STATUS_CYCLE.indexOf(current)
-  return STATUS_CYCLE[(idx + 1) % STATUS_CYCLE.length]
+function nextStatus(current: Status, isAuto: boolean): Status {
+  const cycle = isAuto ? STATUS_CYCLE : MANUAL_STATUS_CYCLE
+  const idx = cycle.indexOf(current)
+  return cycle[(idx + 1) % cycle.length]
 }
 
 function normalize(data: ApiResponse): Row[] {
@@ -85,6 +90,7 @@ function normalize(data: ApiResponse): Row[] {
     status: r.status,
     date: r.requested_at,
     isAuto: true,
+    storage_path: null,
   }))
 
   const manualRows: Row[] = manual.map((r) => ({
@@ -94,9 +100,10 @@ function normalize(data: ApiResponse): Row[] {
     market: r.country ?? '—',
     bank_display: r.bank_name ?? r.original_filename ?? '—',
     error_message: r.error_message ?? null,
-    status: null,
+    status: ((r.status as Status) ?? 'new'),
     date: r.created_at,
     isAuto: false,
+    storage_path: (r.storage_path as string | null) ?? null,
   }))
 
   return [...autoRows, ...manualRows].sort((a, b) => {
@@ -159,16 +166,32 @@ export default function ParserRequestsPage() {
   }, [load])
 
   async function cycleStatus(row: Row) {
-    if (!row.isAuto || !row.status) return
-    const next = nextStatus(row.status)
+    if (!row.status) return
+    const next = nextStatus(row.status, row.isAuto)
+    const table = row.isAuto ? 'parser_requests' : 'pds_parser_requests'
     setUpdating(row.id)
     await fetch('/api/data/parser-requests', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: row.id, status: next }),
+      body: JSON.stringify({ id: row.id, status: next, table }),
     })
     setRows((prev) => prev.map((r) => r.id === row.id ? { ...r, status: next } : r))
     setUpdating(null)
+  }
+
+  // Resolve a private-bucket sample file to a short-lived signed URL and open it.
+  // Threads the current ?env= so staging rows resolve against the staging bucket.
+  async function downloadFile(row: Row) {
+    if (!row.storage_path) return
+    const env = typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('env')
+      : null
+    const qs = new URLSearchParams({ path: row.storage_path })
+    if (env === 'staging') qs.set('env', 'staging')
+    const res = await fetch(`/api/data/parser-requests/download?${qs.toString()}`)
+    if (!res.ok) return
+    const { url } = await res.json()
+    if (url) window.open(url, '_blank', 'noopener')
   }
 
   const filteredRows = useMemo(() => {
@@ -241,7 +264,7 @@ export default function ParserRequestsPage() {
       key: 'status',
       label: 'Status',
       render: (_, row) => {
-        if (!row.isAuto || !row.status) {
+        if (!row.status) {
           return <span style={{ color: 'var(--t3)' }}>—</span>
         }
         return (
@@ -252,6 +275,28 @@ export default function ParserRequestsPage() {
             title="Click to cycle status"
           >
             <StatusBadge status={row.status} />
+          </button>
+        )
+      },
+    },
+    {
+      key: 'file',
+      label: 'File',
+      render: (_, row) => {
+        if (!row.storage_path) {
+          return <span style={{ color: 'var(--t3)' }}>—</span>
+        }
+        return (
+          <button
+            onClick={(e) => { e.stopPropagation(); downloadFile(row) }}
+            style={{
+              background: 'none', border: '1px solid var(--teal)', cursor: 'pointer',
+              color: 'var(--teal)', borderRadius: 4, padding: '2px 8px',
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
+            }}
+            title="Download the submitted sample file"
+          >
+            ↓ file
           </button>
         )
       },
