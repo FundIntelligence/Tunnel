@@ -37,6 +37,7 @@ export async function POST(request: NextRequest) {
     let partner = '';
     let fileBuffer: ArrayBuffer | null = null;
     let fileName = '';
+    let fileType = '';
 
     // ── Parse body ────────────────────────────────────────────────────────────
     if (contentType.includes('multipart/form-data')) {
@@ -50,6 +51,7 @@ export async function POST(request: NextRequest) {
       if (sampleFile) {
         fileBuffer = await sampleFile.arrayBuffer();
         fileName = sampleFile.name;
+        fileType = sampleFile.type || '';
       }
     } else {
       // JSON
@@ -107,6 +109,32 @@ export async function POST(request: NextRequest) {
       ...(attachments.length > 0 ? { attachments } : {}),
     });
 
+    // ── Notify Slack (best-effort; never blocks or fails the request) ─────────
+    //    Same firing point as the Resend email above. Reads SLACK_PARSER_WEBHOOK_URL
+    //    (unset = no-op). The admin queue has no per-request route, so the link
+    //    points at the queue list page, not a guessed per-request URL.
+    const slackWebhook = process.env.SLACK_PARSER_WEBHOOK_URL;
+    if (slackWebhook) {
+      const adminBase = process.env.ADMIN_DASHBOARD_URL || 'https://parity-admin-three.vercel.app';
+      const slackText = [
+        `:wrench: *Parser Request${partnerTag}:* ${bankName}`,
+        accountType ? `• Account type: ${accountType}` : '',
+        country ? `• Country: ${country}` : '',
+        contactEmail ? `• Contact: ${contactEmail}` : '',
+        `• File: ${originalFilename || fileName || '—'}`,
+        `• <${adminBase}/parser-requests|Open the parser-request queue>`,
+      ].filter(Boolean).join('\n');
+      try {
+        await fetch(slackWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: slackText }),
+        });
+      } catch (slackErr) {
+        console.error('[api/request-parser] slack notify failed:', slackErr);
+      }
+    }
+
     // ── Send confirmation to requester (if email provided) ────────────────────
     if (contactEmail) {
       await resend.emails.send({
@@ -141,7 +169,39 @@ export async function POST(request: NextRequest) {
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         serviceRoleKey
       );
+
+      // Generate the row id up front so the stored object path and the DB row
+      // are deterministically linked (bucket path = <requestId>/<filename>).
+      const requestId = crypto.randomUUID();
+
+      // ── Persist the uploaded sample file to Storage ───────────────────────
+      // The Resend email above is no longer the only copy of the file. This is
+      // best-effort: a Storage hiccup must not fail the request or lose the DB
+      // row (the email attachment remains a fallback), so it is wrapped and
+      // storage_path stays null on failure.
+      let storagePath: string | null = null;
+      if (fileBuffer && fileName) {
+        const safeName = (originalFilename || fileName || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const objectPath = `${requestId}/${safeName}`;
+        try {
+          const { error: uploadError } = await supabase.storage
+            .from('parser-requests')
+            .upload(objectPath, Buffer.from(fileBuffer), {
+              contentType: fileType || 'application/octet-stream',
+              upsert: false,
+            });
+          if (uploadError) {
+            console.error('[api/request-parser] storage upload failed:', uploadError.message);
+          } else {
+            storagePath = objectPath;
+          }
+        } catch (storageErr) {
+          console.error('[api/request-parser] storage upload threw:', storageErr);
+        }
+      }
+
       await supabase.from('pds_parser_requests').insert({
+        id: requestId,
         bank_name: bankName,
         country: country || null,
         account_type: accountType || null,
@@ -149,6 +209,8 @@ export async function POST(request: NextRequest) {
         deal_id: dealId || null,
         document_id: documentId || null,
         original_filename: originalFilename || fileName || null,
+        storage_path: storagePath,
+        status: 'new',
       });
     }
 
