@@ -2,6 +2,7 @@ import { createServerClient } from '@supabase/ssr'
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { ALLOWED_EMAILS } from '@/lib/allowed-emails'
+import { isOntologyQaAllowed } from '@/lib/ontology-qa-access'
 
 export async function proxy(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request })
@@ -46,6 +47,14 @@ export async function proxy(request: NextRequest) {
   }
 
   if (isLoginPage) {
+    return NextResponse.redirect(new URL('/parser-requests', request.url))
+  }
+
+  const isOntologyQaPath = path.startsWith('/ontology-qa') || path.startsWith('/api/data/ontology-qa')
+  if (isOntologyQaPath && !isOntologyQaAllowed(email)) {
+    if (path.startsWith('/api/')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
     return NextResponse.redirect(new URL('/parser-requests', request.url))
   }
 
