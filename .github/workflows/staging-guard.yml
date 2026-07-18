@@ -9,7 +9,7 @@ name: Staging Guard
 
 on:
   pull_request:
-    branches: [staging]
+    branches: [paritystaging]
   workflow_dispatch:
 
 jobs:
