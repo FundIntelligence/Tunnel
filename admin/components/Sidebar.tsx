@@ -1,8 +1,11 @@
 'use client'
 
 import Link from 'next/link'
+import { useEffect, useState } from 'react'
 import { SignOutButton } from '@/components/SignOutButton'
 import { useEnv } from '@/app/providers'
+import { getSupabaseBrowser } from '@/lib/supabase-browser'
+import { isOntologyQaAllowed } from '@/lib/ontology-qa-access'
 
 const navItems = [
   { href: '/parser-requests', label: 'Parser Requests' },
@@ -13,6 +16,13 @@ const navItems = [
 
 export function Sidebar() {
   const { env, setEnv } = useEnv()
+  const [showOntologyQa, setShowOntologyQa] = useState(false)
+
+  useEffect(() => {
+    getSupabaseBrowser().auth.getUser().then(({ data: { user } }) => {
+      setShowOntologyQa(isOntologyQaAllowed(user?.email))
+    })
+  }, [])
 
   return (
     <aside style={{
@@ -53,6 +63,11 @@ export function Sidebar() {
             {item.label}
           </Link>
         ))}
+        {showOntologyQa && (
+          <Link href="/ontology-qa" className="nav-link">
+            Ontology QA
+          </Link>
+        )}
       </nav>
       <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
         <div style={{
