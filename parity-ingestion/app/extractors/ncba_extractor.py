@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # Date patterns (order matters — try most specific first)
 _DATE_PAT_DDMMYYYY = re.compile(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s")
@@ -46,11 +47,11 @@ def _normalize_header_cell(c: Optional[str]) -> str:
     return (c or "").replace("\n", " ").strip().upper()
 
 
-def detect_ncba(file_path: str) -> bool:
+def detect_ncba(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an NCBA Bank Kenya statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            header_text = (pdf.pages[0].extract_text() or "")[:_HEADER_SCAN_CHARS].upper()
+        with as_document(source) as doc:
+            header_text = doc.pages[0].text[:_HEADER_SCAN_CHARS].upper()
             has_ncba = (
                 "NCBA" in header_text
                 or ("NIC" in header_text and "CBA" in header_text)
@@ -60,7 +61,7 @@ def detect_ncba(file_path: str) -> bool:
 
             # Some NCBA templates render the brand as a logo image only —
             # fingerprint via the unique ruled-table header instead.
-            for page in pdf.pages[:2]:
+            for page in doc.pages[:2]:
                 for table in page.extract_tables():
                     if not table:
                         continue

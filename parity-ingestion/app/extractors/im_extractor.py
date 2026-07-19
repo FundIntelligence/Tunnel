@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
 from app.extractors.shared import _group_by_line
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # X-thresholds derived from real I&M Bank statement word positions.
 _DATE1_X_MAX = 130.0   # Transaction date
@@ -42,15 +43,11 @@ _DATE_PAT = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{4}$")
 _ROW_TOLERANCE = 5.0
 
 
-def detect_im(file_path: str) -> bool:
+def detect_im(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an I&M Bank statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:2]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
+        with as_document(source) as doc:
+            text = doc.text_upto(2)
             return "Description/Narration" in text and "Transaction reference" in text
     except Exception:
         return False

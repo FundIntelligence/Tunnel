@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
 from app.extractors.shared import _group_by_line
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # X-thresholds from Step 0 (measured from real file)
 _TXN_DATE_X_MAX = 95.0
@@ -64,14 +65,13 @@ def parse_kcb_date(s: str) -> Optional[str]:
         return None
 
 
-def detect_kcb(file_path: str) -> bool:
+def detect_kcb(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be a KCB account statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            if not pdf.pages:
+        with as_document(source) as doc:
+            if not doc.pages:
                 return False
-            text = pdf.pages[0].extract_text() or ""
-            text_upper = text.upper()
+            text_upper = doc.pages[0].text.upper()
             has_kcb = "KCB" in text_upper or "KCB BANK" in text_upper
             has_stmt = "ACCOUNT STATEMENT" in text_upper
             has_cols = "TXN DATE" in text_upper and "LEDGER BALANCE" in text_upper
@@ -239,17 +239,17 @@ _KCB_ONLINE_ROW_TOLERANCE = 3.5
 _KCB_ONLINE_DESC_ABOVE_MAX = 22.0
 
 
-def detect_kcb_online(file_path: str) -> bool:
+def detect_kcb_online(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF is a KCB Online Banking portal statement.
 
     This format uses "Account Statement" (not "KCB ACCOUNT STATEMENT") with
     DD.MM.YYYY dates, and "Money In / Money Out / Ledger Balance" column headers.
     """
     try:
-        with pdfplumber.open(file_path) as pdf:
-            if not pdf.pages:
+        with as_document(source) as doc:
+            if not doc.pages:
                 return False
-            text = pdf.pages[0].extract_text() or ""
+            text = doc.pages[0].text
             return (
                 "Account Statement" in text
                 and "Money In" in text

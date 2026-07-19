@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
 from app.extractors.shared import _group_by_line
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # X-thresholds from real file (words)
 _TXN_DATE_X_MAX = 120.0
@@ -39,15 +40,11 @@ _DATE_TOKEN_PAT = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 _ROW_TOLERANCE = 5.0
 
 
-def detect_absa(file_path: str) -> bool:
+def detect_absa(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an ABSA Bank Kenya statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:3]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
+        with as_document(source) as doc:
+            text = doc.text_upto(3)
             return (
                 "Absa Bank Kenya" in text
                 or "absa.kenya@absa.africa" in text

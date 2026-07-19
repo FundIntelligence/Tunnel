@@ -19,11 +19,12 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 logger = logging.getLogger(__name__)
 
@@ -137,15 +138,11 @@ def _is_equity_business_format(text: str) -> bool:
     )
 
 
-def detect_equity(file_path: str) -> bool:
+def detect_equity(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an Equity Bank statement (personal or business)."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:2]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
+        with as_document(source) as doc:
+            text = doc.text_upto(2)
             if _is_equity_business_format(text):
                 return True
             text_upper = text.upper()
@@ -886,7 +883,7 @@ _EQ_CLMS_ROW_TOLERANCE = 3.5
 _EQ_CLMS_DESC_ABOVE_MAX = 22.0
 
 
-def detect_equity_clms(file_path: str) -> bool:
+def detect_equity_clms(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF is an Equity CLMS (Cash and Liquidity Mgmt System) statement.
 
     Distinct from the standard business format: header includes
@@ -894,10 +891,10 @@ def detect_equity_clms(file_path: str) -> bool:
     DD/MM/YYYY dates instead of DD-MM-YYYY.
     """
     try:
-        with pdfplumber.open(file_path) as pdf:
-            if not pdf.pages:
+        with as_document(source) as doc:
+            if not doc.pages:
                 return False
-            text = pdf.pages[0].extract_text() or ""
+            text = doc.pages[0].text
             return (
                 "CASH AND LIQUIDITY" in text.upper()
                 and "Total Count:" in text
