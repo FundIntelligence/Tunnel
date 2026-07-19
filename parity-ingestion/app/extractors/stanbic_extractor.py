@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pdfplumber
+
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # OCR dependencies — optional.  Not available on all deployments (e.g. Render
 # workers that lack poppler/tesseract).  When absent, detect_stanbic() returns
@@ -110,7 +112,7 @@ _SKIP_FRAGS = (
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def detect_stanbic(file_path: str) -> bool:
+def detect_stanbic(source: Union[str, NormalizedDocument]) -> bool:
     """
     Return True if the PDF is a Stanbic Bank Kenya statement.
 
@@ -121,12 +123,16 @@ def detect_stanbic(file_path: str) -> bool:
     if not _OCR_AVAILABLE:
         return False
     try:
-        with pdfplumber.open(file_path) as pdf:
-            if not pdf.pages:
+        with as_document(source) as doc:
+            if not doc.pages:
                 return False
-            text = pdf.pages[0].extract_text() or ""
+            text = doc.pages[0].text
             if text.count("(cid:") < 20:
                 return False
+            file_path = doc.file_path
+        # Image conversion (pdf2image/poppler) is unrelated to pdfplumber's
+        # parse — always needs the file path directly, regardless of
+        # whether we were handed a pre-parsed document.
         images = _convert_from_path(file_path, dpi=100, first_page=1, last_page=1)
         if not images:
             return False

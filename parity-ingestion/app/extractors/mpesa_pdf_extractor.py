@@ -10,22 +10,19 @@ Paid in → positive amount (credit_raw). Withdrawn → negative (debit_raw).
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 
-def detect_mpesa_pdf(file_path: str) -> bool:
+def detect_mpesa_pdf(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an M-Pesa full statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:2]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
+        with as_document(source) as doc:
+            text = doc.text_upto(2)
             return (
                 ("MPESA FULL STATEMENT" in text or "M-PESA STATEMENT" in text)
                 and "Safaricom" in text
