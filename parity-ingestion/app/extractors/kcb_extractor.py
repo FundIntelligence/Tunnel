@@ -126,82 +126,83 @@ def extract_kcb_pdf(file_path: str) -> ExtractionResult:
     row_idx = 0
 
     with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words()
-            if not words:
+        pages_words = [page.extract_words() for page in pdf.pages]
+
+    for words in pages_words:
+        if not words:
+            continue
+
+        rows = _group_by_line(words, _ROW_TOLERANCE)
+        pending: Optional[dict] = None
+
+        for row_words in rows:
+            txn_date_parts: List[str] = []
+            desc_parts: List[str] = []
+            value_date_parts: List[str] = []
+            money_out = ""
+            money_in = ""
+            balance_raw = ""
+
+            for w in row_words:
+                col = _assign_kcb_column(w)
+                if col == "txn_date":
+                    txn_date_parts.append(w["text"])
+                elif col == "desc":
+                    desc_parts.append(w["text"])
+                elif col == "value_date":
+                    value_date_parts.append(w["text"])
+                elif col == "money_out":
+                    money_out = w["text"]
+                elif col == "money_in":
+                    money_in = w["text"]
+                elif col == "balance":
+                    balance_raw = w["text"]
+
+            txn_date_str = " ".join(txn_date_parts).strip()
+            desc_str = " ".join(desc_parts).strip()
+            value_date_str = " ".join(value_date_parts).strip()
+
+            if any(phrase in desc_str.upper() for phrase in [
+                "BALANCE AT PERIOD END",
+                "PERIOD END"
+            ]):
                 continue
 
-            rows = _group_by_line(words, _ROW_TOLERANCE)
-            pending: Optional[dict] = None
+            if not txn_date_str and not desc_str and not money_out and not money_in:
+                continue
 
-            for row_words in rows:
-                txn_date_parts: List[str] = []
-                desc_parts: List[str] = []
-                value_date_parts: List[str] = []
-                money_out = ""
-                money_in = ""
-                balance_raw = ""
+            iso_date = parse_kcb_date(txn_date_str)
 
-                for w in row_words:
-                    col = _assign_kcb_column(w)
-                    if col == "txn_date":
-                        txn_date_parts.append(w["text"])
-                    elif col == "desc":
-                        desc_parts.append(w["text"])
-                    elif col == "value_date":
-                        value_date_parts.append(w["text"])
-                    elif col == "money_out":
-                        money_out = w["text"]
-                    elif col == "money_in":
-                        money_in = w["text"]
-                    elif col == "balance":
-                        balance_raw = w["text"]
+            if txn_date_str and _TXN_DATE_PAT.match(txn_date_str):
+                if pending:
+                    _flush_kcb_pending(pending, transactions, warnings)
+                    pending = None
 
-                txn_date_str = " ".join(txn_date_parts).strip()
-                desc_str = " ".join(desc_parts).strip()
-                value_date_str = " ".join(value_date_parts).strip()
+                pending = {
+                    "row_index": row_idx,
+                    "date_raw": iso_date or txn_date_str,
+                    "description": desc_str,
+                    "debit_raw": money_out.replace(",", "").lstrip("-") if money_out else "",
+                    "credit_raw": money_in.replace(",", "") if money_in else "",
+                    "balance_raw": balance_raw,
+                    "source_file": file_path,
+                }
+                row_idx += 1
+            else:
+                if pending and desc_str:
+                    pending["description"] = (
+                        (pending["description"] or "") + " " + desc_str
+                    ).strip()
+                if pending and money_out and not pending["debit_raw"]:
+                    pending["debit_raw"] = money_out.replace(",", "").lstrip("-")
+                if pending and money_in and not pending["credit_raw"]:
+                    pending["credit_raw"] = money_in.replace(",", "")
+                if pending and balance_raw and not pending["balance_raw"]:
+                    pending["balance_raw"] = balance_raw
 
-                if any(phrase in desc_str.upper() for phrase in [
-                    "BALANCE AT PERIOD END",
-                    "PERIOD END"
-                ]):
-                    continue
-
-                if not txn_date_str and not desc_str and not money_out and not money_in:
-                    continue
-
-                iso_date = parse_kcb_date(txn_date_str)
-
-                if txn_date_str and _TXN_DATE_PAT.match(txn_date_str):
-                    if pending:
-                        _flush_kcb_pending(pending, transactions, warnings)
-                        pending = None
-
-                    pending = {
-                        "row_index": row_idx,
-                        "date_raw": iso_date or txn_date_str,
-                        "description": desc_str,
-                        "debit_raw": money_out.replace(",", "").lstrip("-") if money_out else "",
-                        "credit_raw": money_in.replace(",", "") if money_in else "",
-                        "balance_raw": balance_raw,
-                        "source_file": file_path,
-                    }
-                    row_idx += 1
-                else:
-                    if pending and desc_str:
-                        pending["description"] = (
-                            (pending["description"] or "") + " " + desc_str
-                        ).strip()
-                    if pending and money_out and not pending["debit_raw"]:
-                        pending["debit_raw"] = money_out.replace(",", "").lstrip("-")
-                    if pending and money_in and not pending["credit_raw"]:
-                        pending["credit_raw"] = money_in.replace(",", "")
-                    if pending and balance_raw and not pending["balance_raw"]:
-                        pending["balance_raw"] = balance_raw
-
-            if pending:
-                _flush_kcb_pending(pending, transactions, warnings)
-                pending = None
+        if pending:
+            _flush_kcb_pending(pending, transactions, warnings)
+            pending = None
 
     transactions = derive_missing_debits(transactions)
 
@@ -306,113 +307,127 @@ def _kcb_online_anchor_column(w: dict) -> Optional[str]:
     return None
 
 
-def extract_kcb_online_pdf(file_path: str) -> ExtractionResult:
-    """Extract transactions from a KCB Online Banking portal PDF statement."""
+def extract_kcb_online_pdf(file_path: str, word_engine: str = "pdfplumber") -> ExtractionResult:
+    """
+    Extract transactions from a KCB Online Banking portal PDF statement.
+
+    ``word_engine`` selects the word-extraction backend (PAR-37):
+    ``"pdfplumber"`` (default, unchanged production behavior) or ``"pdfium"``
+    — validated end-to-end against this exact fixture/format in
+    tests/test_pdfium_words.py (this is the KCB Online format; the real
+    126-page rotated fixture this repo ships is a KCB Online statement).
+    """
     transactions: List[RawTransaction] = []
     warnings: List[WarningItem] = []
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words()
-            if not words:
-                continue
+    if word_engine == "pdfium":
+        from app.extractors.pdfium_words import extract_words_pdfium
 
-            words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+        pages_words = extract_words_pdfium(file_path)
+    else:
+        with pdfplumber.open(file_path) as pdf:
+            pages_words = [page.extract_words() for page in pdf.pages]
 
-            # ── Find anchor rows (transaction-date positions) ──────────────────
-            anchor_tops = [
-                w["top"]
-                for w in words_sorted
+    for words in pages_words:
+        if not words:
+            continue
+
+        words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+
+        # ── Find anchor rows (transaction-date positions) ──────────────────
+        anchor_tops = [
+            w["top"]
+            for w in words_sorted
+            if _KCB_ONLINE_TXN_DATE_X_MIN <= w["x0"] <= _KCB_ONLINE_TXN_DATE_X_MAX
+            and _KCB_ONLINE_DATE_PAT.match(w["text"])
+        ]
+        if not anchor_tops:
+            continue
+
+        # ── Build anchor objects with amounts / reference ──────────────────
+        anchors = []
+        for at in anchor_tops:
+            row_words = [
+                w for w in words_sorted
+                if abs(w["top"] - at) <= _KCB_ONLINE_ROW_TOLERANCE
+            ]
+            date_words = [
+                w for w in row_words
                 if _KCB_ONLINE_TXN_DATE_X_MIN <= w["x0"] <= _KCB_ONLINE_TXN_DATE_X_MAX
                 and _KCB_ONLINE_DATE_PAT.match(w["text"])
             ]
-            if not anchor_tops:
+            if not date_words:
                 continue
 
-            # ── Build anchor objects with amounts / reference ──────────────────
-            anchors = []
-            for at in anchor_tops:
-                row_words = [
-                    w for w in words_sorted
-                    if abs(w["top"] - at) <= _KCB_ONLINE_ROW_TOLERANCE
-                ]
-                date_words = [
-                    w for w in row_words
-                    if _KCB_ONLINE_TXN_DATE_X_MIN <= w["x0"] <= _KCB_ONLINE_TXN_DATE_X_MAX
-                    and _KCB_ONLINE_DATE_PAT.match(w["text"])
-                ]
-                if not date_words:
-                    continue
+            money_out = money_in = balance = reference = ""
+            inline_desc_words: List[dict] = []
 
-                money_out = money_in = balance = reference = ""
-                inline_desc_words: List[dict] = []
+            for w in row_words:
+                col = _kcb_online_anchor_column(w)
+                if col == "money_out" and not money_out:
+                    money_out = w["text"]
+                elif col == "money_in" and not money_in:
+                    money_in = w["text"]
+                elif col == "balance":
+                    balance = w["text"]
+                elif col == "reference" and not reference:
+                    reference = w["text"]
+                elif col == "inline_desc":
+                    inline_desc_words.append(w)
 
-                for w in row_words:
-                    col = _kcb_online_anchor_column(w)
-                    if col == "money_out" and not money_out:
-                        money_out = w["text"]
-                    elif col == "money_in" and not money_in:
-                        money_in = w["text"]
-                    elif col == "balance":
-                        balance = w["text"]
-                    elif col == "reference" and not reference:
-                        reference = w["text"]
-                    elif col == "inline_desc":
-                        inline_desc_words.append(w)
+            anchors.append({
+                "top": at,
+                "date_raw": _parse_kcb_online_date(date_words[0]["text"]) or "",
+                "money_out": money_out,
+                "money_in": money_in,
+                "balance": balance,
+                "reference": reference,
+                "inline_desc_words": inline_desc_words,
+                "extra_desc_words": [],
+            })
 
-                anchors.append({
-                    "top": at,
-                    "date_raw": _parse_kcb_online_date(date_words[0]["text"]) or "",
-                    "money_out": money_out,
-                    "money_in": money_in,
-                    "balance": balance,
-                    "reference": reference,
-                    "inline_desc_words": inline_desc_words,
-                    "extra_desc_words": [],
-                })
+        # ── Assign floating description words to nearest anchor ────────────
+        for w in words_sorted:
+            x0, top, text = w["x0"], w["top"], w["text"]
+            if not (_KCB_ONLINE_DESC_X_MIN <= x0 <= _KCB_ONLINE_DESC_X_MAX):
+                continue
+            if _KCB_ONLINE_DATE_PAT.match(text) or _KCB_ONLINE_AMOUNT_PAT.match(text):
+                continue
+            # Skip words sitting on an anchor row (already captured as inline_desc)
+            if any(abs(a["top"] - top) <= _KCB_ONLINE_ROW_TOLERANCE for a in anchors):
+                continue
 
-            # ── Assign floating description words to nearest anchor ────────────
-            for w in words_sorted:
-                x0, top, text = w["x0"], w["top"], w["text"]
-                if not (_KCB_ONLINE_DESC_X_MIN <= x0 <= _KCB_ONLINE_DESC_X_MAX):
-                    continue
-                if _KCB_ONLINE_DATE_PAT.match(text) or _KCB_ONLINE_AMOUNT_PAT.match(text):
-                    continue
-                # Skip words sitting on an anchor row (already captured as inline_desc)
-                if any(abs(a["top"] - top) <= _KCB_ONLINE_ROW_TOLERANCE for a in anchors):
-                    continue
+            nearest = min(anchors, key=lambda a: abs(a["top"] - top))
+            # Drop if word is too far above its nearest anchor (header artifacts)
+            if nearest["top"] - top > _KCB_ONLINE_DESC_ABOVE_MAX:
+                continue
+            nearest["extra_desc_words"].append(w)
 
-                nearest = min(anchors, key=lambda a: abs(a["top"] - top))
-                # Drop if word is too far above its nearest anchor (header artifacts)
-                if nearest["top"] - top > _KCB_ONLINE_DESC_ABOVE_MAX:
-                    continue
-                nearest["extra_desc_words"].append(w)
+        # ── Build RawTransaction for each anchor ───────────────────────────
+        for anchor in anchors:
+            all_desc = sorted(
+                anchor["extra_desc_words"] + anchor["inline_desc_words"],
+                key=lambda w: (w["top"], w["x0"]),
+            )
+            description = " ".join(w["text"] for w in all_desc).strip()
 
-            # ── Build RawTransaction for each anchor ───────────────────────────
-            for anchor in anchors:
-                all_desc = sorted(
-                    anchor["extra_desc_words"] + anchor["inline_desc_words"],
-                    key=lambda w: (w["top"], w["x0"]),
+            is_b_fwd = "B/FWD" in description.upper()
+            debit_raw = "" if is_b_fwd else _clean_kcb_online_amount(anchor["money_out"])
+            credit_raw = "" if is_b_fwd else _clean_kcb_online_amount(anchor["money_in"])
+            balance_raw = anchor["balance"].replace(",", "") if anchor["balance"] else ""
+
+            transactions.append(
+                RawTransaction(
+                    row_index=len(transactions),
+                    date_raw=anchor["date_raw"],
+                    description=description,
+                    debit_raw=debit_raw,
+                    credit_raw=credit_raw,
+                    balance_raw=balance_raw,
+                    source_file=file_path,
+                    extraction_confidence=1.0,
                 )
-                description = " ".join(w["text"] for w in all_desc).strip()
-
-                is_b_fwd = "B/FWD" in description.upper()
-                debit_raw = "" if is_b_fwd else _clean_kcb_online_amount(anchor["money_out"])
-                credit_raw = "" if is_b_fwd else _clean_kcb_online_amount(anchor["money_in"])
-                balance_raw = anchor["balance"].replace(",", "") if anchor["balance"] else ""
-
-                transactions.append(
-                    RawTransaction(
-                        row_index=len(transactions),
-                        date_raw=anchor["date_raw"],
-                        description=description,
-                        debit_raw=debit_raw,
-                        credit_raw=credit_raw,
-                        balance_raw=balance_raw,
-                        source_file=file_path,
-                        extraction_confidence=1.0,
-                    )
-                )
+            )
 
     return ExtractionResult(
         source_file=file_path,
