@@ -2,6 +2,7 @@
 Parity Backend — PDS v1 API only.
 All legacy routes decommissioned. Use /v1/* exclusively.
 """
+import asyncio
 import traceback
 from contextlib import asynccontextmanager
 
@@ -16,6 +17,7 @@ from v1 import api as v1_api
 from v1.db.migrator import run_pending_migrations
 from v1.ingestion.service import register_ingestion_startup
 from v1.integrations.musa_api import router as musa_router
+from v1.integrations.musa_parser_request_sla import parser_request_sla_sweeper
 
 load_dotenv()
 
@@ -28,7 +30,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_pending_migrations()
+    sla_task = asyncio.create_task(parser_request_sla_sweeper.start())
     yield
+    parser_request_sla_sweeper.stop()
+    sla_task.cancel()
 
 
 app = FastAPI(
