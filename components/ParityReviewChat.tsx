@@ -55,7 +55,7 @@ function renderTable(rows: string[]): string {
   const thStyle = 'padding:5px 10px;border:1px solid var(--b1);font-size:11px;font-weight:600;color:var(--accent);text-align:left;white-space:nowrap'
   const tdStyle = 'padding:4px 10px;border:1px solid var(--b1);font-size:12px;color:var(--t1);white-space:nowrap'
 
-  let html = '<table style="border-collapse:collapse;width:100%;margin:8px 0;font-family:\'IBM Plex Mono\',monospace">'
+  let html = '<div style="overflow-x:auto;margin:8px 0"><table style="border-collapse:collapse;width:100%;font-family:\'IBM Plex Mono\',monospace">'
   if (headerCells) {
     html += '<thead><tr>' + headerCells.map(c => `<th style="${thStyle}">${c}</th>`).join('') + '</tr></thead>'
   }
@@ -64,7 +64,7 @@ function renderTable(rows: string[]): string {
     const cells = parseCells(row)
     html += '<tr>' + cells.map(c => `<td style="${tdStyle}">${c}</td>`).join('') + '</tr>'
   }
-  html += '</tbody></table>'
+  html += '</tbody></table></div>'
   return html
 }
 
