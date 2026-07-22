@@ -767,6 +767,15 @@ _VALID_OVERRIDE_ROLES = frozenset({
     "needs_review", "other",
 })
 
+# PAR-52 draft taxonomy — may be refined later. "other" requires reason_note.
+_VALID_OVERRIDE_REASON_CATEGORIES = frozenset({
+    "misclassified_rule_matching",
+    "ambiguous_narrative",
+    "known_exception",
+    "duplicate_reversal",
+    "other",
+})
+
 
 @router.get("/deals/{deal_id}/transactions/needs-review")
 def get_needs_review_transactions(request: Request, deal_id: str):
@@ -822,10 +831,17 @@ def resolve_transaction(
     row_id: str = Form(...),
     new_role: str = Form(...),
     analyst_initials: str = Form(...),
+    reason_category: str = Form(...),
+    reason_note: str = Form(""),
 ):
     """Override a single needs_review transaction with an analyst-assigned role."""
     if new_role not in _VALID_OVERRIDE_ROLES:
         _error("BAD_REQUEST", f"Invalid role '{new_role}'. Must be one of the valid classifier roles.")
+    if reason_category not in _VALID_OVERRIDE_REASON_CATEGORIES:
+        _error("BAD_REQUEST", f"Invalid reason_category '{reason_category}'.")
+    reason_note = reason_note.strip()
+    if reason_category == "other" and not reason_note:
+        _error("BAD_REQUEST", "reason_note is required when reason_category is 'other'.")
 
     repos = _repos(request)
     deal = repos["deals"].get_deal(deal_id)
@@ -856,6 +872,8 @@ def resolve_transaction(
         "original_role": original_role,
         "override_role": new_role,
         "analyst_initials": analyst_initials.strip()[:3].upper(),
+        "reason_category": reason_category,
+        "reason_note": reason_note or None,
     }
     if user_id:
         log_entry["user_id"] = user_id
