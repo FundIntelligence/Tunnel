@@ -42,6 +42,9 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
   const [bulkReason, setBulkReason] = useState<OverrideReasonCategory | ''>('')
   const [bulkReasonNote, setBulkReasonNote] = useState('')
   const [bulkResolving, setBulkResolving] = useState(false)
+  const [search, setSearch] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
 
   const queryClient = useQueryClient()
 
@@ -63,6 +66,22 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
       onQueueUpdate?.(data?.total ?? 0)
     }
   }, [data, onQueueUpdate])
+
+  // PAR-50: search by description/amount, filter by date range. The ticket also
+  // scoped "bank" and "flag reason" filters, but neither field is actually
+  // returned by GET /transactions/needs-review (NeedsReviewItem has no bank
+  // field at all, and flag_reason is optional/unpopulated in practice) — the
+  // ticket's own note says "whatever fields the queue already exposes", so
+  // those two are left out rather than filtering on data that isn't there.
+  const searchLower = search.trim().toLowerCase()
+  const filteredItems = items.filter((item) => {
+    if (dateFrom && String(item.txn_date) < dateFrom) return false
+    if (dateTo && String(item.txn_date) > dateTo) return false
+    if (!searchLower) return true
+    const desc = ((item.entity_name || item.description || '') as string).toLowerCase()
+    const amountStr = (Math.abs(Number(item.signed_amount_cents ?? 0)) / 100).toFixed(2)
+    return desc.includes(searchLower) || amountStr.includes(searchLower)
+  })
 
   // helper to toggle bulk selection
   const toggleBulkItem = useCallback((rowId: string) => {
@@ -235,40 +254,81 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
         </div>
       )}
 
+      {/* Search / filter */}
+      {items.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search description or amount…"
+            style={{ flex: 1, minWidth: 180, background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+          />
+          <span style={{ fontSize: 11, color: 'var(--t2)' }}>From</span>
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '5px 8px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+          />
+          <span style={{ fontSize: 11, color: 'var(--t2)' }}>To</span>
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '5px 8px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+          />
+          {(search || dateFrom || dateTo) && (
+            <button
+              onClick={() => { setSearch(''); setDateFrom(''); setDateTo('') }}
+              style={{ padding: '5px 10px', background: 'transparent', border: '1px solid var(--b1)', borderRadius: 4, fontSize: 11, color: 'var(--t2)', cursor: 'pointer' }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+
+      {items.length > 0 && filteredItems.length === 0 && (
+        <div style={{ padding: '32px 0', textAlign: 'center' }}>
+          <div style={{ fontSize: 12, color: 'var(--t2)' }}>No items match your search/filter.</div>
+        </div>
+      )}
+
       {/* Items list */}
       <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, overflow: 'hidden' }}>
         {/* Column headers */}
-        {items.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: bulkMode ? '32px 100px 1fr 100px 120px' : '100px 1fr 100px 120px', gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)' }}>
+        {filteredItems.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: bulkMode ? '32px 100px 1fr 70px 100px 120px' : '100px 1fr 70px 100px 120px', gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)' }}>
             {bulkMode && (
               <div
                 style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}
                 onClick={() => {
-                  if (bulkSelected.size === items.length) {
+                  if (bulkSelected.size === filteredItems.length) {
                     setBulkSelected(new Set())
                   } else {
-                    setBulkSelected(new Set(items.map(i => i.row_id as string)))
+                    setBulkSelected(new Set(filteredItems.map(i => i.row_id as string)))
                   }
                 }}
               >
                 <div style={{
                   width: 16, height: 16, borderRadius: 3,
-                  border: `1px solid ${bulkSelected.size === items.length && items.length > 0 ? 'var(--accent)' : bulkSelected.size > 0 ? 'var(--accent)' : 'var(--b1)'}`,
-                  background: bulkSelected.size === items.length && items.length > 0 ? 'var(--accent)' : bulkSelected.size > 0 ? 'rgba(20,184,166,0.3)' : 'transparent',
+                  border: `1px solid ${bulkSelected.size === filteredItems.length && filteredItems.length > 0 ? 'var(--accent)' : bulkSelected.size > 0 ? 'var(--accent)' : 'var(--b1)'}`,
+                  background: bulkSelected.size === filteredItems.length && filteredItems.length > 0 ? 'var(--accent)' : bulkSelected.size > 0 ? 'rgba(20,184,166,0.3)' : 'transparent',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                 }}>
-                  {bulkSelected.size === items.length && items.length > 0 && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>✓</span>}
-                  {bulkSelected.size > 0 && bulkSelected.size < items.length && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>—</span>}
+                  {bulkSelected.size === filteredItems.length && filteredItems.length > 0 && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>✓</span>}
+                  {bulkSelected.size > 0 && bulkSelected.size < filteredItems.length && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>—</span>}
                 </div>
               </div>
             )}
-            {['DATE', 'DESCRIPTION', 'ROLE', 'AMOUNT'].map((h) => (
+            {['DATE', 'DESCRIPTION', 'DR/CR', 'ROLE', 'AMOUNT'].map((h) => (
               <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--b1)', letterSpacing: '0.1em' }}>{h}</span>
             ))}
           </div>
         )}
 
-        {items.map((item) => {
+        {filteredItems.map((item) => {
           const rowId = item.row_id as string
           const isActive = activeItemId === rowId
           const amt = Math.abs(Number(item.signed_amount_cents ?? 0))
@@ -286,7 +346,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                 }}
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: bulkMode ? '32px 100px 1fr 100px 120px' : '100px 1fr 100px 120px',
+                  gridTemplateColumns: bulkMode ? '32px 100px 1fr 70px 100px 120px' : '100px 1fr 70px 100px 120px',
                   gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)', cursor: 'pointer',
                   background: isActive ? 'rgba(245,158,11,0.04)' : bulkSelected.has(rowId) ? 'rgba(20,184,166,0.06)' : 'transparent',
                   transition: 'background 0.15s',
@@ -315,6 +375,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                     <span style={{ fontSize: 10, color: 'var(--t2)', marginTop: 2 }}>{String(item.flag_reason)}</span>
                   )}
                 </div>
+                <span style={{ fontSize: 11, fontWeight: 700, color: isNeg ? 'var(--red)' : 'var(--green)', fontFamily: "'IBM Plex Mono', monospace", display: 'flex', alignItems: 'center' }}>{isNeg ? 'DR' : 'CR'}</span>
                 <span style={{ fontSize: 10, color: 'var(--amber)', fontFamily: "'IBM Plex Mono', monospace", display: 'flex', alignItems: 'center' }}>needs_review</span>
                 <span style={{ fontSize: 12, fontWeight: 600, color: isNeg ? 'var(--red)' : 'var(--green)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
                   {formatCents(amt)}
@@ -398,7 +459,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
       {/* Footer stats */}
       {items.length > 0 && (
         <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12, fontSize: 10, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>
-          <span>Showing {items.length} of {total} items</span>
+          <span>Showing {filteredItems.length} of {total} items</span>
           <span>Analyst: {analystInitials}</span>
         </div>
       )}
