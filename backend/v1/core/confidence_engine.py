@@ -49,6 +49,23 @@ def compute_tier(confidence_bp: int, reconciliation_status: str) -> (str, bool):
     return tier, capped
 
 
+def compute_coverage_tier(confidence_bp: int) -> str:
+    """
+    PAR-47: the same Low/Medium/High thresholds as compute_tier(), but as a
+    pure function of confidence_bp alone — no reconciliation_status gating.
+    compute_tier() caps High->Medium whenever reconciliation isn't OK, which
+    today is every deal (no deal has accrual data yet), so `tier` reads as
+    "this deal is weak" when the truth is "no deal can score High right now,
+    for a reason unrelated to this deal's own data completeness". Additive:
+    does not change compute_tier()/finalize_confidence()'s existing behavior.
+    """
+    if confidence_bp >= 8500:
+        return "High"
+    if confidence_bp >= 7000:
+        return "Medium"
+    return "Low"
+
+
 def finalize_confidence(base_after_months_bp: int, override_penalty_bp: int, reconciliation_status: str) -> Dict:
     final_conf = max(0, base_after_months_bp - override_penalty_bp)
     tier, capped = compute_tier(final_conf, reconciliation_status)
@@ -56,5 +73,6 @@ def finalize_confidence(base_after_months_bp: int, override_penalty_bp: int, rec
         "final_confidence_bp": final_conf,
         "tier": tier,
         "tier_capped": capped,
+        "coverage_tier": compute_coverage_tier(final_conf),
         "override_penalty_bp": override_penalty_bp,
     }
