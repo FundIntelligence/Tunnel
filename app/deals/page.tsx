@@ -28,6 +28,8 @@ export default function DashboardPage() {
   const router = useRouter()
   const [user, setUser] = useState<any>(null)
   const [userId, setUserId] = useState<string | undefined>(undefined)
+  const [search, setSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<string>('all')
 
   useEffect(() => {
     const supabase = createBrowserClient()
@@ -103,6 +105,19 @@ export default function DashboardPage() {
   const avgOverridePenaltyBp = runsWithConfidence.length > 0
     ? Math.round(runsWithConfidence.reduce((s, r) => s + (Number(r.override_penalty_bp) || 0), 0) / runsWithConfidence.length)
     : null
+
+  // Search/filter narrows what's shown in the Deal Pipeline table only —
+  // the stat cards above still reflect the full portfolio.
+  const STATUS_FILTER_OPTIONS = ['Analysis complete', 'In progress', 'Ready to analyse', 'Failed — retry', 'Uploading documents']
+  const searchLower = search.trim().toLowerCase()
+  const filteredDeals = deals.filter((d) => {
+    if (statusFilter !== 'all' && (statuses[d.id]?.label ?? STATUS_UPLOADING.label) !== statusFilter) return false
+    if (!searchLower) return true
+    const name = ((d.company_name || d.name || '') as string).toLowerCase()
+    const shortId = d.id.replace(/-/g, '').slice(0, 12).toLowerCase()
+    const analyst = ((d.analyst_initials || '') as string).toLowerCase()
+    return name.includes(searchLower) || shortId.includes(searchLower) || analyst.includes(searchLower)
+  })
 
   if (loading) {
     return (
@@ -220,9 +235,36 @@ export default function DashboardPage() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--s3)' }}>
               <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', color: 'var(--t0)' }}>DEAL PIPELINE</span>
               <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <span style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>{activeDeals} record{activeDeals !== 1 ? 's' : ''}</span>
+                <span style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>{filteredDeals.length} of {activeDeals} record{activeDeals !== 1 ? 's' : ''}</span>
                 <button onClick={() => router.push('/deals/new')} style={{ padding: '4px 12px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>+ New</button>
               </div>
+            </div>
+
+            {/* Search / filter */}
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 20px', borderBottom: '1px solid var(--s3)' }}>
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search borrower, analyst, or deal ID…"
+                style={{ flex: 1, maxWidth: 320, background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+              />
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+              >
+                <option value="all">All statuses</option>
+                {STATUS_FILTER_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+              {(search || statusFilter !== 'all') && (
+                <button
+                  onClick={() => { setSearch(''); setStatusFilter('all') }}
+                  style={{ padding: '5px 10px', background: 'transparent', border: '1px solid var(--b1)', borderRadius: 4, fontSize: 11, color: 'var(--t2)', cursor: 'pointer' }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
 
             {/* Column headers */}
@@ -239,7 +281,14 @@ export default function DashboardPage() {
               </div>
             )}
 
-            {deals.map((deal) => {
+            {deals.length > 0 && filteredDeals.length === 0 && (
+              <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--t2)', fontSize: 13 }}>
+                No deals match your search/filter.{' '}
+                <span style={{ color: 'var(--accent)', cursor: 'pointer' }} onClick={() => { setSearch(''); setStatusFilter('all') }}>Clear filters →</span>
+              </div>
+            )}
+
+            {filteredDeals.map((deal) => {
               const name = (deal.company_name || deal.name || 'Untitled') as string
               const shortId = deal.id.replace(/-/g, '').slice(0, 12).toUpperCase()
               const analyst = ((deal.analyst_initials || '—') as string).toUpperCase()
