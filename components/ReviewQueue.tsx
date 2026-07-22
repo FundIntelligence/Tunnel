@@ -239,7 +239,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
       <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, overflow: 'hidden' }}>
         {/* Column headers */}
         {items.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: bulkMode ? '32px 100px 1fr 100px 120px' : '100px 1fr 100px 120px', gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: bulkMode ? '32px 100px 1fr 70px 100px 120px' : '100px 1fr 70px 100px 120px', gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)' }}>
             {bulkMode && (
               <div
                 style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}
@@ -262,7 +262,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                 </div>
               </div>
             )}
-            {['DATE', 'DESCRIPTION', 'ROLE', 'AMOUNT'].map((h) => (
+            {['DATE', 'DESCRIPTION', 'DR/CR', 'ROLE', 'AMOUNT'].map((h) => (
               <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--b1)', letterSpacing: '0.1em' }}>{h}</span>
             ))}
           </div>
@@ -286,7 +286,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                 }}
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: bulkMode ? '32px 100px 1fr 100px 120px' : '100px 1fr 100px 120px',
+                  gridTemplateColumns: bulkMode ? '32px 100px 1fr 70px 100px 120px' : '100px 1fr 70px 100px 120px',
                   gap: 8, padding: '10px 16px', borderBottom: '1px solid var(--s3)', cursor: 'pointer',
                   background: isActive ? 'rgba(245,158,11,0.04)' : bulkSelected.has(rowId) ? 'rgba(20,184,166,0.06)' : 'transparent',
                   transition: 'background 0.15s',
@@ -315,6 +315,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                     <span style={{ fontSize: 10, color: 'var(--t2)', marginTop: 2 }}>{String(item.flag_reason)}</span>
                   )}
                 </div>
+                <span style={{ fontSize: 11, fontWeight: 700, color: isNeg ? 'var(--red)' : 'var(--green)', fontFamily: "'IBM Plex Mono', monospace", display: 'flex', alignItems: 'center' }}>{isNeg ? 'DR' : 'CR'}</span>
                 <span style={{ fontSize: 10, color: 'var(--amber)', fontFamily: "'IBM Plex Mono', monospace", display: 'flex', alignItems: 'center' }}>needs_review</span>
                 <span style={{ fontSize: 12, fontWeight: 600, color: isNeg ? 'var(--red)' : 'var(--green)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
                   {formatCents(amt)}
