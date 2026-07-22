@@ -14,10 +14,10 @@ steps:
       - --image=gcr.io/$PROJECT_ID/parity-backend
       - --region=us-central1
       - --platform=managed
-      - --memory=2Gi
-      - --cpu=2
+      - --memory=12Gi
+      - --cpu=4
       - --allow-unauthenticated
-      - --timeout=300
+      - --timeout=1200
       - --concurrency=80
       - --min-instances=0
       - --max-instances=3
