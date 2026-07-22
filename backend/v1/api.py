@@ -1778,7 +1778,11 @@ def log_intelligence_entry(request: Request, deal_id: str, entry_id: str):
 # Parity Review — Suggestions Engine
 # ===================================================================
 
-from .analytics import loan_drawdowns as _loan_drawdowns, monthly_cashflow as _monthly_cashflow  # noqa: E402
+from .analytics import (  # noqa: E402
+    loan_drawdowns as _loan_drawdowns,
+    monthly_cashflow as _monthly_cashflow,
+    credit_scoring_inputs as _credit_scoring_inputs,
+)
 from .suggestions import generate_suggestions  # noqa: E402
 
 
@@ -1864,6 +1868,47 @@ def get_monthly_cashflow(request: Request, deal_id: str):
 
     rows = _monthly_cashflow(tagged)
     return {"monthly_cashflow": rows, "count": len(rows)}
+
+
+@router.get("/deals/{deal_id}/analytics/credit-scoring-inputs")
+def get_credit_scoring_inputs(request: Request, deal_id: str):
+    """
+    Deal-level Credit Scoring Inputs (the 7 core metrics + payroll/KRA signals),
+    computed from classifier role in the latest snapshot — works uniformly for
+    single-document and batch-uploaded deals, unlike the per-document analytics
+    computed during ingestion.
+    """
+    repos = _repos(request)
+    if not repos["deals"].get_deal(deal_id):
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
+    if not snapshot:
+        _error("NOT_FOUND", "No snapshot found. Run export first.")
+
+    import json
+    from .core.snapshot_engine import decompress_canonical_json_if_needed
+
+    data = json.loads(decompress_canonical_json_if_needed(snapshot["canonical_json"]))
+    transactions = data.get("transactions", [])
+    txn_entity_map = data.get("txn_entity_map", [])
+
+    role_lookup = {str(m.get("txn_id") or ""): m.get("role", "") for m in txn_entity_map}
+
+    tagged = []
+    for t in transactions:
+        txn_id = str(t.get("id") or t.get("txn_id") or "")
+        role = role_lookup.get(txn_id, "")
+        txn_date = str(t.get("txn_date", ""))
+        if not txn_date:
+            continue
+        tagged.append({
+            "role": role,
+            "amount_cents": int(t.get("signed_amount_cents", 0)),
+            "txn_date": txn_date,
+            "txn_id": txn_id,
+        })
+
+    return _credit_scoring_inputs(tagged)
 
 
 @router.get("/deals/{deal_id}/review/suggestions")

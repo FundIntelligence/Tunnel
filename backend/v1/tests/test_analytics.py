@@ -14,6 +14,7 @@ from analytics import (
     kra_summary,
     top_expenses_with_frequency,
     monthly_cashflow,
+    credit_scoring_inputs,
 )
 
 
@@ -245,3 +246,99 @@ def test_monthly_cashflow_all_integer_types():
     assert all(isinstance(r["inflow_cents"], int) for r in result)
     assert all(isinstance(r["outflow_cents"], int) for r in result)
     assert all(isinstance(r["net_cents"], int) for r in result)
+
+
+# ── credit_scoring_inputs ──────────────────────────────────────────────────────
+
+def test_credit_scoring_inputs_uses_role_not_keywords():
+    """Loan repayment burden must come from the real classifier's `loan_repayment`
+    role, not a keyword/pattern-hint match — a Pesalink supplier payment must
+    NOT be counted as loan repayment just because it moved via Pesalink."""
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 1_000_000_00, "txn_date": "2025-01-05"},
+        {"role": "pesalink_outflow", "amount_cents": -400_000_00, "txn_date": "2025-01-10"},  # supplier via pesalink, NOT a loan
+        {"role": "loan_repayment", "amount_cents": -100_000_00, "txn_date": "2025-01-15"},
+    ]
+    result = credit_scoring_inputs(txns)
+    # total_outflow = 500_000_00; loan_repayment_total = 100_000_00 -> 2000 bps (20%)
+    assert result["loan_repayment_burden_bps"] == 2000
+
+
+def test_credit_scoring_inputs_median_and_average_inflow():
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-01-05"},
+        {"role": "mpesa_inflow", "amount_cents": 200_000_00, "txn_date": "2025-02-05"},
+        {"role": "revenue_operational", "amount_cents": 300_000_00, "txn_date": "2025-03-05"},
+    ]
+    result = credit_scoring_inputs(txns)
+    assert result["average_monthly_inflow_cents"] == 200_000_00
+    assert result["median_monthly_inflow_cents"] == 200_000_00
+    assert result["month_count_with_inflow"] == 3
+
+
+def test_credit_scoring_inputs_excludes_loan_inflow_and_capital_injection():
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-01-05"},
+        {"role": "loan_inflow", "amount_cents": 5_000_000_00, "txn_date": "2025-01-06"},
+        {"role": "capital_injection", "amount_cents": 2_000_000_00, "txn_date": "2025-01-07"},
+    ]
+    result = credit_scoring_inputs(txns)
+    assert result["average_monthly_inflow_cents"] == 100_000_00
+
+
+def test_credit_scoring_inputs_peak_and_trough_net_position():
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 500_000_00, "txn_date": "2025-01-05"},
+        {"role": "bank_charge", "amount_cents": -100_000_00, "txn_date": "2025-01-06"},
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-02-05"},
+        {"role": "bank_charge", "amount_cents": -300_000_00, "txn_date": "2025-02-06"},
+    ]
+    result = credit_scoring_inputs(txns)
+    assert result["peak_net_position_cents"] == 400_000_00
+    assert result["trough_net_position_cents"] == -200_000_00
+
+
+def test_credit_scoring_inputs_payroll_and_kra_use_roles():
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-01-05"},
+        {"role": "payroll", "amount_cents": -50_000_00, "txn_date": "2025-01-10"},
+        {"role": "tax_payment", "amount_cents": -10_000_00, "txn_date": "2025-01-20"},
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-02-05"},
+        {"role": "payroll", "amount_cents": -50_000_00, "txn_date": "2025-02-10"},
+        {"role": "tax_payment", "amount_cents": -10_000_00, "txn_date": "2025-02-20"},
+    ]
+    result = credit_scoring_inputs(txns)
+    assert result["payroll_stability"] == "CONSISTENT"
+    assert result["payroll_months_detected"] == 2
+    assert result["kra_compliance"] == "PASS"
+
+
+def test_credit_scoring_inputs_kra_gaps_detected():
+    txns = [
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-01-05"},
+        {"role": "tax_payment", "amount_cents": -10_000_00, "txn_date": "2025-01-20"},
+        {"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-02-05"},
+        # no tax_payment in Feb
+    ]
+    result = credit_scoring_inputs(txns)
+    assert result["kra_compliance"] == "GAPS_DETECTED"
+
+
+def test_credit_scoring_inputs_no_tax_transactions():
+    txns = [{"role": "revenue_operational", "amount_cents": 100_000_00, "txn_date": "2025-01-05"}]
+    result = credit_scoring_inputs(txns)
+    assert result["kra_compliance"] == "NOT_DETECTED"
+
+
+def test_credit_scoring_inputs_rejects_float_amount():
+    txns = [{"role": "revenue_operational", "amount_cents": 100.5, "txn_date": "2025-01-01"}]
+    with pytest.raises(ValueError):
+        credit_scoring_inputs(txns)
+
+
+def test_credit_scoring_inputs_empty():
+    result = credit_scoring_inputs([])
+    assert result["average_monthly_inflow_cents"] == 0
+    assert result["loan_repayment_burden_bps"] == 0
+    assert result["kra_compliance"] == "NOT_DETECTED"
+    assert result["payroll_stability"] == "NOT_DETECTED"

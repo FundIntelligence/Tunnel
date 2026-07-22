@@ -892,3 +892,12 @@ export async function getMonthlyCashflow(dealId: string): Promise<{ monthly_cash
   }
   return res.json()
 }
+
+export async function getCreditScoringInputs(dealId: string): Promise<Record<string, unknown>> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/analytics/credit-scoring-inputs`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to load credit scoring inputs' }))
+    throw new Error(err.detail ?? 'Failed to load credit scoring inputs')
+  }
+  return res.json()
+}

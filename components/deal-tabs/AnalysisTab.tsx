@@ -148,7 +148,7 @@ export default function AnalysisTab({
                       { label: 'Revenue Growth', value: csi ? fmtBps(csi.revenue_growth_bps) : '—', basis: 'First vs last month with inflow', positive: csi ? Number(csi.revenue_growth_bps) >= 0 : null },
                       { label: 'Loan Repayment Burden', value: csi ? fmtBps(csi.loan_repayment_burden_bps) : '—', basis: '% of total outflows', positive: null },
                       { label: 'Payroll Stability', value: csi ? (csi.payroll_stability as string) || 'NOT DETECTED' : 'NOT DETECTED', basis: csi?.payroll_stability === 'CONSISTENT' ? 'Consistent monthly pattern' : 'No payroll pattern in statement', positive: csi?.payroll_stability === 'CONSISTENT' ? true : csi?.payroll_stability ? null : null },
-                      { label: 'KRA Compliance', value: csi ? (csi.kra_compliance as string) || 'NOT DETECTED' : 'NOT DETECTED', basis: 'No KRA/VAT/PAYE transactions found', positive: csi?.kra_compliance === 'COMPLIANT' ? true : null },
+                      { label: 'KRA Compliance', value: csi ? (csi.kra_compliance as string) || 'NOT DETECTED' : 'NOT DETECTED', basis: (csi?.kra_note as string) || 'No KRA/VAT/PAYE transactions found', positive: csi?.kra_compliance === 'PASS' ? true : csi?.kra_compliance === 'GAPS_DETECTED' ? false : null },
                     ];
                     return rows.map((row) => (
                       <div key={row.label} style={{ display: 'grid', gridTemplateColumns: '1fr 200px 1fr', gap: 12, padding: '11px 0', borderBottom: '1px solid var(--s3)', alignItems: 'center' }}>
