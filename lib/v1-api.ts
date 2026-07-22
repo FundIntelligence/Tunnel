@@ -673,16 +673,36 @@ export async function getNeedsReviewTransactions(
   return res.json()
 }
 
+export type OverrideReasonCategory =
+  | 'misclassified_rule_matching'
+  | 'ambiguous_narrative'
+  | 'known_exception'
+  | 'duplicate_reversal'
+  | 'other'
+
+// PAR-52 draft taxonomy — may be refined later. 'other' requires a reason note.
+export const OVERRIDE_REASON_OPTIONS: { value: OverrideReasonCategory; label: string }[] = [
+  { value: 'misclassified_rule_matching', label: 'Misclassified by rule-matching' },
+  { value: 'ambiguous_narrative', label: 'Ambiguous narrative' },
+  { value: 'known_exception', label: 'Known exception for this client/deal' },
+  { value: 'duplicate_reversal', label: 'Duplicate/reversal' },
+  { value: 'other', label: 'Other' },
+]
+
 export async function resolveTransaction(
   dealId: string,
   rowId: string,
   newRole: string,
-  analystInitials: string
+  analystInitials: string,
+  reasonCategory: OverrideReasonCategory,
+  reasonNote?: string
 ): Promise<{ success: boolean; remaining_count: number }> {
   const form = new FormData()
   form.append('row_id', rowId)
   form.append('new_role', newRole)
   form.append('analyst_initials', analystInitials)
+  form.append('reason_category', reasonCategory)
+  form.append('reason_note', reasonNote ?? '')
   const res = await fetchApiFormData(`${BASE}/deals/${dealId}/transactions/resolve`, {
     method: 'POST',
     body: form,
@@ -889,6 +909,15 @@ export async function getMonthlyCashflow(dealId: string): Promise<{ monthly_cash
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to load cashflow' }))
     throw new Error(err.detail ?? 'Failed to load cashflow')
+  }
+  return res.json()
+}
+
+export async function getCreditScoringInputs(dealId: string): Promise<Record<string, unknown>> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/analytics/credit-scoring-inputs`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to load credit scoring inputs' }))
+    throw new Error(err.detail ?? 'Failed to load credit scoring inputs')
   }
   return res.json()
 }

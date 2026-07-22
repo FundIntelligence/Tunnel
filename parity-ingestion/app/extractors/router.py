@@ -2,9 +2,11 @@
 Bank format detection and extraction router.
 
 XLSX is routed by extension first. PDF detection order:
-KCB → KCB_Online → Equity_CLMS → NCBA → Equity → ABSA → COOP → MPESA_PDF → Stanbic → I&M → SCB
+KCB → KCB_Online → Equity_CLMS → Equity_F1 → NCBA → Equity → ABSA → COOP → MPESA_PDF → Stanbic → I&M → SCB
 
 Note: Equity_CLMS must precede NCBA because some CLMS statements trigger NCBA detection.
+Equity_F1 must precede the generic Equity check since it's structurally a
+distinct layout (Tran Particulars/Instrument columns, no "Running Balance").
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from typing import Optional, Union
 
 from app.extractors.kcb_extractor import detect_kcb, extract_kcb_pdf, detect_kcb_online, extract_kcb_online_pdf
 from app.extractors.ncba_extractor import detect_ncba, extract_ncba_pdf
-from app.extractors.equity_extractor import detect_equity, extract_equity_pdf, detect_equity_clms, extract_equity_clms_pdf
+from app.extractors.equity_extractor import detect_equity, extract_equity_pdf, detect_equity_clms, extract_equity_clms_pdf, detect_equity_f1, extract_equity_f1_pdf
 from app.extractors.absa_extractor import detect_absa, extract_absa_pdf
 from app.extractors.coop_extractor import detect_coop, extract_coop_pdf
 from app.extractors.mpesa_pdf_extractor import detect_mpesa_pdf, extract_mpesa_pdf
@@ -84,6 +86,8 @@ def route_extract(file_path: str) -> Union[ExtractionResult, dict]:
                 return extract_kcb_online_pdf(file_path)
             if detect_equity_clms(doc):
                 return extract_equity_clms_pdf(file_path)
+            if detect_equity_f1(doc):
+                return extract_equity_f1_pdf(file_path)
             if detect_ncba(doc):
                 return extract_ncba_pdf(file_path)
             if detect_equity(doc):

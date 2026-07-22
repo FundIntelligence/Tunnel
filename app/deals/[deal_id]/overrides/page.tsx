@@ -3,8 +3,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { createBrowserClient } from '@/lib/supabase'
-import { getNeedsReviewTransactions, resolveTransaction } from '@/lib/v1-api'
-import type { NeedsReviewTransaction } from '@/lib/v1-api'
+import { getNeedsReviewTransactions, resolveTransaction, OVERRIDE_REASON_OPTIONS } from '@/lib/v1-api'
+import type { NeedsReviewTransaction, OverrideReasonCategory } from '@/lib/v1-api'
 
 const ROLES: { value: string; label: string }[] = [
   { value: 'revenue_operational', label: 'Revenue: Operational' },
@@ -41,6 +41,8 @@ function formatAmount(cents: number): string {
 
 interface RowState {
   selectedRole: string
+  selectedReason: OverrideReasonCategory | ''
+  reasonNote: string
   resolving: boolean
   resolved: boolean
   error: string
@@ -80,7 +82,7 @@ export default function OverridesPage() {
         setTransactions(txns)
         const initial: Record<string, RowState> = {}
         for (const t of txns) {
-          initial[t.row_id] = { selectedRole: ROLES[0].value, resolving: false, resolved: false, error: '' }
+          initial[t.row_id] = { selectedRole: ROLES[0].value, selectedReason: '', reasonNote: '', resolving: false, resolved: false, error: '' }
         }
         setRowStates(initial)
       })
@@ -104,12 +106,28 @@ export default function OverridesPage() {
     setRowStates((prev) => ({ ...prev, [rowId]: { ...prev[rowId], selectedRole: role, error: '' } }))
   }, [])
 
+  const handleReasonChange = useCallback((rowId: string, reason: OverrideReasonCategory) => {
+    setRowStates((prev) => ({ ...prev, [rowId]: { ...prev[rowId], selectedReason: reason, error: '' } }))
+  }, [])
+
+  const handleReasonNoteChange = useCallback((rowId: string, note: string) => {
+    setRowStates((prev) => ({ ...prev, [rowId]: { ...prev[rowId], reasonNote: note, error: '' } }))
+  }, [])
+
   const handleResolve = useCallback(async (txn: NeedsReviewTransaction) => {
     const state = rowStates[txn.row_id]
     if (!state || state.resolved || state.resolving) return
+    if (!state.selectedReason) {
+      setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], error: 'Select a reason before resolving.' } }))
+      return
+    }
+    if (state.selectedReason === 'other' && !state.reasonNote.trim()) {
+      setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], error: "Reason note is required for 'Other'." } }))
+      return
+    }
     setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], resolving: true, error: '' } }))
     try {
-      await resolveTransaction(dealId, txn.row_id, state.selectedRole, analystInitials)
+      await resolveTransaction(dealId, txn.row_id, state.selectedRole, analystInitials, state.selectedReason, state.reasonNote)
       setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], resolving: false, resolved: true } }))
     } catch (err: any) {
       setRowStates((prev) => ({
@@ -258,28 +276,60 @@ export default function OverridesPage() {
                     {formatAmount(txn.signed_amount_cents)}
                   </span>
 
-                  {/* Role dropdown */}
-                  <div className="pl-3">
+                  {/* Role + reason */}
+                  <div className="pl-3 space-y-1.5">
                     {state.resolved ? (
                       <span className="text-xs font-medium" style={{ color: 'var(--green)' }}>
                         ✓ {ROLES.find((r) => r.value === state.selectedRole)?.label ?? state.selectedRole}
                       </span>
                     ) : (
-                      <select
-                        value={state.selectedRole}
-                        onChange={(e) => handleRoleChange(txn.row_id, e.target.value)}
-                        disabled={state.resolving}
-                        className="w-full text-xs rounded px-2 py-1.5 outline-none"
-                        style={{
-                          background: 'var(--s2)',
-                          border: '1px solid rgba(20,184,166,0.3)',
-                          color: 'var(--t0)',
-                        }}
-                      >
-                        {ROLES.map((r) => (
-                          <option key={r.value} value={r.value}>{r.label}</option>
-                        ))}
-                      </select>
+                      <>
+                        <select
+                          value={state.selectedRole}
+                          onChange={(e) => handleRoleChange(txn.row_id, e.target.value)}
+                          disabled={state.resolving}
+                          className="w-full text-xs rounded px-2 py-1.5 outline-none"
+                          style={{
+                            background: 'var(--s2)',
+                            border: '1px solid rgba(20,184,166,0.3)',
+                            color: 'var(--t0)',
+                          }}
+                        >
+                          {ROLES.map((r) => (
+                            <option key={r.value} value={r.value}>{r.label}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={state.selectedReason}
+                          onChange={(e) => handleReasonChange(txn.row_id, e.target.value as OverrideReasonCategory)}
+                          disabled={state.resolving}
+                          className="w-full text-xs rounded px-2 py-1.5 outline-none"
+                          style={{
+                            background: 'var(--s2)',
+                            border: `1px solid ${state.selectedReason ? 'rgba(20,184,166,0.3)' : 'var(--amber)'}`,
+                            color: 'var(--t0)',
+                          }}
+                        >
+                          <option value="">Reason…</option>
+                          {OVERRIDE_REASON_OPTIONS.map((r) => (
+                            <option key={r.value} value={r.value}>{r.label}</option>
+                          ))}
+                        </select>
+                        {state.selectedReason === 'other' && (
+                          <input
+                            type="text"
+                            value={state.reasonNote}
+                            onChange={(e) => handleReasonNoteChange(txn.row_id, e.target.value)}
+                            placeholder="Reason note (required)"
+                            className="w-full text-xs rounded px-2 py-1.5 outline-none"
+                            style={{
+                              background: 'var(--s2)',
+                              border: '1px solid rgba(20,184,166,0.3)',
+                              color: 'var(--t0)',
+                            }}
+                          />
+                        )}
+                      </>
                     )}
                     {state.error && (
                       <p className="text-xs mt-1" style={{ color: 'var(--red)' }}>{state.error}</p>

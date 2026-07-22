@@ -29,13 +29,32 @@ from app.models import ExtractionResult, RawTransaction, WarningItem
 from app.extractors.shared import _group_by_line
 from app.extractors.pdf_document import NormalizedDocument, as_document
 
-# X-thresholds from real file (words)
+# X-thresholds from real file (words) — legacy template:
+# Txn Date | Description | User Narrative | Money Out | Money In | Balance
 _TXN_DATE_X_MAX = 120.0
 _DESC_X_MAX = 400.0
 _MONEY_OUT_X_MAX = 465.0
 _MONEY_IN_X_MAX = 515.0
 # Balance: x0 >= 515
-_AMOUNT_PAT = re.compile(r"^[\d,]+\.\d{2}$")
+
+# X-thresholds for the "Absa One Biashara Account" template — a differently
+# laid-out statement (wider page, columns shifted right) that the legacy
+# thresholds above do not fit:
+# DATE | DESCRIPTION | USER DESCRIPTION | VALUE DATE | DEBIT | CREDIT | BALANCE
+# The Value Date column duplicates the transaction date and carries no extra
+# information here, so it is deliberately dropped rather than parsed.
+_OB_DATE_X_MAX = 60.0
+_OB_DESC_X_MAX = 175.0
+_OB_USER_DESC_X_MAX = 290.0
+_OB_VALUE_DATE_X_MAX = 420.0
+_OB_DEBIT_X_MAX = 540.0
+_OB_CREDIT_X_MAX = 660.0
+# Balance: x0 >= 660
+
+# Leading "-" allowed: real "Absa One Biashara" statements can show a
+# momentary negative running balance (overdraft), which must still be
+# recognised as an amount token and land in the balance column.
+_AMOUNT_PAT = re.compile(r"^-?[\d,]+\.\d{2}$")
 _DATE_TOKEN_PAT = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 _ROW_TOLERANCE = 5.0
 
@@ -48,9 +67,40 @@ def detect_absa(source: Union[str, NormalizedDocument]) -> bool:
             return (
                 "Absa Bank Kenya" in text
                 or "absa.kenya@absa.africa" in text
+                or "Absa One Biashara Account" in text
             )
     except Exception:
         return False
+
+
+def _is_one_biashara_layout(source: Union[str, NormalizedDocument]) -> bool:
+    """
+    True for the "Absa One Biashara Account" column layout (DATE | DESCRIPTION
+    | USER DESCRIPTION | VALUE DATE | DEBIT | CREDIT | BALANCE), which needs
+    different x-thresholds than the legacy Txn Date/Money Out/Money In layout.
+    Detected structurally (header tokens), not by brand text, since both
+    layouts share the same "Absa" branding.
+    """
+    try:
+        with as_document(source) as doc:
+            text = doc.text_upto(1).upper()
+            return "USER DESCRIPTION" in text and "VALUE DATE" in text
+    except Exception:
+        return False
+
+
+def _is_ob_trailer_line(date_parts: List[str]) -> bool:
+    """
+    "Absa One Biashara" statements interleave per-transaction metadata lines
+    ("Our Ref : ...", "Customer Ref. No. : ...", "BALANCE : KES ...") between
+    transactions. Each starts with a word in the date-column x-zone that is
+    never a real transaction date, which is what distinguishes them from
+    genuine multi-line description continuations (those start further right,
+    with an empty date zone for that line). Without filtering, these lines
+    get appended to the previous transaction's description as junk text.
+    """
+    first_token = (date_parts[0] if date_parts else "").upper()
+    return first_token in ("OUR", "CUSTOMER", "BALANCE")
 
 
 def _parse_absa_date(raw: str) -> Optional[str]:
@@ -99,6 +149,10 @@ def _is_header_row(date_parts: List[str], desc_parts: List[str]) -> bool:
     return "TXN DATE" in date_str or "DATE" in date_str or "DESCRIPTION" in desc_str
 
 
+def _is_reversal_description(description: str) -> bool:
+    return description.strip().upper().startswith("REVERSAL:")
+
+
 def _flush_absa_pending(
     pending: dict,
     transactions: List[RawTransaction],
@@ -114,13 +168,27 @@ def _flush_absa_pending(
             )
         )
 
+    debit_raw = pending["debit_raw"]
+    credit_raw = pending["credit_raw"]
+    # "REVERSAL: <original description>" rows render their amount in the
+    # SAME column the original (reversed) transaction used — a reversed
+    # debit still prints in the Money Out column — but the ledger effect is
+    # the opposite: reversing a debit adds back to the balance (a credit
+    # effect) and reversing a credit removes from it (a debit effect). Left
+    # unswapped, every reversal breaks the running-balance chain by exactly
+    # 2x its amount. Confirmed against the real "Absa One Biashara Account"
+    # fixture (Tres Beau Medical Group statement, PAR-64): every one of its
+    # REVERSAL: rows reconciles only after this swap.
+    if _is_reversal_description(pending["description"] or ""):
+        debit_raw, credit_raw = credit_raw, debit_raw
+
     transactions.append(
         RawTransaction(
             row_index=pending["row_index"],
             date_raw=pending["date_raw"],
             description=pending["description"] or "",
-            debit_raw=pending["debit_raw"],
-            credit_raw=pending["credit_raw"],
+            debit_raw=debit_raw,
+            credit_raw=credit_raw,
             balance_raw=pending["balance_raw"],
             source_file=pending["source_file"],
             extraction_confidence=1.0,
@@ -128,8 +196,24 @@ def _flush_absa_pending(
     )
 
 
-def _is_footer_or_marketing(text: str) -> bool:
+def _is_footer_or_marketing(text: str, has_amount: bool = False) -> bool:
+    """
+    A real transaction always carries at least one amount (debit, credit, or
+    balance); footer/ad copy never does. Without `has_amount`, the bare
+    "MARKETING" check below false-positives on real transaction narratives
+    like "BP:PESALINK-2/MARKETING" (a payment category label, not an ad) —
+    confirmed against a real "Absa One Biashara" statement where this
+    silently dropped a genuine KES 100,000 debit (balance arithmetic across
+    adjacent rows only reconciles with it included).
+    """
     t = (text or "").upper()
+    # Unambiguous statement-footer signatures — never legitimate transaction
+    # narrative text, so these apply regardless of whether an amount is present
+    # (the end-of-statement "CLOSING BALANCE" recap row carries a balance value).
+    if "CLOSING BALANCE" in t:
+        return True
+    if has_amount:
+        return False
     return (
         "PAGE" in t and "OF" in t
         or "CONTINUED" in t
@@ -156,10 +240,34 @@ def _assign_word_column(w: dict) -> Optional[str]:
     return None
 
 
+def _assign_word_column_ob(w: dict) -> Optional[str]:
+    """Column assignment for the "Absa One Biashara Account" layout."""
+    text = w.get("text", "")
+    x0 = w.get("x0", 0)
+    if _AMOUNT_PAT.match(text):
+        if x0 >= _OB_CREDIT_X_MAX:
+            return "balance"
+        if x0 >= _OB_DEBIT_X_MAX:
+            return "money_in"
+        if x0 >= _OB_VALUE_DATE_X_MAX:
+            return "money_out"
+    if x0 < _OB_DATE_X_MAX:
+        return "date"
+    if x0 < _OB_DESC_X_MAX:
+        return "desc"
+    if x0 < _OB_USER_DESC_X_MAX:
+        return "user_desc"
+    if x0 < _OB_VALUE_DATE_X_MAX:
+        return None  # value date column — duplicates txn date, discarded
+    return None
+
+
 def extract_absa_pdf(file_path: str) -> ExtractionResult:
     transactions: List[RawTransaction] = []
     warnings: List[WarningItem] = []
     row_idx = 0
+    one_biashara = _is_one_biashara_layout(file_path)
+    assign_col = _assign_word_column_ob if one_biashara else _assign_word_column
 
     with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
@@ -173,18 +281,21 @@ def extract_absa_pdf(file_path: str) -> ExtractionResult:
             for row_words in rows:
                 date_parts: List[str] = []
                 desc_parts: List[str] = []
+                user_desc_parts: List[str] = []
                 money_out = ""
                 money_in = ""
                 balance_raw = ""
 
                 for w in row_words:
-                    col = _assign_word_column(w)
+                    col = assign_col(w)
                     if col == "date":
-                        if date_parts and _DATE_TOKEN_PAT.match(w["text"]):
+                        if not one_biashara and date_parts and _DATE_TOKEN_PAT.match(w["text"]):
                             continue  # value date column — transaction date already captured
                         date_parts.append(w["text"])
                     elif col == "desc":
                         desc_parts.append(w["text"])
+                    elif col == "user_desc":
+                        user_desc_parts.append(w["text"])
                     elif col == "money_out":
                         money_out = w["text"]
                     elif col == "money_in":
@@ -192,13 +303,16 @@ def extract_absa_pdf(file_path: str) -> ExtractionResult:
                     elif col == "balance":
                         balance_raw = w["text"]
 
+                if one_biashara and _is_ob_trailer_line(date_parts):
+                    continue
+
                 date_str = " ".join(date_parts).strip()
-                desc_str = " ".join(desc_parts).strip()
+                desc_str = " ".join(desc_parts + user_desc_parts).strip()
 
                 if _is_header_row(date_parts, desc_parts):
                     continue
 
-                if _is_footer_or_marketing(desc_str):
+                if _is_footer_or_marketing(desc_str, has_amount=bool(money_out or money_in or balance_raw)):
                     continue
 
                 if not date_str and not desc_str and not money_out and not money_in:

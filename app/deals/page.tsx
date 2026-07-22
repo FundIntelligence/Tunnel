@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useQueries } from '@tanstack/react-query'
 import { createBrowserClient } from '@/lib/supabase'
-import { getDeal, listDocuments } from '@/lib/v1-api'
+import { getDeal, listDocuments, type AnalysisRun } from '@/lib/v1-api'
 import { useDealsListQuery, dealDetailKey, dealDocumentsKey } from '@/lib/queries/deals'
 import { ThemeToggle } from '@/components/ThemeToggle'
 
@@ -28,6 +28,8 @@ export default function DashboardPage() {
   const router = useRouter()
   const [user, setUser] = useState<any>(null)
   const [userId, setUserId] = useState<string | undefined>(undefined)
+  const [search, setSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<string>('all')
 
   useEffect(() => {
     const supabase = createBrowserClient()
@@ -62,20 +64,60 @@ export default function DashboardPage() {
   })
 
   const statuses: Record<string, PipelineStatus> = {}
+  const latestRunByDeal: Record<string, AnalysisRun | undefined> = {}
+  let statusesLoaded = 0
   deals.forEach((d, i) => {
     const detail = dealDetailQueries[i]?.data
     const docs = dealDocumentsQueries[i]?.data
     if (!detail || !docs) return
+    statusesLoaded += 1
     statuses[d.id] = computeStatus(
       docs.documents.map((doc) => doc.status),
       detail.analysis_runs.length > 0
     )
+    latestRunByDeal[d.id] = detail.analysis_runs.length > 0
+      ? detail.analysis_runs.reduce((a, b) => ((b.created_at as string || '') > (a.created_at as string || '') ? b : a))
+      : undefined
   })
 
   const loading = dealsQuery.isLoading
   const email = user?.email ?? ''
   const initials = email ? email.slice(0, 2).toUpperCase() : 'AN'
   const activeDeals = deals.length
+
+  // All derived from data already fetched above — no additional per-deal calls.
+  const now = new Date()
+  const newThisMonth = deals.filter((d) => {
+    if (!d.created_at) return false
+    const c = new Date(d.created_at as string)
+    return c.getUTCFullYear() === now.getUTCFullYear() && c.getUTCMonth() === now.getUTCMonth()
+  }).length
+
+  const dealsWithStatus = deals.filter((d) => statuses[d.id])
+  const pendingCount = dealsWithStatus.filter((d) => statuses[d.id].label !== 'Analysis complete').length
+
+  const runsWithConfidence = deals
+    .map((d) => latestRunByDeal[d.id])
+    .filter((r): r is AnalysisRun => !!r)
+  const avgAccuracyBp = runsWithConfidence.length > 0
+    ? Math.round(runsWithConfidence.reduce((s, r) => s + (r.final_confidence_bp || 0), 0) / runsWithConfidence.length)
+    : null
+  const avgOverridePenaltyBp = runsWithConfidence.length > 0
+    ? Math.round(runsWithConfidence.reduce((s, r) => s + (Number(r.override_penalty_bp) || 0), 0) / runsWithConfidence.length)
+    : null
+
+  // Search/filter narrows what's shown in the Deal Pipeline table only —
+  // the stat cards above still reflect the full portfolio.
+  const STATUS_FILTER_OPTIONS = ['Analysis complete', 'In progress', 'Ready to analyse', 'Failed — retry', 'Uploading documents']
+  const searchLower = search.trim().toLowerCase()
+  const filteredDeals = deals.filter((d) => {
+    if (statusFilter !== 'all' && (statuses[d.id]?.label ?? STATUS_UPLOADING.label) !== statusFilter) return false
+    if (!searchLower) return true
+    const name = ((d.company_name || d.name || '') as string).toLowerCase()
+    const shortId = d.id.replace(/-/g, '').slice(0, 12).toLowerCase()
+    const analyst = ((d.analyst_initials || '') as string).toLowerCase()
+    return name.includes(searchLower) || shortId.includes(searchLower) || analyst.includes(searchLower)
+  })
 
   if (loading) {
     return (
@@ -106,15 +148,12 @@ export default function DashboardPage() {
         )}
         <nav style={{ flex: 1, padding: '8px 0' }}>
           <div style={{ padding: '6px 16px', fontSize: 9, color: 'var(--t2)', letterSpacing: '0.12em', fontWeight: 600 }}>OPERATIONS</div>
-          <button onClick={() => {}} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '9px 16px', background: 'rgba(20,184,166,0.1)', borderLeft: '2px solid var(--accent)', border: 'none', color: 'var(--accent)', fontSize: 13, cursor: 'pointer', textAlign: 'left', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          <button onClick={() => router.push('/deals')} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '9px 16px', background: 'rgba(20,184,166,0.1)', borderLeft: '2px solid var(--accent)', border: 'none', color: 'var(--accent)', fontSize: 13, cursor: 'pointer', textAlign: 'left', fontFamily: "'IBM Plex Sans', sans-serif" }}>
             Dashboard <span style={{ fontSize: 10, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>SYS</span>
           </button>
-          <button onClick={() => {}} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '9px 16px', background: 'transparent', borderLeft: '2px solid transparent', border: 'none', color: 'var(--t1)', fontSize: 13, cursor: 'pointer', textAlign: 'left', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          <button onClick={() => router.push('/deals')} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '9px 16px', background: 'transparent', borderLeft: '2px solid transparent', border: 'none', color: 'var(--t1)', fontSize: 13, cursor: 'pointer', textAlign: 'left', fontFamily: "'IBM Plex Sans', sans-serif" }}>
             Deals <span style={{ fontSize: 10, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>{String(activeDeals).padStart(2, '0')}</span>
           </button>
-          <div style={{ padding: '9px 16px', color: 'var(--t2)', fontSize: 13, borderLeft: '2px solid transparent', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            Portfolio <span style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace" }}>12</span>
-          </div>
           <div style={{ padding: '12px 16px 6px', fontSize: 9, color: 'var(--t2)', letterSpacing: '0.12em', fontWeight: 600, marginTop: 4 }}>INTELLIGENCE</div>
           <div style={{ padding: '9px 16px', color: 'var(--t2)', fontSize: 13 }}>Parity Review</div>
           <div style={{ padding: '9px 16px', color: 'var(--t2)', fontSize: 13 }}>Benchmarks</div>
@@ -157,12 +196,31 @@ export default function DashboardPage() {
           {/* Stat cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', background: 'var(--s3)', border: '1px solid var(--s3)', borderRadius: 8, overflow: 'hidden', marginBottom: 28, gap: 1 }}>
             {[
-              { label: 'ACTIVE DEALS', value: String(activeDeals).padStart(2, '0'), sub: '+1 this month', color: 'var(--t0)' },
-              { label: 'PENDING REVIEW', value: '01', sub: deals[0] ? (deals[0].company_name || deals[0].name || '—') as string : '—', color: 'var(--amber)' },
-              { label: 'AVG ACCURACY', value: '97.3%', sub: '9,730 bps', color: 'var(--green)' },
-              { label: 'OVERRIDE RATE', value: '2.7%', sub: '↓ vs prior period', color: 'var(--t0)' },
-              { label: 'ENTITY DISCOVERIES', value: '07', sub: `${activeDeals} active deals`, color: '#818CF8' },
-              { label: 'NEEDS REVIEW', value: '03', sub: 'requires action', color: 'var(--amber)' },
+              { label: 'ACTIVE DEALS', value: String(activeDeals).padStart(2, '0'), sub: newThisMonth > 0 ? `+${newThisMonth} this month` : 'No new deals this month', color: 'var(--t0)' },
+              {
+                label: 'PENDING REVIEW',
+                value: statusesLoaded > 0 ? String(pendingCount).padStart(2, '0') : '—',
+                sub: statusesLoaded > 0 ? `of ${activeDeals} total` : 'Loading…',
+                color: 'var(--amber)',
+              },
+              {
+                label: 'AVG ACCURACY',
+                value: avgAccuracyBp !== null ? `${(avgAccuracyBp / 100).toFixed(1)}%` : '—',
+                sub: avgAccuracyBp !== null ? `${avgAccuracyBp} bps · ${runsWithConfidence.length} deal${runsWithConfidence.length !== 1 ? 's' : ''} analysed` : 'No completed analyses yet',
+                color: 'var(--green)',
+              },
+              {
+                label: 'OVERRIDE RATE',
+                value: avgOverridePenaltyBp !== null ? `${(avgOverridePenaltyBp / 100).toFixed(1)}%` : '—',
+                sub: avgOverridePenaltyBp !== null ? 'avg. confidence penalty' : 'No completed analyses yet',
+                color: 'var(--t0)',
+              },
+              // Entity discoveries and needs-review counts aren't in the data this
+              // page already fetches (getDeal/listDocuments) — showing them would
+              // mean N more per-deal calls (see the N+1 already flagged on this
+              // page) or a new aggregate endpoint. Left honest rather than faked.
+              { label: 'ENTITY DISCOVERIES', value: '—', sub: 'Not yet wired', color: '#818CF8' },
+              { label: 'NEEDS REVIEW', value: '—', sub: 'Not yet wired', color: 'var(--amber)' },
             ].map((s) => (
               <div key={s.label} style={{ background: 'var(--s1)', padding: '16px 18px' }}>
                 <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.1em', marginBottom: 8 }}>{s.label}</div>
@@ -177,9 +235,36 @@ export default function DashboardPage() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--s3)' }}>
               <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', color: 'var(--t0)' }}>DEAL PIPELINE</span>
               <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <span style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>{activeDeals} record{activeDeals !== 1 ? 's' : ''}</span>
+                <span style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>{filteredDeals.length} of {activeDeals} record{activeDeals !== 1 ? 's' : ''}</span>
                 <button onClick={() => router.push('/deals/new')} style={{ padding: '4px 12px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>+ New</button>
               </div>
+            </div>
+
+            {/* Search / filter */}
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 20px', borderBottom: '1px solid var(--s3)' }}>
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search borrower, analyst, or deal ID…"
+                style={{ flex: 1, maxWidth: 320, background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+              />
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+              >
+                <option value="all">All statuses</option>
+                {STATUS_FILTER_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+              {(search || statusFilter !== 'all') && (
+                <button
+                  onClick={() => { setSearch(''); setStatusFilter('all') }}
+                  style={{ padding: '5px 10px', background: 'transparent', border: '1px solid var(--b1)', borderRadius: 4, fontSize: 11, color: 'var(--t2)', cursor: 'pointer' }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
 
             {/* Column headers */}
@@ -196,7 +281,14 @@ export default function DashboardPage() {
               </div>
             )}
 
-            {deals.map((deal) => {
+            {deals.length > 0 && filteredDeals.length === 0 && (
+              <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--t2)', fontSize: 13 }}>
+                No deals match your search/filter.{' '}
+                <span style={{ color: 'var(--accent)', cursor: 'pointer' }} onClick={() => { setSearch(''); setStatusFilter('all') }}>Clear filters →</span>
+              </div>
+            )}
+
+            {filteredDeals.map((deal) => {
               const name = (deal.company_name || deal.name || 'Untitled') as string
               const shortId = deal.id.replace(/-/g, '').slice(0, 12).toUpperCase()
               const analyst = ((deal.analyst_initials || '—') as string).toUpperCase()
@@ -205,6 +297,12 @@ export default function DashboardPage() {
                 ? new Date(deal.created_at as string).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
                 : '—'
               const status = statuses[deal.id] ?? STATUS_UPLOADING
+              const run = latestRunByDeal[deal.id]
+              const dealSize = run
+                ? `${currency} ${(run.non_transfer_abs_total_cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                : `${currency} —`
+              const confidencePct = run ? (run.final_confidence_bp / 100).toFixed(1) : null
+              const tierColor: Record<string, string> = { High: 'var(--green)', Medium: 'var(--amber)', Low: 'var(--red)' }
               return (
                 <div
                   key={deal.id}
@@ -218,15 +316,17 @@ export default function DashboardPage() {
                     <div style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace", marginTop: 2 }}>{shortId} · {currency}</div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center' }}>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--accent)', background: 'rgba(20,184,166,0.12)', padding: '2px 7px', borderRadius: 3, border: '1px solid rgba(20,184,166,0.2)', letterSpacing: '0.06em' }}>DEBT</span>
+                    <span style={{ fontSize: 10, color: 'var(--t2)' }}>—</span>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, color: 'var(--t1)', fontFamily: "'IBM Plex Mono', monospace" }}>{currency} —</div>
+                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, color: 'var(--t1)', fontFamily: "'IBM Plex Mono', monospace" }}>{dealSize}</div>
                   <div style={{ display: 'flex', alignItems: 'center', fontSize: 13, fontWeight: 600, color: 'var(--t0)' }}>{analyst}</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--t1)' }}>
                     <span style={{ width: 7, height: 7, borderRadius: '50%', background: status.dot, display: 'inline-block', flexShrink: 0 }} />
                     {status.label}
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>—</div>
+                  <div style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: run ? tierColor[run.tier] : 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>
+                    {confidencePct ? `${confidencePct}% · ${run!.tier}` : '—'}
+                  </div>
                   <div style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--t2)' }}>{updatedAt}</div>
                 </div>
               )

@@ -152,3 +152,107 @@ class TestAbsaCorporateTemplate:
         result = extract_absa_pdf(CORP_ABSA_PDF)
         for t in result.raw_transactions:
             assert not (t.debit_raw and t.credit_raw and not t.description.strip())
+
+
+# ── "Absa One Biashara Account" template (PAR-64) ─────────────────────────────
+# Real, committed fixture (gitignored as NDA client data — see
+# tests/fixtures/real_samples/, never pushed). Columns: DATE | DESCRIPTION |
+# USER DESCRIPTION | VALUE DATE | DEBIT | CREDIT | BALANCE — a wider page with
+# entirely different x-coordinates than the legacy template, and no "Absa Bank
+# Kenya"/"absa.kenya@absa.africa" brand text the old detector relied on.
+
+OB_ABSA_PDF = str(
+    __import__("pathlib").Path(__file__).parent
+    / "fixtures/real_samples/bank_samples/ABSA Bank Statement for Dorah Omondi.pdf"
+)
+
+
+def _can_open_ob_absa_pdf() -> bool:
+    import pathlib
+    if not pathlib.Path(OB_ABSA_PDF).exists():
+        return False
+    try:
+        import pdfplumber
+        with pdfplumber.open(OB_ABSA_PDF) as pdf:
+            _ = pdf.pages[0].extract_text()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _can_open_ob_absa_pdf(), reason="Absa One Biashara fixture missing or unreadable")
+class TestAbsaOneBiasharaTemplate:
+    def test_detect_absa(self):
+        assert detect_absa(OB_ABSA_PDF) is True
+
+    def test_file_not_rejected(self):
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        assert result.extraction_status in ("success", "needs_review")
+        assert len(result.raw_transactions) > 0
+
+    def test_debit_credit_totals_match_declared_counts(self):
+        """Statement declares its own "<n> Debits <total>" / "<n> Credits
+        <total>" recap on the final page — sum of extracted debit/credit
+        rows must match exactly."""
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        total_debit = sum(_to_cents(t.debit_raw) for t in result.raw_transactions)
+        total_credit = sum(_to_cents(t.credit_raw) for t in result.raw_transactions)
+        assert total_debit == 7074493315  # KES 70,744,933.15
+        assert total_credit == 7074990370  # KES 70,749,903.70
+
+    def test_running_balance_reconciles_every_row(self):
+        """Strongest available accuracy signal: recompute the running
+        balance from debit/credit deltas and require it to match the
+        statement's own printed balance for every single row (2819 of 2819
+        transitions in the real fixture)."""
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        rows = [t for t in result.raw_transactions if t.date_raw]
+        prev_bal = None
+        checked = 0
+        for t in rows:
+            bal = _to_cents(t.balance_raw.lstrip("-")) * (-1 if t.balance_raw.startswith("-") else 1) if t.balance_raw else None
+            debit = _to_cents(t.debit_raw)
+            credit = _to_cents(t.credit_raw)
+            if bal is None:
+                continue
+            if prev_bal is not None:
+                assert abs((prev_bal - debit + credit) - bal) <= 1
+                checked += 1
+            prev_bal = bal
+        assert checked > 2500
+
+    def test_negative_balance_captured(self):
+        """A momentary overdraft ("-301,702.85") must still be captured as
+        a balance value, not silently dropped to empty."""
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        negative_balances = [t for t in result.raw_transactions if (t.balance_raw or "").startswith("-")]
+        assert len(negative_balances) >= 1
+
+    def test_marketing_narrative_not_treated_as_footer(self):
+        """A real transaction narrative containing the word "marketing"
+        (e.g. "BP:PESALINK-2/MARKETING") must not be dropped by the
+        footer/ad-copy filter — only genuine footer text with no amount
+        should be."""
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        marketing_txns = [
+            t for t in result.raw_transactions
+            if "MARKETING" in (t.description or "").upper()
+        ]
+        assert len(marketing_txns) >= 1
+        assert any(t.debit_raw or t.credit_raw for t in marketing_txns)
+
+    def test_no_closing_balance_summary_row(self):
+        """The end-of-statement "CLOSING BALANCE" recap block must never
+        appear as a transaction row."""
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        for t in result.raw_transactions:
+            assert "CLOSING BALANCE" not in (t.description or "").upper()
+
+    def test_no_floats(self):
+        result = extract_absa_pdf(OB_ABSA_PDF)
+        normalise_all(result)
+        for t in result.normalised_transactions:
+            if t.debit_cents is not None:
+                assert isinstance(t.debit_cents, int)
+            if t.credit_cents is not None:
+                assert isinstance(t.credit_cents, int)

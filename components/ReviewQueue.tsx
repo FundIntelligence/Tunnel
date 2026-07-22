@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback, memo } from 'react'
-import { getNeedsReview, resolveTransaction, type NeedsReviewItem } from '@/lib/v1-api'
+import { getNeedsReview, resolveTransaction, OVERRIDE_REASON_OPTIONS, type NeedsReviewItem, type OverrideReasonCategory } from '@/lib/v1-api'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 
 const ROLE_OPTIONS = [
@@ -32,11 +32,15 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
   const [error, setError] = useState('')
   const [activeItemId, setActiveItemId] = useState<string | null>(null)
   const [selectedRole, setSelectedRole] = useState('supplier')
+  const [selectedReason, setSelectedReason] = useState<OverrideReasonCategory | ''>('')
+  const [reasonNote, setReasonNote] = useState('')
   const [resolving, setResolving] = useState(false)
   const [resolvedCount, setResolvedCount] = useState(0)
   const [bulkMode, setBulkMode] = useState(true)
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set())
   const [bulkRole, setBulkRole] = useState('supplier')
+  const [bulkReason, setBulkReason] = useState<OverrideReasonCategory | ''>('')
+  const [bulkReasonNote, setBulkReasonNote] = useState('')
   const [bulkResolving, setBulkResolving] = useState(false)
 
   const queryClient = useQueryClient()
@@ -74,9 +78,10 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
   const resolveMutation = useMutation<
     { success: boolean; remaining_count: number },
     Error,
-    { rowId: string; newRole: string }
+    { rowId: string; newRole: string; reasonCategory: OverrideReasonCategory; reasonNote: string }
   >({
-    mutationFn: ({ rowId, newRole }) => resolveTransaction(dealId, rowId, newRole, analystInitials),
+    mutationFn: ({ rowId, newRole, reasonCategory, reasonNote: note }) =>
+      resolveTransaction(dealId, rowId, newRole, analystInitials, reasonCategory, note),
     onMutate: async ({ rowId }) => {
       await queryClient.cancelQueries({ queryKey: ['needsReview', dealId] })
       const previous = queryClient.getQueryData<{ transactions: NeedsReviewItem[]; total: number }>(['needsReview', dealId])
@@ -99,11 +104,15 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
   })
 
   const handleResolve = async (rowId: string, newRole: string) => {
+    if (!selectedReason) { setError('Select a reason before resolving.'); return }
+    if (selectedReason === 'other' && !reasonNote.trim()) { setError("Reason note is required for 'Other'."); return }
     setResolving(true)
     try {
-      await resolveMutation.mutateAsync({ rowId, newRole })
+      await resolveMutation.mutateAsync({ rowId, newRole, reasonCategory: selectedReason, reasonNote })
       setResolvedCount(prev => prev + 1)
       setActiveItemId(null)
+      setSelectedReason('')
+      setReasonNote('')
     } catch (e) {
       // error handled in mutation
     } finally {
@@ -113,16 +122,20 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
 
   const handleBulkResolve = async () => {
     if (bulkSelected.size === 0) return
+    if (!bulkReason) { setError('Select a reason before resolving.'); return }
+    if (bulkReason === 'other' && !bulkReasonNote.trim()) { setError("Reason note is required for 'Other'."); return }
     setBulkResolving(true)
     const ids = Array.from(bulkSelected)
     for (const rowId of ids) {
       try {
-        await resolveMutation.mutateAsync({ rowId, newRole: bulkRole })
+        await resolveMutation.mutateAsync({ rowId, newRole: bulkRole, reasonCategory: bulkReason, reasonNote: bulkReasonNote })
       } catch {
         /* continue with others */
       }
     }
     setBulkSelected(new Set())
+    setBulkReason('')
+    setBulkReasonNote('')
     setBulkResolving(false)
   }
 
@@ -175,23 +188,43 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
 
       {/* Bulk action bar */}
       {bulkMode && bulkSelected.size > 0 && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', background: 'rgba(20,184,166,0.08)', border: '1px solid rgba(20,184,166,0.2)', borderRadius: 6, marginBottom: 14 }}>
-          <span style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 600 }}>{bulkSelected.size} selected</span>
-          <span style={{ fontSize: 11, color: 'var(--t2)' }}>→ Classify as:</span>
-          <select
-            value={bulkRole}
-            onChange={(e) => setBulkRole(e.target.value)}
-            style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '4px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
-          >
-            {ROLE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
-          </select>
-          <button
-            onClick={handleBulkResolve}
-            disabled={bulkResolving}
-            style={{ padding: '5px 14px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: bulkResolving ? 'not-allowed' : 'pointer', opacity: bulkResolving ? 0.6 : 1 }}
-          >
-            {bulkResolving ? 'Resolving…' : `Resolve ${bulkSelected.size}`}
-          </button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 16px', background: 'rgba(20,184,166,0.08)', border: '1px solid rgba(20,184,166,0.2)', borderRadius: 6, marginBottom: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 600 }}>{bulkSelected.size} selected</span>
+            <span style={{ fontSize: 11, color: 'var(--t2)' }}>→ Classify as:</span>
+            <select
+              value={bulkRole}
+              onChange={(e) => setBulkRole(e.target.value)}
+              style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '4px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+            >
+              {ROLE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+            </select>
+            <span style={{ fontSize: 11, color: 'var(--t2)' }}>Reason:</span>
+            <select
+              value={bulkReason}
+              onChange={(e) => setBulkReason(e.target.value as OverrideReasonCategory)}
+              style={{ background: 'var(--s2)', border: `1px solid ${bulkReason ? 'var(--b1)' : 'var(--amber)'}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+            >
+              <option value="">Select reason…</option>
+              {OVERRIDE_REASON_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+            </select>
+            <button
+              onClick={handleBulkResolve}
+              disabled={bulkResolving}
+              style={{ padding: '5px 14px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: bulkResolving ? 'not-allowed' : 'pointer', opacity: bulkResolving ? 0.6 : 1 }}
+            >
+              {bulkResolving ? 'Resolving…' : `Resolve ${bulkSelected.size}`}
+            </button>
+          </div>
+          {bulkReason === 'other' && (
+            <input
+              type="text"
+              value={bulkReasonNote}
+              onChange={(e) => setBulkReasonNote(e.target.value)}
+              placeholder="Reason note (required for 'Other')"
+              style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '5px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
+            />
+          )}
         </div>
       )}
 
@@ -248,6 +281,8 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                   if (bulkMode) { toggleBulkItem(rowId); return }
                   setActiveItemId(isActive ? null : rowId)
                   setSelectedRole('supplier')
+                  setSelectedReason('')
+                  setReasonNote('')
                 }}
                 style={{
                   display: 'grid',
@@ -307,11 +342,39 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                       </button>
                     ))}
                   </div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.08em', marginBottom: 8 }}>REASON</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                    {OVERRIDE_REASON_OPTIONS.map((r) => (
+                      <button
+                        key={r.value}
+                        onClick={(e) => { e.stopPropagation(); setSelectedReason(r.value) }}
+                        style={{
+                          padding: '5px 12px', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                          background: selectedReason === r.value ? 'rgba(20,184,166,0.15)' : 'transparent',
+                          border: `1px solid ${selectedReason === r.value ? 'var(--accent)' : 'var(--b1)'}`,
+                          color: selectedReason === r.value ? 'var(--accent)' : 'var(--t2)',
+                          fontFamily: "'IBM Plex Sans', sans-serif",
+                        }}
+                      >
+                        {r.label}
+                      </button>
+                    ))}
+                  </div>
+                  {selectedReason === 'other' && (
+                    <input
+                      type="text"
+                      value={reasonNote}
+                      onChange={(e) => setReasonNote(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      placeholder="Reason note (required for 'Other')"
+                      style={{ width: '100%', boxSizing: 'border-box', background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif", marginBottom: 12 }}
+                    />
+                  )}
                   <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                     <button
                       onClick={(e) => { e.stopPropagation(); handleResolve(rowId, selectedRole) }}
-                      disabled={resolving}
-                      style={{ padding: '7px 18px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: resolving ? 'not-allowed' : 'pointer', opacity: resolving ? 0.6 : 1 }}
+                      disabled={resolving || !selectedReason || (selectedReason === 'other' && !reasonNote.trim())}
+                      style={{ padding: '7px 18px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: resolving ? 'not-allowed' : 'pointer', opacity: (resolving || !selectedReason || (selectedReason === 'other' && !reasonNote.trim())) ? 0.5 : 1 }}
                     >
                       {resolving ? 'Saving…' : `Classify as ${ROLE_OPTIONS.find(r => r.value === selectedRole)?.label ?? selectedRole}`}
                     </button>

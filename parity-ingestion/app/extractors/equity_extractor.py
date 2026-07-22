@@ -865,6 +865,238 @@ def extract_equity_pdf(file_path: str) -> ExtractionResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Equity "F1" business account format (PAR-65)
+# DD-MM-YYYY dates — line-based extraction, net-new (no prior detector/extractor)
+#
+# Columns: Tran Date | Value Date | Tran Particulars | Instrument Id | Debit |
+# Credit | Balance. Header wraps "Instrument Id" across two lines ("Instrument"
+# on the header row, "Id" alone on the next).
+#
+# Naming caveat (unresolved as of PAR-65): the source filename and backlog
+# ticket call this "F1", but the statement's own "Product Name" field reads
+# "CAA" — "F1" does not appear anywhere in the document text. The functions
+# below use "f1" purely as the working name from the ticket/filename; this is
+# NOT a claim that the document self-identifies as F1. See
+# tests/fixtures/real_samples/manifest.json's entry for this fixture and
+# rust_engine_prototype/CLAUDE_CODE_INSTRUCTIONS.md Task 3 for the same
+# open question.
+#
+# Structurally distinct from the existing "business" layout above: here, each
+# transaction's Instrument Id + counterparty name print as continuation
+# line(s) AFTER the date/amount line (belonging to that same row), not before
+# it as a narrative prefix to the next row.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_F1_PAGE_NUM_PAT = re.compile(r"^\d+\s*/\s*\d+$")
+# Negative-aware, unlike the shared _AMOUNT_PAT: F1 statements print momentary
+# overdrafts as a signed running balance ("-99,707.40"), not a "Dr" suffix.
+_F1_AMOUNT_PAT = re.compile(r"-?[\d,]+\.\d{2}")
+
+
+def _f1_parse_amounts_from_rest(
+    rest: str, previous_balance: Optional[int] = None
+) -> Tuple[Optional[int], Optional[int], Optional[int], List[str]]:
+    """Like _parse_equity_business_amounts_from_rest, but balance-sign-aware."""
+    matches = _F1_AMOUNT_PAT.findall(rest)
+    if not matches:
+        return None, None, None, matches
+
+    amounts_cents = [_amount_str_to_cents(m) for m in matches]
+
+    if len(amounts_cents) == 1:
+        return None, None, amounts_cents[0], matches
+
+    if len(amounts_cents) == 2:
+        amount, balance = amounts_cents[0], amounts_cents[1]
+        if previous_balance is not None:
+            if balance < previous_balance:
+                return amount, None, balance, matches
+            if balance > previous_balance:
+                return None, amount, balance, matches
+            return None, None, balance, matches
+        return amount, None, balance, matches
+
+    if len(amounts_cents) == 3:
+        return amounts_cents[0], amounts_cents[1], amounts_cents[2], matches
+
+    return amounts_cents[-3], amounts_cents[-2], amounts_cents[-1], matches
+
+
+def _is_equity_f1_business_format(text: str) -> bool:
+    """Structural signature: Account Statement + Tran Particulars/Instrument
+    columns, distinct from the "Narrative"/"Running Balance" business layout.
+
+    Note: the document's own Product Name field prints "CAA" — that is the
+    authoritative label for this account type.  "F1" is GBFund's colloquial
+    alias (from the original request/filename) and does NOT appear in the
+    document text.  We match structural column headers rather than either
+    label so the signature is robust to both names.  Search for "F1" to find
+    the functions; search for "CAA" to find this note.
+    """
+    return (
+        "Account Statement" in text
+        and "Tran Particulars" in text
+        and "Instrument" in text
+        and "Debit" in text
+        and "Credit" in text
+    )
+
+
+def detect_equity_f1(source: Union[str, NormalizedDocument]) -> bool:
+    """Return True if the PDF matches the Equity CAA business account layout.
+
+    The document's Product Name field reads "CAA" — that is the authoritative
+    name printed on the statement.  "F1" is GBFund's internal alias for the
+    same format and does not appear in document text; functions retain the f1
+    suffix as the working name from ticket PAR-65 / the source filename.
+    """
+    try:
+        with as_document(source) as doc:
+            text = doc.text_upto(2)
+            return _is_equity_f1_business_format(text)
+    except Exception:
+        return False
+
+
+def _is_f1_noise_line(line: str) -> bool:
+    """Lines that are page furniture, not transaction content or continuation text."""
+    if not line or line == "_" or line == "Id":
+        return True
+    if line.startswith("HEAD OFFICE"):
+        return True
+    if line.startswith("Account No.") or line.startswith("Customer Name"):
+        return True
+    if _F1_PAGE_NUM_PAT.match(line):
+        return True
+    if line.upper().startswith("NOTE: ANY OMISSION"):
+        return True
+    if "GRAND TOTAL" in line.upper():
+        return True
+    if line.startswith("Tran Date") and "Tran Particulars" in line:
+        return True
+    return False
+
+
+class _F1ParserState:
+    __slots__ = (
+        "seen_table",
+        "table_ended",
+        "previous_balance",
+        "pending",
+        "row_idx",
+        "transactions",
+    )
+
+    def __init__(self) -> None:
+        self.seen_table = False
+        self.table_ended = False
+        self.previous_balance: Optional[int] = None
+        self.pending: Optional[dict] = None
+        self.row_idx = 0
+        self.transactions: List[RawTransaction] = []
+
+
+def _flush_f1_pending(state: _F1ParserState, file_path: str) -> None:
+    if state.pending is None:
+        return
+    p = state.pending
+    parsed = {
+        "date_raw": p["date_raw"],
+        "particulars": re.sub(r"\s+", " ", p["particulars"]).strip(),
+        "money_out": _cents_to_equity_raw(p["debit_cents"]) if p["debit_cents"] else "",
+        "money_in": _cents_to_equity_raw(p["credit_cents"]) if p["credit_cents"] else "",
+        "balance_raw": (
+            _cents_to_equity_raw(p["balance_cents"]) if p["balance_cents"] is not None else ""
+        ),
+        "is_opening": False,
+    }
+    state.row_idx = _append_raw_transaction(state.transactions, parsed, file_path, state.row_idx)
+    state.pending = None
+
+
+def _run_f1_on_pages(pages: List[Any], file_path: str, state: _F1ParserState) -> None:
+    for page in pages:
+        text = page.extract_text()
+        if not text:
+            page.flush_cache()
+            continue
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if state.table_ended:
+                continue
+            if not state.seen_table:
+                if "Tran Date" in raw_line and "Tran Particulars" in raw_line:
+                    state.seen_table = True
+                continue
+
+            if "GRAND TOTAL" in line.upper():
+                # Everything after the closing recap (page signature/stamp
+                # lines like "END" + a trailer code) is not transaction data.
+                _flush_f1_pending(state, file_path)
+                state.table_ended = True
+                continue
+
+            if _is_f1_noise_line(line):
+                continue
+
+            m = _DATE2_PAT.match(line)
+            if m:
+                _flush_f1_pending(state, file_path)
+                rest = m.group(3).strip()
+                is_first_txn = state.previous_balance is None
+                debit, credit, balance, amounts = _f1_parse_amounts_from_rest(
+                    rest, state.previous_balance
+                )
+                particulars = _strip_amounts_from_rest(rest, amounts)
+                if (
+                    is_first_txn
+                    and debit is not None
+                    and credit is None
+                    and particulars.startswith("MPS")
+                ):
+                    # No opening-balance row precedes the very first transaction,
+                    # so its direction can't be read off a balance delta like every
+                    # other row. Every other "MPS <phone> ... <name>" row in this
+                    # statement (679/680, verified against the statement's own
+                    # Grand Total recap) is a mobile-money inbound credit, so the
+                    # shared helper's no-prior-balance debit default is wrong here.
+                    debit, credit = None, debit
+                if balance is not None:
+                    state.previous_balance = balance
+                state.pending = {
+                    "date_raw": m.group(1),
+                    "particulars": particulars,
+                    "debit_cents": debit,
+                    "credit_cents": credit,
+                    "balance_cents": balance,
+                }
+            elif line and state.pending is not None:
+                state.pending["particulars"] = (
+                    f"{state.pending['particulars']} {line}".strip()
+                )
+        page.flush_cache()
+
+
+def extract_equity_f1_pdf(file_path: str) -> ExtractionResult:
+    warnings: List[WarningItem] = []
+    state = _F1ParserState()
+
+    with pdfplumber.open(file_path) as pdf:
+        _run_f1_on_pages(pdf.pages, file_path, state)
+        _flush_f1_pending(state, file_path)
+
+    return ExtractionResult(
+        source_file=file_path,
+        extractor_type="equity_pdf",
+        row_count=len(state.transactions),
+        extraction_status="success",
+        warnings=warnings,
+        raw_transactions=state.transactions,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Equity CLMS (Cash and Liquidity Management System) format
 # DD/MM/YYYY dates — coordinate-based extraction
 # ─────────────────────────────────────────────────────────────────────────────

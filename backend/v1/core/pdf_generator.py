@@ -716,8 +716,18 @@ def generate_pdf(
     tier        = conf.get("tier") or "—"
     tier_capped = bool(conf.get("tier_capped"))
     tier_str    = tier + (" (capped to Medium — recon not run)" if tier_capped else "")
+    # PAR-21: when reconciliation hasn't run, final_confidence_bp falls back to
+    # coverage_bp alone (see metrics_engine.py), so it can read 100% even though
+    # the Tier badge above is capped to Medium — logically consistent (coverage
+    # is genuinely complete) but confusing without this qualifier, since a raw
+    # reader sees "100% Confidence" paired with a non-High tier. Presentation
+    # only: does not change final_confidence_bp / min() / compute_tier().
+    conf_str = _fmt_bp(conf.get('final_confidence_bp') or 0) + (
+        " (coverage-based — reconciliation not run; not a validated accuracy score)"
+        if tier_capped else ""
+    )
     story.append(_body_line(f"Coverage:               {_fmt_bp(metrics.get('coverage_bp') or 0)}"))
-    story.append(_body_line(f"Confidence:             {_fmt_bp(conf.get('final_confidence_bp') or 0)}"))
+    story.append(_body_line(f"Confidence:             {conf_str}"))
     story.append(_body_line(f"Tier:                   {tier_str}"))
     story.append(_body_line(f"Reconciliation:         {metrics.get('reconciliation_status') or '—'}"))
     story.append(_body_line(f"Missing months:         {metrics.get('missing_month_count') or 0}"))

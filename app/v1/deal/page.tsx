@@ -23,6 +23,7 @@ import {
   getNeedsReview,
   listDeals,
   getMonthlyCashflow,
+  getCreditScoringInputs,
   getReconciliation,
   getDeal,
   downloadReport,
@@ -212,6 +213,12 @@ function V1DealPageInner() {
         setExportData(data);
         const txRes = await listDealTransactions(deal.id);
         setRawTransactions(txRes.transactions as unknown as Array<Record<string, unknown>>);
+        try {
+          const csiRes = await getCreditScoringInputs(deal.id);
+          setCreditScoringInputs(csiRes);
+        } catch (e) {
+          console.error('getCreditScoringInputs failed on rehydrate:', e);
+        }
         setAnalysisState('done');
       } catch {
         // No existing analysis, or documents still processing — leave at 'idle',
@@ -458,9 +465,6 @@ function V1DealPageInner() {
         if (status.analytics?.monthly_cashflow) {
           setMonthlyCashflow(status.analytics.monthly_cashflow);
         }
-        if (status.analytics?.credit_scoring_inputs) {
-          setCreditScoringInputs(status.analytics.credit_scoring_inputs);
-        }
         if ((status as any).analytics?.monthly_entity_breakdown) {
           setMonthlyEntityBreakdown((status as any).analytics.monthly_entity_breakdown);
         }
@@ -493,6 +497,12 @@ function V1DealPageInner() {
         setMonthlyCashflow(mcRes.monthly_cashflow as unknown as Array<Record<string, unknown>>);
       } catch (e) {
         console.error('getMonthlyCashflow failed after export:', e);
+      }
+      try {
+        const csiRes = await getCreditScoringInputs(activeDeal.id);
+        setCreditScoringInputs(csiRes);
+      } catch (e) {
+        console.error('getCreditScoringInputs failed after export:', e);
       }
       setAnalysisState('done');
     } catch (e) {
