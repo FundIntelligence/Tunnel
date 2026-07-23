@@ -378,3 +378,59 @@ def test_cross_year_statement_period_not_collapsed_to_trailing_month():
     assert "All 13 months net-positive." in html
     # Avg monthly revenue reflects all three revenue months, not just 2026-01 alone.
     assert "3K" in html
+
+
+def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
+    """The "Observed Patterns" analyst-review section (net-negative months,
+    irregular payroll) had its own hardcoded "of 12 months" strings, a second
+    instance of the same bug fixed above in the summary cashflow note — missed
+    the first time because it's a separate code path. Confirms both now use the
+    real observed-period length (13 here) instead of a hardcoded 12.
+    """
+    months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
+    # 3 net-negative months so the "Net-negative months" pattern triggers (>2).
+    neg = {"2025-02", "2025-05", "2025-08"}
+    monthly_cashflow = [
+        {
+            "month": m,
+            "inflow_cents": 50000 if m in neg else 100000,
+            "outflow_cents": 100000 if m in neg else 50000,
+        }
+        for m in months
+    ]
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {
+            "summary": {"total_transactions": len(months)},
+            "monthly_cashflow": monthly_cashflow,
+            "credit_scoring_inputs": {
+                "payroll_stability": "IRREGULAR",
+                "payroll_months_detected": 4,
+            },
+        },
+    }]
+    tables = {
+        "pds_deals": [{"company_name": "CrossYear Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2026-01-30T08:00:00+00:00",
+            "canonical_json": json.dumps({"metrics": {
+                "coverage_bp": 10000, "missing_month_count": 0,
+                "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                "reconciliation_status": "NOT_RUN",
+            }}),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [],
+        "pds_raw_transactions": [],
+        "pds_txn_entity_map": [],
+    }
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "3 of 13 months net-negative" in html
+    assert "Payroll detected in 4 of 13 months" in html
+    assert "of 12 months" not in html
