@@ -3,6 +3,7 @@ Parity Backend — PDS v1 API only.
 All legacy routes decommissioned. Use /v1/* exclusively.
 """
 import asyncio
+import re
 import traceback
 from contextlib import asynccontextmanager
 
@@ -43,7 +44,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",")
+# PAR-83: CORS_ORIGINS has historically been set as either comma- or
+# space-separated (or a mix, from manual workarounds). Split on any run of
+# whitespace and/or commas so the parsing tolerates either convention.
+_CORS_ORIGINS = re.split(r"[\s,]+", os.getenv("CORS_ORIGINS", "").strip())
 _EXPLICIT_ORIGINS = [
     "https://parityfinance.vercel.app",
     "https://parity-sme-staging.vercel.app",
@@ -54,6 +58,10 @@ _EXPLICIT_ORIGINS = [
 _ALL_ORIGINS = list({o.strip() for o in _CORS_ORIGINS + _EXPLICIT_ORIGINS if o.strip()})
 logger.info("[CORS] allow_origins=%s", _ALL_ORIGINS)
 
+# Intentionally scoped to *.vercel.app only (Vercel preview/staging URLs we
+# don't want to hardcode individually). Custom domains (paritytunnel.com and
+# its subdomains) are NOT matched by this regex on purpose — they must be
+# added explicitly to CORS_ORIGINS, same as any other production origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALL_ORIGINS,
