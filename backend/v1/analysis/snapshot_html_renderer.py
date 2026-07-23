@@ -675,7 +675,7 @@ def render_snapshot_html(
             patterns.append({
                 "name": "Irregular payroll",
                 "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-                "data_statement": f"Payroll detected in {m_det} of 12 months",
+                "data_statement": f"Payroll detected in {m_det} of {len(period_months)} months",
                 "check_prompt": "→ Review: casual workforce or payroll routed off-statement?",
             })
             break
@@ -688,7 +688,7 @@ def render_snapshot_html(
         patterns.append({
             "name": "Net-negative months",
             "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-            "data_statement": f"{len(neg_months)} of 12 months net-negative: {label_months}",
+            "data_statement": f"{len(neg_months)} of {len(period_months)} months net-negative: {label_months}",
             "check_prompt": "→ Review: seasonal pattern or sustained cash drain?",
         })
 
