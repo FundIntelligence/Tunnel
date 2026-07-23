@@ -275,17 +275,21 @@ def render_snapshot_html(
     else:
         acct_cov_raw = {}
 
-    # ── Active year ────────────────────────────────────────────────────────
-    # Drives every "this year" filter below (avg revenue, loan frequency,
-    # cashflow rows/notes). Use the declared audited financial year when
-    # present, else the most recent transaction's year — never a hardcoded
-    # year, which previously zeroed these metrics for any deal whose
-    # transactions weren't dated 2025.
+    # ── Active period ──────────────────────────────────────────────────────
+    # Drives every "this period" filter below (avg revenue, loan frequency,
+    # cashflow rows/notes). When an audited financial year is declared, scope
+    # to that calendar year. Otherwise there's no real "year" to scope to —
+    # bank-statement-only deals commonly submit a 12-13 month trailing
+    # lookback that crosses a calendar year boundary (e.g. Jan 2025-Jan
+    # 2026), so filtering by max(txn_years) would keep only the trailing
+    # partial year and silently drop every other month. Include every month
+    # present instead.
     if recon_available and af.get("financial_year"):
         active_year = str(af["financial_year"])
+        _in_active_period = lambda m: m.startswith(f"{active_year}-")
     else:
-        _txn_years = [(t["txn_date"] or "")[:4] for t in txns if t["txn_date"]]
-        active_year = max(_txn_years) if _txn_years else ""
+        active_year = ""
+        _in_active_period = lambda m: True
 
     # ── Computed metrics ──────────────────────────────────────────────────────
 
@@ -294,7 +298,7 @@ def render_snapshot_html(
     for t in txns:
         if t["signed"] > 0 and t["role"] in REVENUE_ROLES:
             m = (t["txn_date"] or "")[:7]
-            if m.startswith(f"{active_year}-"):
+            if _in_active_period(m):
                 by_month_rev[m] += t["signed"]
     avg_rev_cents = (
         int(sum(by_month_rev.values()) / len(by_month_rev)) if by_month_rev else 0
@@ -325,7 +329,7 @@ def render_snapshot_html(
     for t in txns:
         if t["role"] == "loan_repayment" and t["signed"] < 0:
             m = (t["txn_date"] or "")[:7]
-            if m.startswith(f"{active_year}-"):
+            if _in_active_period(m):
                 repay_months[m] += 1
     loan_freq = (
         sum(repay_months.values()) / len(repay_months) if repay_months else 0
@@ -377,9 +381,10 @@ def render_snapshot_html(
     jan_total = tax_by_month[jan_month]["total"] if jan_month else 0
 
     # Cashflow net-negative months
+    period_months = sorted(m for m in monthly_merged if _in_active_period(m))
     neg_months = sorted(
-        m for m, v in monthly_merged.items()
-        if m.startswith(f"{active_year}-") and (v["inflow_cents"] - v["outflow_cents"]) < 0
+        m for m in period_months
+        if (monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]) < 0
     )
     if neg_months:
         worst = min(
@@ -387,11 +392,13 @@ def render_snapshot_html(
             key=lambda m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"],
         )
         cashflow_note = (
-            f"{len(neg_months)} of 12 months net-negative. "
+            f"{len(neg_months)} of {len(period_months)} months net-negative. "
             f"Largest deficit in {MONTH_ABBR.get(worst[5:7], worst[5:7])} {worst[:4]}."
         )
+    elif period_months:
+        cashflow_note = f"All {len(period_months)} months net-positive."
     else:
-        cashflow_note = "All 12 months net-positive."
+        cashflow_note = "No cashflow data available."
 
     # ── Period label ────────────────────────────────────────────────────────
     fy = str(af.get("financial_year") or "") if recon_available else ""
@@ -516,7 +523,7 @@ def render_snapshot_html(
         ]
 
     # ── Monthly cashflow chart rows ──────────────────────────────────────────
-    active_months = sorted(m for m in monthly_merged if m.startswith(f"{active_year}-"))
+    active_months = period_months
     max_abs_net = (
         max(abs(monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"])
             for m in active_months)

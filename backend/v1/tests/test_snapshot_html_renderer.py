@@ -311,3 +311,70 @@ def test_determinism_same_context_same_html():
     html_1 = renderer.render_snapshot_html("deal-fixture")
     html_2 = renderer.render_snapshot_html("deal-fixture")
     assert html_1 == html_2
+
+
+# ── cross-year statement period (no audited financials) ─────────────────────────
+
+def test_cross_year_statement_period_not_collapsed_to_trailing_month():
+    """Regression for the demo deal 2a619980-0f74-4d-9f-bb3b-648ab1eb9c95 bug:
+    a deal with no audited financials whose bank statement spans a calendar year
+    boundary (e.g. a 13-month lookback Jan 2025 - Jan 2026) previously collapsed
+    every "active period" metric to just the trailing 2026-01 month, because
+    active_year was computed as max(txn_years) and every filter did
+    `m.startswith(f"{active_year}-")`. Confirms all months present are now used
+    when no audited financial year is declared, not just the trailing partial year.
+    """
+    months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
+    monthly_cashflow = [
+        {"month": m, "inflow_cents": 100000, "outflow_cents": 50000} for m in months
+    ]
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {
+            "summary": {"total_transactions": len(months)},
+            "monthly_cashflow": monthly_cashflow,
+            "credit_scoring_inputs": {},
+        },
+    }]
+    # Revenue spread across both years: pre-fix, only the 2026-01 txn (KES 5,000)
+    # would count, averaging to "5K". Post-fix, all three months count, averaging
+    # (1,000 + 3,000 + 5,000) / 3 = KES 3,000, i.e. "3K".
+    raw_txn_rows = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 100000,
+         "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None},
+        {"id": "t2", "txn_date": "2025-06-05", "signed_amount_cents": 300000,
+         "abs_amount_cents": 300000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None},
+        {"id": "t3", "txn_date": "2026-01-05", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None},
+    ]
+    txn_map_rows = [
+        {"txn_id": "t1", "role": "revenue_operational"},
+        {"txn_id": "t2", "role": "revenue_operational"},
+        {"txn_id": "t3", "role": "revenue_operational"},
+    ]
+    tables = {
+        "pds_deals": [{"company_name": "CrossYear Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2026-01-30T08:00:00+00:00",
+            "canonical_json": json.dumps({"metrics": {
+                "coverage_bp": 10000, "missing_month_count": 0,
+                "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                "reconciliation_status": "NOT_RUN",
+            }}),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [],  # not submitted -> recon_available False
+        "pds_raw_transactions": raw_txn_rows,
+        "pds_txn_entity_map": txn_map_rows,
+    }
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    # All 13 months counted, not just the trailing 2026 month.
+    assert "All 13 months net-positive." in html
+    # Avg monthly revenue reflects all three revenue months, not just 2026-01 alone.
+    assert "3K" in html
