@@ -1,5 +1,8 @@
 import logging
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import httpx
 
 from ..core.snapshot_engine import decode_snapshot_row
 from .repositories import (
@@ -27,8 +30,8 @@ SELECT_ROW_LIMIT = 50_000
 
 
 class BaseRepo:
-    def __init__(self, table: str):
-        self.client = get_supabase()
+    def __init__(self, table: str, client_timeout: Optional[float] = None):
+        self.client = get_supabase(timeout=client_timeout)
         self.table = table
 
     def insert(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -361,8 +364,15 @@ class TransferLinksRepo(TransferLinksRepository, BaseRepo):
 
 
 class EntitiesRepo(EntitiesRepository, BaseRepo):
+    # 2026-07-23: bulk upsert on this table hit the default 120s postgrest
+    # client timeout during a live demo export (deal 2A619980-0F74-4D).
+    # Did not reproduce on repeated on-demand re-runs, so treated as a
+    # transient/load-related window rather than a structural batch-size
+    # problem — raised timeout + added one retry as cheap insurance.
+    _UPSERT_TIMEOUT_SECONDS = 300
+
     def __init__(self):
-        super().__init__("pds_entities")
+        super().__init__("pds_entities", client_timeout=self._UPSERT_TIMEOUT_SECONDS)
 
     def upsert_entities(self, entities: Iterable[Dict[str, Any]]) -> None:
         items = list(entities)
@@ -370,7 +380,15 @@ class EntitiesRepo(EntitiesRepository, BaseRepo):
             return
         for i in range(0, len(items), BATCH_SIZE):
             batch = items[i : i + BATCH_SIZE]
-            self.client.table(self.table).upsert(batch).execute()
+            try:
+                self.client.table(self.table).upsert(batch).execute()
+            except (httpx.TimeoutException, httpx.ReadTimeout):
+                logger.warning(
+                    "[EntitiesRepo] upsert batch timed out, retrying once (batch_size=%d)",
+                    len(batch),
+                )
+                time.sleep(2)
+                self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
