@@ -171,7 +171,14 @@ export default function AnalysisTab({
                     <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr 1fr 1fr', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--s3)' }}>
                       {['MONTH', 'INFLOW', 'OUTFLOW', 'NET'].map((h) => <span key={h} style={{ fontSize: 10, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.1em' }}>{h}</span>)}
                     </div>
-                    {(monthlyCashflow as Array<Record<string, unknown>>).slice(0, 12).map((m) => {
+                    {/* No count cap here — monthlyCashflow already IS the real observed
+                        period from GET /analytics/monthly-cashflow (backend/v1/analytics.py's
+                        monthly_cashflow(), unbounded). A hardcoded .slice(0, 12) previously
+                        silently dropped any statement period longer than 12 months (e.g. a
+                        13-month cross-year lookback) — same "12 months" assumption bug fixed
+                        in the exported PDF's snapshot_html_renderer.py, independently present
+                        here since this tab reads the live endpoint directly, not the PDF. */}
+                    {(monthlyCashflow as Array<Record<string, unknown>>).map((m) => {
                       const net = Number(m.net_cents ?? 0);
                       return (
                         <div key={m.month as string} style={{ display: 'grid', gridTemplateColumns: '100px 1fr 1fr 1fr', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--s3)', alignItems: 'center' }}>
