@@ -816,7 +816,7 @@ function V1DealPageInner() {
         dealName={dealName}
         dealId={dealId}
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={(tab) => { userSelectedTabRef.current = true; setActiveTab(tab); }}
         needsReviewCount={needsReviewItems.length}
       />
 
