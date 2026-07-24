@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback, memo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { askParityReview, getParityChatSession, clearParityChatSession } from '@/lib/v1-api'
+import AnalystStatus from '@/components/AnalystStatus'
 
 // ── Lightweight markdown → HTML ────────────────────────────────────────────
 
@@ -326,13 +327,6 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
 
   return (
     <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
-      <style>{`
-        @keyframes parityDot {
-          0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
-          40% { opacity: 1; transform: scale(1); }
-        }
-      `}</style>
-
       {/* Left: Chat area */}
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* Header */}
@@ -361,9 +355,7 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
         {/* Corpus description card */}
         {!effectiveCorpusReady && isCheckingAnalysis && (
           <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
-            <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
-              Checking analysis status…
-            </div>
+            <AnalystStatus stage="checking" size={16} />
           </div>
         )}
         {!effectiveCorpusReady && !isCheckingAnalysis && (
@@ -427,11 +419,8 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
               {loading && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
                   <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--green)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
-                  <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                    {[0, 1, 2].map(n => (
-                      <span key={n} style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--green)', display: 'inline-block', animation: `parityDot 1.4s ${n * 0.2}s infinite ease-in-out` }} />
-                    ))}
-                    <span style={{ fontSize: 11, color: 'var(--t2)', marginLeft: 8, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}>COMPUTING</span>
+                  <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px' }}>
+                    <AnalystStatus stage="generic" size={16} />
                   </div>
                 </div>
               )}
@@ -440,11 +429,8 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
           {chatHistory.length === 0 && loading && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
               <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--green)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
-              <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                {[0, 1, 2].map(n => (
-                  <span key={n} style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--green)', display: 'inline-block', animation: `parityDot 1.4s ${n * 0.2}s infinite ease-in-out` }} />
-                ))}
-                <span style={{ fontSize: 11, color: 'var(--t2)', marginLeft: 8, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}>ANALYZING SNAPSHOT</span>
+              <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px' }}>
+                <AnalystStatus stage="generic" size={16} />
               </div>
             </div>
           )}
@@ -473,7 +459,13 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={effectiveCorpusReady ? "Ask anything about this borrower's financials..." : 'Run analysis first to enable Parity Review...'}
+            placeholder={
+              effectiveCorpusReady
+                ? "Ask anything about this borrower's financials..."
+                : isCheckingAnalysis
+                ? 'Checking analysis status…'
+                : 'Run analysis first to enable Parity Review...'
+            }
             disabled={!effectiveCorpusReady || loading}
             rows={2}
             style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: 'var(--t1)', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !effectiveCorpusReady ? 0.4 : 1 }}

@@ -2,6 +2,7 @@
 
 import type { AnalysisRun, Snapshot } from '@/lib/v1-api';
 import type { AnalysisState } from './types';
+import AnalystStatus from '@/components/AnalystStatus';
 
 export interface SnapshotTabProps {
   run: AnalysisRun | undefined;
@@ -26,7 +27,15 @@ export default function SnapshotTab({
 }: SnapshotTabProps) {
   return (
     <div style={{ maxWidth: 720 }}>
-      {!run ? (
+      {analysisState === 'checking' && !run ? (
+        // Same false-negative class as PR #101/#102: 'checking' means we haven't
+        // confirmed a snapshot's absence yet, so this must never render the
+        // "no snapshot" copy — that would be a confirmed-negative claim before
+        // the check has actually resolved.
+        <div style={{ padding: '48px 0', display: 'flex', justifyContent: 'center' }}>
+          <AnalystStatus stage="checking" />
+        </div>
+      ) : !run ? (
         <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--t2)', fontSize: 13 }}>
           Run analysis first to generate a snapshot.
         </div>
@@ -44,6 +53,7 @@ export default function SnapshotTab({
                 Download CSV
               </button>
             </div>
+            {analysisState === 'exporting' && <div style={{ marginBottom: 10 }}><AnalystStatus stage="snapshot" size={16} /></div>}
             {exportSuccess && <div style={{ fontSize: 12, color: 'var(--green)', marginBottom: 10 }}>{exportSuccess}</div>}
             {exportError && <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 10 }}>{exportError}</div>}
             {lastExportedAt && <div style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>Last exported {lastExportedAt.toLocaleTimeString()}</div>}

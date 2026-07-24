@@ -1,5 +1,23 @@
 import type { AnalysisRun, Entity, ExportResponse, DocumentListItem, Snapshot, TxnEntityMapping } from '@/lib/v1-api';
 import type { AnalysisState, EntityBreakdownRow, PipelineStage, QueuedStatement } from '@/components/deal-tabs/types';
+import type { AnalystStatusStage } from '@/components/AnalystStatus';
+
+/** Maps a PIPELINE STAGES row name (see computePipelineStages below) to its AnalystStatus phrase set. */
+const STAGE_NAME_TO_ANALYST_STAGE: Record<string, AnalystStatusStage> = {
+  'Document ingestion': 'ingestion',
+  'Transaction parsing': 'ingestion',
+  'Classification': 'classification',
+  'Entity extraction': 'classification',
+  'Reconciliation': 'reconciliation',
+  'Confidence scoring': 'reconciliation',
+  'Snapshot generation': 'snapshot',
+};
+
+/** The AnalystStatus phrase set for whichever pipeline stage is currently 'active', or undefined if none is. */
+export function activeAnalystStage(stages: PipelineStage[]): AnalystStatusStage | undefined {
+  const active = stages.find((s) => s.status === 'active');
+  return active ? STAGE_NAME_TO_ANALYST_STAGE[active.name] : undefined;
+}
 
 /** Normalize API status (list + status endpoints; lease may surface failed). */
 export function apiDocumentStatus(doc: Pick<DocumentListItem, 'status'>): 'completed' | 'failed' | 'processing' {

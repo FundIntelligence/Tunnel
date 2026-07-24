@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react';
 import { deleteDocument, patchAuditedFinancials,removeAuditedFinancials, AuditedFinancialsRemoveError } from '@/lib/v1-api';
 import type { Deal, AuditedFinancialsRecord } from '@/lib/v1-api';
 import type { AnalysisState, QueuedStatement } from './types';
+import AnalystStatus from '@/components/AnalystStatus';
 
 const MAX_STATEMENTS = 20;
 
@@ -519,11 +520,7 @@ export default function DocumentsTab({
               const isChecking = analysisState === 'checking';
               const hasExistingAnalysis = analysisState === 'done';
               const isDisabled = isChecking || statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm;
-              const label = isChecking
-                ? 'Checking analysis status…'
-                : isProcessing
-                ? 'Processing…'
-                : hasExistingAnalysis
+              const label = hasExistingAnalysis
                 ? 'Add documents & re-run analysis'
                 : 'Initialise analysis pipeline';
               return (
@@ -532,7 +529,7 @@ export default function DocumentsTab({
                   disabled={isDisabled}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '10px 20px', background: isDisabled ? 'var(--s3)' : 'var(--accent)', color: isDisabled ? 'var(--t2)' : '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: isDisabled ? 'not-allowed' : 'pointer', fontFamily: "'IBM Plex Sans', sans-serif", transition: 'background 0.15s' }}
                 >
-                  {label}
+                  {isChecking || isProcessing ? <AnalystStatus stage={isChecking ? 'checking' : 'generic'} size={16} /> : label}
                   {!isChecking && !isProcessing && <span style={{ fontSize: 16 }}>→</span>}
                 </button>
               );
