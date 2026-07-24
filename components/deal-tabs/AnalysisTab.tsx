@@ -71,6 +71,11 @@ export default function AnalysisTab({
   };
   return (
     <div>
+      {analysisState === 'checking' && !run && (
+        <div style={{ padding: '48px 0', textAlign: 'center' }}>
+          <div style={{ fontSize: 13, color: 'var(--t2)' }}>Checking analysis status…</div>
+        </div>
+      )}
       {analysisState === 'idle' && !run && (
         <div style={{ padding: '48px 0', textAlign: 'center' }}>
           <div style={{ fontSize: 13, color: 'var(--t1)', marginBottom: 16 }}>No analysis run yet. Upload documents and initialise the pipeline.</div>

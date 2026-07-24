@@ -54,6 +54,52 @@ import type {
 import type { AnalysisState, EntityBreakdownRow, QueuedStatement, PipelineStage, DrillModalState, ParserRequestDoc } from '@/components/deal-tabs/types';
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'KES', 'NGN'];
 
+// Module-level (outside the component, survives remounts of V1DealPageInner):
+// a fresh/cold navigation to a deal URL can mount this component more than
+// once in quick succession as part of Next.js's rendering path for a
+// useSearchParams()-consuming component under <Suspense> (see V1DealPage's
+// export below) — a component-local ref guard does NOT protect against this,
+// since a genuine remount gets a brand-new ref. Two independent mounts would
+// otherwise race two separate fetch chains for the same deal_id. Keying the
+// in-flight/resolved rehydration promise by dealId here means every mount
+// shares the SAME one chain — each mount still applies the result to its own
+// local state once resolved, but only one real fetch sequence ever runs.
+type RehydrationResult =
+  | { ok: true; analysis_run: AnalysisRun | null; exportData?: ExportResponse; rawTransactions?: Array<Record<string, unknown>>; creditScoringInputs?: Record<string, unknown> | null }
+  | { ok: false; message: string };
+const rehydrationPromises = new Map<string, Promise<RehydrationResult>>();
+
+function getOrFetchRehydration(dealId: string): Promise<RehydrationResult> {
+  let p = rehydrationPromises.get(dealId);
+  if (!p) {
+    p = (async (): Promise<RehydrationResult> => {
+      try {
+        const { analysis_run } = await getLatestAnalysis(dealId);
+        if (!analysis_run) return { ok: true, analysis_run: null };
+        const data = await exportSnapshot(dealId);
+        const txRes = await listDealTransactions(dealId);
+        let creditScoringInputs: Record<string, unknown> | null = null;
+        try {
+          creditScoringInputs = await getCreditScoringInputs(dealId);
+        } catch (e) {
+          console.error('getCreditScoringInputs failed on rehydrate:', e);
+        }
+        return {
+          ok: true,
+          analysis_run,
+          exportData: data,
+          rawTransactions: txRes.transactions as unknown as Array<Record<string, unknown>>,
+          creditScoringInputs,
+        };
+      } catch (e) {
+        return { ok: false, message: e instanceof Error ? e.message : String(e) };
+      }
+    })();
+    rehydrationPromises.set(dealId, p);
+  }
+  return p;
+}
+
 function V1DealPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -91,7 +137,7 @@ function V1DealPageInner() {
   const [accrualPeriodEnd, setAccrualPeriodEnd] = useState('');
   const [deal, setDeal] = useState<Deal | null>(null);
   const [documentId, setDocumentId] = useState<string | null>(null);
-  const [analysisState, setAnalysisState] = useState<AnalysisState>('idle');
+  const [analysisState, setAnalysisState] = useState<AnalysisState>('checking');
   const [errorMsg, setErrorMsg] = useState('');
   const [exportData, setExportData] = useState<ExportResponse | null>(null);
   const [overrideEntityId, setOverrideEntityId] = useState('');
@@ -134,7 +180,7 @@ function V1DealPageInner() {
   const [unknownFormatDocIds, setUnknownFormatDocIds] = useState<Set<string>>(new Set());
   const [sidebarDeals, setSidebarDeals] = useState<DealListItem[]>([]);
   const [userInitials, setUserInitials] = useState('AN');
-  const rehydratedDealId = useRef<string | null>(null);
+  const userSelectedTabRef = useRef(false);
 
   // Derive real currency from the already-loaded deal list (no separate fetch needed)
   useEffect(() => {
@@ -203,61 +249,58 @@ function V1DealPageInner() {
   // itself short-circuits to the existing snapshot when nothing changed, so this
   // doesn't create a new analysis_run.
   //
-  // Two outcomes must be told apart, or an unknown/failed check looks
-  // identical to "this deal was never analysed" (misleadingly telling an
-  // analyst to start over on a deal that already has validated results):
-  //   1. getLatestAnalysis genuinely returns no run — idle is correct.
-  //   2. Any call throws (cold start, network blip, transient 409/401/5xx) —
-  //      we don't actually know whether this deal has a run or not, so we
-  //      must NOT assert "no analysis" either. Surface a distinct, retryable
-  //      error state instead. The guard is latched as soon as we reach any
-  //      conclusive outcome (case 1, success, or case 2) so we don't loop
-  //      forever, but retryRehydrate clears it for an explicit retry.
+  // analysisState starts at 'checking' (not 'idle') specifically so "haven't
+  // looked yet" and "confirmed no analysis exists" can never be the same
+  // value — every UI surface that used to key off 'idle' to mean "no
+  // analysis" must never see that state before this effect has conclusively
+  // resolved one way or another. Real fetch work is delegated to
+  // getOrFetchRehydration (module-scoped, keyed by dealId) so a genuine
+  // double-mount on a cold navigation shares one fetch chain instead of
+  // racing two — this effect just applies the shared result to local state,
+  // and the two state updates below happen back-to-back with no intervening
+  // await, so React batches them into a single render (no transient
+  // "run truthy but analysisState still checking" flash either).
   useEffect(() => {
-    if (!deal?.id || analysisState !== 'idle' || rehydratedDealId.current === deal.id) return;
+    if (!deal?.id || analysisState !== 'checking') return;
     const dealId = deal.id;
-    (async () => {
-      let analysis_run;
-      try {
-        ({ analysis_run } = await getLatestAnalysis(dealId));
-      } catch (e) {
-        console.error('getLatestAnalysis failed on rehydrate:', e);
+    let cancelled = false;
+    getOrFetchRehydration(dealId).then((result) => {
+      if (cancelled) return;
+      if (!result.ok) {
+        console.error('Rehydration failed:', result.message);
         setErrorMsg("Could not check this deal's analysis status (a temporary network or server issue). If analysis already completed, your results are safe — retry to check again.");
-        rehydratedDealId.current = dealId;
         setAnalysisState('error');
         return;
       }
-      if (!analysis_run) {
-        rehydratedDealId.current = dealId;
+      if (!result.analysis_run) {
+        setAnalysisState('idle');
         return;
       }
-      try {
-        const data = await exportSnapshot(dealId);
-        setExportData(data);
-        const txRes = await listDealTransactions(dealId);
-        setRawTransactions(txRes.transactions as unknown as Array<Record<string, unknown>>);
-        try {
-          const csiRes = await getCreditScoringInputs(dealId);
-          setCreditScoringInputs(csiRes);
-        } catch (e) {
-          console.error('getCreditScoringInputs failed on rehydrate:', e);
-        }
-        rehydratedDealId.current = dealId;
-        setAnalysisState('done');
-      } catch (e) {
-        console.error('Rehydration failed after finding an existing analysis run:', e);
-        setErrorMsg('Found a completed analysis for this deal but could not load it (a temporary network or server issue). Your results are safe — retry to reload them.');
-        rehydratedDealId.current = dealId;
-        setAnalysisState('error');
-      }
-    })();
+      setExportData(result.exportData!);
+      setRawTransactions(result.rawTransactions ?? []);
+      if (result.creditScoringInputs) setCreditScoringInputs(result.creditScoringInputs);
+      setAnalysisState('done');
+    });
+    return () => { cancelled = true; };
   }, [deal?.id, analysisState]);
 
   const retryRehydrate = useCallback(() => {
-    rehydratedDealId.current = null;
+    if (deal?.id) rehydrationPromises.delete(deal.id);
     setErrorMsg('');
-    setAnalysisState('idle');
-  }, []);
+    setAnalysisState('checking');
+  }, [deal?.id]);
+
+  // PAR-91: land on Analysis (not Documents) by default for a deal that
+  // already has completed results — Documents is for adding new files, not
+  // the "start here" landing page for an already-analysed deal. Only fires
+  // once rehydration conclusively confirms 'done', and only if the user
+  // hasn't already picked a tab themselves (so this never yanks someone away
+  // from wherever they intentionally navigated).
+  useEffect(() => {
+    if (analysisState === 'done' && !userSelectedTabRef.current) {
+      setActiveTab('analysis');
+    }
+  }, [analysisState]);
 
   useEffect(() => {
     setStatementQueue((prev) => {
@@ -826,7 +869,7 @@ function V1DealPageInner() {
             {TABS.map((tab) => (
               <button
                 key={tab}
-                onClick={() => setActiveTab(tab)}
+                onClick={() => { userSelectedTabRef.current = true; setActiveTab(tab); }}
                 style={{ padding: '10px 20px', fontSize: 13, fontWeight: 500, color: activeTab === tab ? 'var(--accent)' : 'var(--t2)', background: 'transparent', border: 'none', borderBottom: activeTab === tab ? '2px solid var(--accent)' : '2px solid transparent', cursor: 'pointer', transition: 'all 0.15s', fontFamily: "'IBM Plex Sans', sans-serif", marginBottom: -1 }}
               >
                 {TAB_LABELS[tab]}
@@ -860,7 +903,7 @@ function V1DealPageInner() {
               loadAuditedFinancials={loadAuditedFinancials}
               queueHasPending={queueHasPending}
               isProcessing={isProcessing}
-              onInitialiseAnalysis={() => { setActiveTab('analysis'); void runAnalysis(); }}
+              onInitialiseAnalysis={() => { userSelectedTabRef.current = true; setActiveTab('analysis'); void runAnalysis(); }}
               errorMsg={errorMsg}
             />
           )}
@@ -884,8 +927,8 @@ function V1DealPageInner() {
               entityBreakdownByCategory={entityBreakdownByCategory}
               entityBreakdown={entityBreakdown}
               needsReviewItems={needsReviewItems}
-              onGoToDocuments={() => setActiveTab('documents')}
-              onGoToQueue={() => setActiveTab('queue')}
+              onGoToDocuments={() => { userSelectedTabRef.current = true; setActiveTab('documents'); }}
+              onGoToQueue={() => { userSelectedTabRef.current = true; setActiveTab('queue'); }}
               onDrill={setDrillModal}
               errorMsg={errorMsg}
               onRetry={retryRehydrate}
@@ -905,8 +948,8 @@ function V1DealPageInner() {
               analysisState={analysisState}
               statementQueue={statementQueue}
               needsReviewItems={needsReviewItems}
-              onGoToQueue={() => setActiveTab('queue')}
-              onGoToSnapshot={() => setActiveTab('snapshot')}
+              onGoToQueue={() => { userSelectedTabRef.current = true; setActiveTab('queue'); }}
+              onGoToSnapshot={() => { userSelectedTabRef.current = true; setActiveTab('snapshot'); }}
             />
           </div>
 

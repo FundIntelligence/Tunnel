@@ -98,6 +98,7 @@ const chatCacheKey = (id: string) => ['parity-chat', id] as const
 interface Props {
   dealId: string
   corpusReady: boolean
+  isCheckingAnalysis?: boolean
   txnTotal: number
   statementCount: number
 }
@@ -113,7 +114,7 @@ const SUGGESTION_CHIPS = [
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Props) {
+function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, statementCount }: Props) {
   const queryClient = useQueryClient()
   const cached = queryClient.getQueryData<ChatCache>(chatCacheKey(dealId))
 
@@ -343,7 +344,7 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
             color: effectiveCorpusReady ? 'var(--green)' : '#818CF8',
             border: `1px solid ${effectiveCorpusReady ? 'rgba(74,222,128,0.25)' : 'rgba(20,184,166,0.25)'}`,
           }}>
-            {effectiveCorpusReady ? 'READY' : 'PENDING'}
+            {effectiveCorpusReady ? 'READY' : isCheckingAnalysis ? 'CHECKING' : 'PENDING'}
           </span>
           {chatHistory.length > 0 && (
             <button
@@ -358,7 +359,14 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
         </div>
 
         {/* Corpus description card */}
-        {!effectiveCorpusReady && (
+        {!effectiveCorpusReady && isCheckingAnalysis && (
+          <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
+            <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
+              Checking analysis status…
+            </div>
+          </div>
+        )}
+        {!effectiveCorpusReady && !isCheckingAnalysis && (
           <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
             <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
               Parity Intelligence is available once analysis completes. Run analysis from the Documents tab to activate.

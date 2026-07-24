@@ -1,4 +1,8 @@
-export type AnalysisState = 'idle' | 'uploading' | 'polling' | 'exporting' | 'done' | 'error';
+// 'checking' is the genuine initial value: we haven't yet confirmed whether this
+// deal has prior analysis results. 'idle' means we CONCLUSIVELY confirmed there
+// are none — the two must never be conflated, or a not-yet-checked deal renders
+// identically to a genuinely-never-analysed one (see PAR-91 rehydration fix).
+export type AnalysisState = 'checking' | 'idle' | 'uploading' | 'polling' | 'exporting' | 'done' | 'error';
 
 export interface QueuedStatement {
   id: string;
