@@ -2,6 +2,7 @@
 
 import type { AnalysisRun, Snapshot } from '@/lib/v1-api';
 import type { AnalysisState } from './types';
+import AnalystStatus from '@/components/AnalystStatus';
 
 export interface SnapshotTabProps {
   run: AnalysisRun | undefined;
@@ -44,6 +45,7 @@ export default function SnapshotTab({
                 Download CSV
               </button>
             </div>
+            {analysisState === 'exporting' && <div style={{ marginBottom: 10 }}><AnalystStatus stage="snapshot" size={16} /></div>}
             {exportSuccess && <div style={{ fontSize: 12, color: 'var(--green)', marginBottom: 10 }}>{exportSuccess}</div>}
             {exportError && <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 10 }}>{exportError}</div>}
             {lastExportedAt && <div style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>Last exported {lastExportedAt.toLocaleTimeString()}</div>}

@@ -2,6 +2,8 @@
 
 import type { AnalysisRun, AuditedFinancialsRecord, ReconciliationSection } from '@/lib/v1-api';
 import type { AnalysisState, EntityBreakdownRow, PipelineStage, QueuedStatement, StageStatus, DrillModalState } from './types';
+import AnalystStatus from '@/components/AnalystStatus';
+import { activeAnalystStage } from '@/lib/deal-analytics';
 
 const StatusDot = ({ status }: { status: StageStatus }) => {
   const colors: Record<StageStatus, string> = { done: 'var(--green)', active: '#818CF8', queued: 'var(--t2)', failed: 'var(--red)' };
@@ -72,8 +74,8 @@ export default function AnalysisTab({
   return (
     <div>
       {analysisState === 'checking' && !run && (
-        <div style={{ padding: '48px 0', textAlign: 'center' }}>
-          <div style={{ fontSize: 13, color: 'var(--t2)' }}>Checking analysis status…</div>
+        <div style={{ padding: '48px 0', display: 'flex', justifyContent: 'center' }}>
+          <AnalystStatus stage="checking" />
         </div>
       )}
       {analysisState === 'idle' && !run && (
@@ -112,6 +114,11 @@ export default function AnalysisTab({
               <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', color: 'var(--t0)' }}>PIPELINE STAGES</span>
               <span style={{ fontSize: 11, color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace" }}>Deterministic · No AI in financial pipeline</span>
             </div>
+            {isProcessing && (
+              <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--s3)' }}>
+                <AnalystStatus stage={activeAnalystStage(pipelineStages) ?? 'generic'} />
+              </div>
+            )}
             <div style={{ padding: '0 20px' }}>
               <div style={{ display: 'grid', gridTemplateColumns: '200px 1fr 120px 80px', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--s3)' }}>
                 {['STAGE', 'DETAIL', 'PROGRESS', 'STATUS'].map((h) => <span key={h} style={{ fontSize: 10, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.1em' }}>{h}</span>)}
