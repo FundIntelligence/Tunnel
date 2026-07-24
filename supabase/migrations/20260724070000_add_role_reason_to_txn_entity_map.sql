@@ -1,0 +1,20 @@
+-- Migration 025: add role_reason to pds_txn_entity_map (PAR-89)
+--
+-- PAR-89 replaces the classifier's flat KES 100,000 "large positive credit"
+-- threshold with a per-deal relative statistic (median + scaled MAD), plus an
+-- absolute ceiling. Every needs_review transaction now carries a human-readable
+-- reason string explaining why it was flagged (e.g. "KES 340,000 credit, no
+-- keyword match, 4.2x this business's median transaction size") — this column
+-- is where that string is persisted so the Review Queue can display it.
+--
+-- Additive only: nullable text column, no backfill for existing rows (older
+-- rows simply have role_reason = null; the Review Queue falls back to an
+-- empty string for those). NOTE: unlike most additive columns in this log,
+-- this one DOES change financial_state_hash going forward — the whole
+-- txn_entity_map list (including this new field) is part of the hashed
+-- snapshot payload (see backend/v1/core/snapshot_engine.py). That is expected
+-- and handled by the accompanying SCHEMA_VERSION/CONFIG_VERSION bump in
+-- backend/v1/config.py (1.0.2->1.0.3 / 1.0.3->1.0.4) in the same change — see
+-- the Schema Change Log entry below and the golden hash sentinel update in
+-- backend/tests_v1/test_golden_hash_sentinel.py.
+alter table pds_txn_entity_map add column if not exists role_reason text null;
