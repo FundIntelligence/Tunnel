@@ -473,63 +473,17 @@ _CATEGORY_MAP = {
 }
 
 
-_MOM_RELIABLE_THRESHOLD_CENTS = 1000000
-
-
-def _mom_change_bps(prev: int, curr: int) -> int:
-    """Month-on-month change in basis points. Returns 0 if prev is zero."""
-    if prev == 0:
-        return 0
-    return int((curr - prev) * 10000 // prev)
-
-
-def monthly_cashflow(transactions: List[RawTransaction]) -> List[Dict[str, Any]]:
-    """
-    Month-on-month cash flow with MoM % change.
-    Includes mom_reliable flag — False when previous month net is below
-    threshold and ratio is not meaningful.
-    Returns list sorted by month ascending.
-    """
-    monthly_in: Dict[str, int] = defaultdict(int)
-    monthly_out: Dict[str, int] = defaultdict(int)
-
-    for t in transactions:
-        if t.pattern_hint == "REVERSAL_PAIR":
-            continue
-        month = _month_key(t.date_raw)
-        if not month:
-            continue
-        credit = _parse_amount(t.credit_raw)
-        debit = _parse_amount(t.debit_raw)
-        if credit > 0:
-            monthly_in[month] += credit
-        if debit > 0:
-            monthly_out[month] += debit
-
-    all_months = sorted(set(list(monthly_in.keys()) + list(monthly_out.keys())))
-    result = []
-    prev_net = 0
-    for i, month in enumerate(all_months):
-        inflow = monthly_in.get(month, 0)
-        outflow = monthly_out.get(month, 0)
-        net = inflow - outflow
-        if i == 0:
-            mom_bps = 0
-            mom_reliable = False
-        else:
-            mom_bps = _mom_change_bps(prev_net, net)
-            mom_reliable = abs(prev_net) >= _MOM_RELIABLE_THRESHOLD_CENTS
-        result.append({
-            "month": month,
-            "inflow_cents": inflow,
-            "outflow_cents": outflow,
-            "net_cents": net,
-            "mom_change_bps": mom_bps,
-            "mom_reliable": mom_reliable,
-        })
-        prev_net = net
-
-    return result
+# NOTE: a raw, pre-classification monthly_cashflow() used to live here, feeding
+# pds_documents.analytics.monthly_cashflow. It summed credit/debit statement
+# columns directly with no role classification (classification happens later,
+# in the backend pipeline) — a second, independent, and silently divergent
+# definition of "monthly cashflow" from the trusted, role-classified one in
+# backend/v1/analytics.py::monthly_cashflow(), which the app's Analysis tab and
+# (as of the same fix that removed this) the exported PDF both use, sourced
+# from the deal's sealed canonical_json. Removed rather than left unused, so it
+# can't be silently reconnected later and reintroduce the same class of bug —
+# see backend/v1/analysis/snapshot_html_renderer.py's "Monthly cashflow"
+# comment for the full history.
 
 
 def entity_discovery_flags(transactions: List[RawTransaction]) -> List[Dict[str, Any]]:
@@ -757,7 +711,6 @@ def run_analytics(transactions: List[RawTransaction], threshold_cents: int = 500
             "analyst_classified": sum(1 for t in transactions if t.classification_status == "ANALYST_CLASSIFIED"),
         },
         "credit_scoring_inputs": credit_scoring_inputs(transactions),
-        "monthly_cashflow": monthly_cashflow(transactions),
         "monthly_entity_breakdown": monthly_entity_breakdown(transactions),
         "revenue_quality": revenue_quality(transactions),
         "expense_patterns": expense_patterns(transactions),

@@ -6,6 +6,7 @@ audit session (deal_id 42c41951-c907-4361-bb12-16f39d468f0c).
 """
 import json
 import os
+import re
 import sys
 from unittest.mock import MagicMock
 
@@ -19,6 +20,7 @@ import v1.db.supabase_client as _supabase_client_mod  # noqa: E402
 _supabase_client_mod.get_supabase = MagicMock(return_value=MagicMock())
 
 from v1.analysis import snapshot_html_renderer as renderer  # noqa: E402
+from v1.analytics import monthly_cashflow as _live_monthly_cashflow  # noqa: E402
 
 
 # ── fake Supabase client ────────────────────────────────────────────────────────
@@ -325,22 +327,31 @@ def test_cross_year_statement_period_not_collapsed_to_trailing_month():
     when no audited financial year is declared, not just the trailing partial year.
     """
     months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
-    monthly_cashflow = [
-        {"month": m, "inflow_cents": 100000, "outflow_cents": 50000} for m in months
-    ]
     document_rows = [{
         "id": "doc-1",
         "storage_url": "inline://STATEMENT.pdf",
         "source_files": [],
-        "analytics": {
-            "summary": {"total_transactions": len(months)},
-            "monthly_cashflow": monthly_cashflow,
-            "credit_scoring_inputs": {},
-        },
+        "analytics": {"summary": {"total_transactions": len(months)}, "credit_scoring_inputs": {}},
     }]
-    # Revenue spread across both years: pre-fix, only the 2026-01 txn (KES 5,000)
-    # would count, averaging to "5K". Post-fix, all three months count, averaging
-    # (1,000 + 3,000 + 5,000) / 3 = KES 3,000, i.e. "3K".
+    # Monthly cashflow / composition now come from canonical_json's sealed
+    # transactions + txn_entity_map (see snapshot_html_renderer.py's "Monthly
+    # cashflow" comment) — one inflow + one outflow txn per month, net
+    # positive throughout, spanning the same Jan 2025 - Jan 2026 boundary.
+    canon_transactions = []
+    canon_txn_entity_map = []
+    for i, m in enumerate(months):
+        in_id, out_id = f"c{i}in", f"c{i}out"
+        canon_transactions.append({"id": in_id, "txn_date": f"{m}-05", "signed_amount_cents": 100000})
+        canon_transactions.append({"id": out_id, "txn_date": f"{m}-10", "signed_amount_cents": -50000})
+        canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
+        canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
+
+    # Revenue spread across both years, on the LIVE raw-transactions table
+    # (avg monthly revenue is still computed from there, unchanged by this
+    # unification — only monthly cashflow/composition moved to canonical_json):
+    # pre-fix, only the 2026-01 txn (KES 5,000) would count, averaging to "5K".
+    # Post-fix, all three months count, averaging (1,000 + 3,000 + 5,000) / 3
+    # = KES 3,000, i.e. "3K".
     raw_txn_rows = [
         {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 100000,
          "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None},
@@ -359,11 +370,15 @@ def test_cross_year_statement_period_not_collapsed_to_trailing_month():
         "pds_snapshots": [{
             "sha256_hash": _SHA,
             "created_at": "2026-01-30T08:00:00+00:00",
-            "canonical_json": json.dumps({"metrics": {
-                "coverage_bp": 10000, "missing_month_count": 0,
-                "missing_month_penalty_bp": 0, "reconciliation_bp": None,
-                "reconciliation_status": "NOT_RUN",
-            }}),
+            "canonical_json": json.dumps({
+                "metrics": {
+                    "coverage_bp": 10000, "missing_month_count": 0,
+                    "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                    "reconciliation_status": "NOT_RUN",
+                },
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map,
+            }),
         }],
         "pds_documents": document_rows,
         "pds_audited_financials": [],  # not submitted -> recon_available False
@@ -390,37 +405,43 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
     # 3 net-negative months so the "Net-negative months" pattern triggers (>2).
     neg = {"2025-02", "2025-05", "2025-08"}
-    monthly_cashflow = [
-        {
-            "month": m,
-            "inflow_cents": 50000 if m in neg else 100000,
-            "outflow_cents": 100000 if m in neg else 50000,
-        }
-        for m in months
-    ]
     document_rows = [{
         "id": "doc-1",
         "storage_url": "inline://STATEMENT.pdf",
         "source_files": [],
         "analytics": {
             "summary": {"total_transactions": len(months)},
-            "monthly_cashflow": monthly_cashflow,
             "credit_scoring_inputs": {
                 "payroll_stability": "IRREGULAR",
                 "payroll_months_detected": 4,
             },
         },
     }]
+    # Monthly cashflow now comes from canonical_json's sealed transactions +
+    # txn_entity_map (see snapshot_html_renderer.py's "Monthly cashflow" comment).
+    canon_transactions = []
+    canon_txn_entity_map = []
+    for i, m in enumerate(months):
+        in_id, out_id = f"c{i}in", f"c{i}out"
+        in_amt, out_amt = (50000, 100000) if m in neg else (100000, 50000)
+        canon_transactions.append({"id": in_id, "txn_date": f"{m}-05", "signed_amount_cents": in_amt})
+        canon_transactions.append({"id": out_id, "txn_date": f"{m}-10", "signed_amount_cents": -out_amt})
+        canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
+        canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
     tables = {
         "pds_deals": [{"company_name": "CrossYear Co", "currency": "KES", "analyst_notes": ""}],
         "pds_snapshots": [{
             "sha256_hash": _SHA,
             "created_at": "2026-01-30T08:00:00+00:00",
-            "canonical_json": json.dumps({"metrics": {
-                "coverage_bp": 10000, "missing_month_count": 0,
-                "missing_month_penalty_bp": 0, "reconciliation_bp": None,
-                "reconciliation_status": "NOT_RUN",
-            }}),
+            "canonical_json": json.dumps({
+                "metrics": {
+                    "coverage_bp": 10000, "missing_month_count": 0,
+                    "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                    "reconciliation_status": "NOT_RUN",
+                },
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map,
+            }),
         }],
         "pds_documents": document_rows,
         "pds_audited_financials": [],
@@ -434,3 +455,304 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     assert "3 of 13 months net-negative" in html
     assert "Payroll detected in 4 of 13 months" in html
     assert "of 12 months" not in html
+
+
+# ── single source of truth: PDF vs live /analytics/monthly-cashflow ─────────
+
+def _extract_cashflow_table_rows(html: str):
+    """Parse the rendered Monthly Cashflow table's <tr class="cf-row"> cells
+    directly out of the HTML, keyed on the same CSS classes snapshot.html uses
+    (cf-month/cf-inflow/cf-outflow), so this can't accidentally match numbers
+    elsewhere on the page."""
+    return [
+        {"month_label": m.group(1), "inflow_str": m.group(2), "outflow_str": m.group(3)}
+        for m in re.finditer(
+            r'<td class="cf-month">([^<]*)</td>\s*'
+            r'<td class="cf-inflow">([^<]*)</td>\s*'
+            r'<td class="cf-outflow">([^<]*)</td>',
+            html,
+        )
+    ]
+
+
+def test_pdf_monthly_cashflow_matches_live_analytics_endpoint_definition():
+    """
+    The regression test for the bug class fixed by unifying #1 (parity-ingestion's
+    raw pre-classification credit/debit cache), #2 (backend/v1/analytics.py's
+    role-classified definition — the live GET /analytics/monthly-cashflow
+    endpoint the app's Analysis tab uses, and now the trusted single source of
+    truth) and #3 (the PDF renderer's own exclude-list composition calc) into
+    one definition. See snapshot_html_renderer.py's "Monthly cashflow" comment.
+
+    Builds a deliberately mixed fixture — CASHFLOW_INFLOW_ROLES roles (revenue,
+    mpesa, loan_inflow, capital_injection) alongside roles that must NOT count
+    as inflow (transfer, even though it's a positive amount), plus outflow
+    roles that the OLD exclude-list composition wrongly dropped (transfer,
+    opening_balance) but must count under #2's "any negative amount" rule.
+    Then independently computes the expected monthly totals by calling
+    backend/v1/analytics.py::monthly_cashflow() directly — the exact function
+    GET /analytics/monthly-cashflow calls — and asserts the PDF's rendered
+    table matches it exactly, month for month. If anyone reintroduces a
+    second, independent implementation, this fails immediately instead of
+    surfacing in front of a client again.
+    """
+    canon_transactions = [
+        {"id": "a1", "txn_date": "2025-01-05", "signed_amount_cents": 500000},   # revenue_operational -> in
+        {"id": "a2", "txn_date": "2025-01-10", "signed_amount_cents": 200000},   # mpesa_inflow -> in
+        {"id": "a3", "txn_date": "2025-01-15", "signed_amount_cents": 300000},   # transfer -> NOT in
+        {"id": "a4", "txn_date": "2025-01-20", "signed_amount_cents": -150000},  # supplier -> out
+        {"id": "a5", "txn_date": "2025-01-25", "signed_amount_cents": -50000},   # transfer -> out (must still count)
+        {"id": "a6", "txn_date": "2025-02-05", "signed_amount_cents": 400000},   # loan_inflow -> in
+        {"id": "a7", "txn_date": "2025-02-10", "signed_amount_cents": 100000},   # capital_injection -> in
+        {"id": "a8", "txn_date": "2025-02-15", "signed_amount_cents": -80000},   # payroll -> out
+        {"id": "a9", "txn_date": "2025-02-20", "signed_amount_cents": -20000},   # opening_balance -> out (must still count)
+    ]
+    canon_txn_entity_map = [
+        {"txn_id": "a1", "role": "revenue_operational"},
+        {"txn_id": "a2", "role": "mpesa_inflow"},
+        {"txn_id": "a3", "role": "transfer"},
+        {"txn_id": "a4", "role": "supplier"},
+        {"txn_id": "a5", "role": "transfer"},
+        {"txn_id": "a6", "role": "loan_inflow"},
+        {"txn_id": "a7", "role": "capital_injection"},
+        {"txn_id": "a8", "role": "payroll"},
+        {"txn_id": "a9", "role": "opening_balance"},
+    ]
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {"summary": {"total_transactions": len(canon_transactions)}, "credit_scoring_inputs": {}},
+    }]
+    tables = {
+        "pds_deals": [{"company_name": "Mixed Roles Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2025-03-01T08:00:00+00:00",
+            "canonical_json": json.dumps({
+                "metrics": {
+                    "coverage_bp": 10000, "missing_month_count": 0,
+                    "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                    "reconciliation_status": "NOT_RUN",
+                },
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map,
+            }),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [],
+        "pds_raw_transactions": [],
+        "pds_txn_entity_map": [],
+    }
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    # Independently compute "expected" via the exact function GET
+    # /analytics/monthly-cashflow calls (backend/v1/api.py's get_monthly_cashflow
+    # tags transactions the same way: role from txn_entity_map keyed by id/txn_id,
+    # amount_cents, txn_date) — not a re-implementation of it.
+    role_lookup = {m["txn_id"]: m["role"] for m in canon_txn_entity_map}
+    tagged = [{
+        "role": role_lookup.get(t["id"], ""),
+        "amount_cents": t["signed_amount_cents"],
+        "txn_date": t["txn_date"],
+        "txn_id": t["id"],
+    } for t in canon_transactions]
+    expected_rows = _live_monthly_cashflow(tagged)
+
+    assert expected_rows == [
+        {"month": "2025-01", "inflow_cents": 700000, "outflow_cents": 200000,
+         "net_cents": 500000, "mom_change_bps": None, "mom_reliable": False},
+        {"month": "2025-02", "inflow_cents": 500000, "outflow_cents": 100000,
+         "net_cents": 400000, "mom_change_bps": -2000, "mom_reliable": False},
+    ]
+
+    rendered_rows = _extract_cashflow_table_rows(html)
+    assert rendered_rows == [
+        {
+            "month_label": renderer.MONTH_ABBR[row["month"][5:7]],
+            "inflow_str": f"{row['inflow_cents'] / 100:,.0f}",
+            "outflow_str": f"{row['outflow_cents'] / 100:,.0f}",
+        }
+        for row in expected_rows
+    ]
+
+    # Composition totals (page 3) must also agree with the same definition —
+    # this is #3's half of the unification. total_in = 700,000 + 500,000;
+    # total_out = 200,000 + 100,000 (all in cents -> KES millions in the PDF).
+    total_in_cents  = sum(r["inflow_cents"] for r in expected_rows)
+    total_out_cents = sum(r["outflow_cents"] for r in expected_rows)
+    assert f"KES {total_in_cents / 100 / 1_000_000:.1f}M" in html
+    assert f"KES {total_out_cents / 100 / 1_000_000:.1f}M" in html
+
+
+# ── multi-deal validation for the monthly-cashflow unification ──────────────
+# Required by the "unify the three divergent definitions" fix: the parity
+# property above (PDF matches backend/v1/analytics.py::monthly_cashflow
+# exactly) must hold across varied deal shapes, not just one fixture — in
+# particular the two branches _in_active_period() takes (audited financial
+# year declared vs not) and short (<12 month) statement histories, since
+# those are the edge cases most likely to silently break this kind of change.
+
+def _render_and_check_parity(canon_transactions, canon_txn_entity_map, *, audited_financials=None):
+    """Render a snapshot from the given canonical transactions/roles and assert
+    the PDF's monthly cashflow table matches backend/v1/analytics.py's
+    monthly_cashflow() applied to the same active-period-filtered months.
+    Returns (html, expected_active_rows) for scenario-specific assertions."""
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {"summary": {"total_transactions": len(canon_transactions)}, "credit_scoring_inputs": {}},
+    }]
+    tables = {
+        "pds_deals": [{"company_name": "Scenario Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2026-01-30T08:00:00+00:00",
+            "canonical_json": json.dumps({
+                "metrics": {
+                    "coverage_bp": 10000, "missing_month_count": 0,
+                    "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                    "reconciliation_status": "NOT_RUN",
+                },
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map,
+            }),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [audited_financials] if audited_financials else [],
+        "pds_raw_transactions": [],
+        "pds_txn_entity_map": [],
+    }
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    if audited_financials:
+        renderer.generate_reconciliation_section = MagicMock(return_value=_RECON_SECTION)
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    role_lookup = {m["txn_id"]: m["role"] for m in canon_txn_entity_map}
+    tagged = [{
+        "role": role_lookup.get(t["id"], ""),
+        "amount_cents": t["signed_amount_cents"],
+        "txn_date": t["txn_date"],
+        "txn_id": t["id"],
+    } for t in canon_transactions]
+    all_expected_rows = _live_monthly_cashflow(tagged)
+
+    # Mirror _in_active_period(): scoped to the declared FY when audited
+    # financials are present, otherwise every month is in scope.
+    if audited_financials and audited_financials.get("financial_year"):
+        fy = str(audited_financials["financial_year"])
+        expected_active_rows = [r for r in all_expected_rows if r["month"].startswith(f"{fy}-")]
+    else:
+        expected_active_rows = all_expected_rows
+
+    rendered_rows = _extract_cashflow_table_rows(html)
+    assert rendered_rows == [
+        {
+            "month_label": renderer.MONTH_ABBR[row["month"][5:7]],
+            "inflow_str": f"{row['inflow_cents'] / 100:,.0f}",
+            "outflow_str": f"{row['outflow_cents'] / 100:,.0f}",
+        }
+        for row in expected_active_rows
+    ]
+    return html, expected_active_rows
+
+
+def _canon_month_pair(idx: int, month: str, in_role: str, in_cents: int, out_role: str, out_cents: int):
+    """One inflow + one outflow canonical transaction/role-map pair for `month`."""
+    in_id, out_id = f"m{idx}in", f"m{idx}out"
+    txns = [
+        {"id": in_id, "txn_date": f"{month}-05", "signed_amount_cents": in_cents},
+        {"id": out_id, "txn_date": f"{month}-20", "signed_amount_cents": -out_cents},
+    ]
+    roles = [
+        {"txn_id": in_id, "role": in_role},
+        {"txn_id": out_id, "role": out_role},
+    ]
+    return txns, roles
+
+
+def test_multi_deal_parity_with_audited_financials_declared_fy():
+    """Deal 2 of 5: audited financials declared (financial_year=2024) — the
+    _in_active_period() branch NOT exercised by the demo deal (which has no
+    audited financials). Statement includes a 2023 transaction that must be
+    excluded from the rendered table (outside the declared FY) while the
+    live-endpoint definition (unconditional, no FY scoping) still includes it
+    in its own raw output — confirming the renderer's FY scoping composes
+    correctly on top of the now-canonical-sourced monthly_merged."""
+    canon_transactions, canon_txn_entity_map = [], []
+    for i, m in enumerate(["2023-12", "2024-01", "2024-02", "2024-03"]):
+        t, r = _canon_month_pair(i, m, "revenue_operational", 300000, "supplier", 100000)
+        canon_transactions += t
+        canon_txn_entity_map += r
+
+    html, expected_active_rows = _render_and_check_parity(
+        canon_transactions, canon_txn_entity_map,
+        audited_financials={"financial_year": 2024, "turnover_cents": 0,
+                             "profit_before_tax_cents": 0, "loan_breakdown": []},
+    )
+    # 2023-12 correctly excluded — the rendered table has exactly 3 rows
+    # (Jan-Mar 2024), which _render_and_check_parity's row-for-row equality
+    # assertion already proved above.
+    assert [r["month"] for r in expected_active_rows] == ["2024-01", "2024-02", "2024-03"]
+
+
+def test_multi_deal_parity_short_history_under_12_months():
+    """Deal 3 of 5: only 4 months of statement history (a fresh SME with a
+    short banking relationship), no audited financials — the shortest,
+    simplest shape most likely to break silently on an off-by-one or an
+    empty-collection edge case."""
+    canon_transactions, canon_txn_entity_map = [], []
+    for i, m in enumerate(["2026-03", "2026-04", "2026-05", "2026-06"]):
+        t, r = _canon_month_pair(i, m, "mpesa_inflow", 150000, "payroll", 60000)
+        canon_transactions += t
+        canon_txn_entity_map += r
+
+    html, expected_active_rows = _render_and_check_parity(canon_transactions, canon_txn_entity_map)
+    assert len(expected_active_rows) == 4
+    assert "All 4 months net-positive." in html
+
+
+def test_multi_deal_parity_zero_inflow_month_included():
+    """Deal 4 of 5: a month with outflow only (zero inflow) — monthly_cashflow()
+    is documented to include zero-inflow months rather than skip them; confirm
+    the PDF table still agrees with the live definition for that month."""
+    canon_transactions, canon_txn_entity_map = [], []
+    t, r = _canon_month_pair(0, "2026-01", "revenue_operational", 200000, "supplier", 50000)
+    canon_transactions += t
+    canon_txn_entity_map += r
+    # 2026-02: outflow only, no inflow transaction at all.
+    canon_transactions.append({"id": "m1out", "txn_date": "2026-02-10", "signed_amount_cents": -75000})
+    canon_txn_entity_map.append({"txn_id": "m1out", "role": "tax_payment"})
+
+    html, expected_active_rows = _render_and_check_parity(canon_transactions, canon_txn_entity_map)
+    assert expected_active_rows[1]["month"] == "2026-02"
+    assert expected_active_rows[1]["inflow_cents"] == 0
+    assert expected_active_rows[1]["outflow_cents"] == 75000
+
+
+def test_multi_deal_parity_outflow_only_dormant_account():
+    """Deal 5 of 5: a dormant/early-stage account with no inflow roles present
+    at all across the whole statement — total_in == 0 throughout, exercising
+    the division-by-zero guards in income_quality_pct/mpesa_pct/composition."""
+    canon_transactions, canon_txn_entity_map = [], []
+    for i, m in enumerate(["2026-01", "2026-02"]):
+        in_id, out_id = f"d{i}in", f"d{i}out"
+        # A positive amount that does NOT count as inflow (not in
+        # CASHFLOW_INFLOW_ROLES) alongside a genuine outflow.
+        canon_transactions.append({"id": in_id, "txn_date": f"{m}-05", "signed_amount_cents": 10000})
+        canon_txn_entity_map.append({"txn_id": in_id, "role": "reversal_credit"})
+        canon_transactions.append({"id": out_id, "txn_date": f"{m}-20", "signed_amount_cents": -40000})
+        canon_txn_entity_map.append({"txn_id": out_id, "role": "bank_charge"})
+
+    html, expected_active_rows = _render_and_check_parity(canon_transactions, canon_txn_entity_map)
+    assert all(r["inflow_cents"] == 0 for r in expected_active_rows)
+    assert all(r["outflow_cents"] == 40000 for r in expected_active_rows)
+    # No crash rendering with total_in == 0 throughout — the parity assertion
+    # inside _render_and_check_parity already exercised every division-by-zero
+    # guard (income_quality_pct, mpesa_pct, composition segments) without
+    # raising, since it got this far.
+    assert "<html" in html

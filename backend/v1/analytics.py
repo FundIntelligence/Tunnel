@@ -17,7 +17,12 @@ _ANNUAL_REVENUE_ROLES = frozenset({
 })
 
 # ── Inflow roles for monthly cashflow ────────────────────────────────────────
-_CASHFLOW_INFLOW_ROLES = frozenset({
+# Public (no underscore): this is the single source of truth for what counts as
+# "inflow" for cashflow purposes, cross-imported by snapshot_html_renderer.py so
+# the exported PDF's monthly cashflow table and composition breakdown use the
+# exact same role set as this module's monthly_cashflow(), not a re-implemented
+# copy that can silently drift from it.
+CASHFLOW_INFLOW_ROLES = frozenset({
     "revenue_operational",
     "revenue_non_operational",
     "mpesa_inflow",
@@ -358,7 +363,7 @@ def monthly_cashflow(transactions: list[dict]) -> list[dict]:
     """
     Month-by-month inflow/outflow/net from classified transactions.
 
-    Inflows:  roles in _CASHFLOW_INFLOW_ROLES with amount_cents > 0.
+    Inflows:  roles in CASHFLOW_INFLOW_ROLES with amount_cents > 0.
     Outflows: abs(amount_cents) where amount_cents < 0.
     Zero-inflow months are included, not skipped.
     All amounts integer cents. No floats.
@@ -383,7 +388,7 @@ def monthly_cashflow(transactions: list[dict]) -> list[dict]:
         months_seen.add(month)
 
         role = txn.get("role") or txn.get("classification") or ""
-        if role in _CASHFLOW_INFLOW_ROLES and amount > 0:
+        if role in CASHFLOW_INFLOW_ROLES and amount > 0:
             monthly_in[month] = monthly_in.get(month, 0) + amount
         elif amount < 0:
             monthly_out[month] = monthly_out.get(month, 0) + abs(amount)
