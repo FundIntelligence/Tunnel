@@ -459,7 +459,13 @@ function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, s
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={effectiveCorpusReady ? "Ask anything about this borrower's financials..." : 'Run analysis first to enable Parity Review...'}
+            placeholder={
+              effectiveCorpusReady
+                ? "Ask anything about this borrower's financials..."
+                : isCheckingAnalysis
+                ? 'Checking analysis status…'
+                : 'Run analysis first to enable Parity Review...'
+            }
             disabled={!effectiveCorpusReady || loading}
             rows={2}
             style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: 'var(--t1)', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !effectiveCorpusReady ? 0.4 : 1 }}
