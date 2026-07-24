@@ -34,6 +34,7 @@ export default function ParityReviewTab({
   const txnTotal = rawTransactions.length;
   const reconDelta = creditScoringInputs ? (creditScoringInputs.average_net_monthly_cents as number ?? 0) : 0;
   const corpusReady = analysisState === 'done';
+  const isCheckingAnalysis = analysisState === 'checking';
   return (
     <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
       {/* Left: Chat area — isolated component to avoid full-page re-renders on keystroke */}
@@ -41,6 +42,7 @@ export default function ParityReviewTab({
         <ParityReviewChat
           dealId={deal.id}
           corpusReady={corpusReady}
+          isCheckingAnalysis={isCheckingAnalysis}
           txnTotal={txnTotal}
           statementCount={statementQueue.filter(s => s.status === 'ready').length}
         />

@@ -216,7 +216,7 @@ export default function DocumentsTab({
                   accent="var(--green)"
                   isUnknownFormat={unknownFormatDocIds.has(item.id)}
                   onRequestParser={() => onRequestParser({ docId: item.id, fileName: item.fileName, errorMessage: 'Bank format not recognised' })}
-                  canRemove={analysisState === 'idle' || item.status === 'failed'}
+                  canRemove={analysisState === 'idle' || analysisState === 'checking' || item.status === 'failed'}
                   onRemove={() => onRemoveStatement(item.id)}
                 />
               ))}
@@ -510,14 +510,33 @@ export default function DocumentsTab({
 
           {/* CTA */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-            <button
-              onClick={onInitialiseAnalysis}
-              disabled={statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm}
-              style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '10px 20px', background: statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm ? 'var(--s3)' : 'var(--accent)', color: statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm ? 'var(--t2)' : '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm ? 'not-allowed' : 'pointer', fontFamily: "'IBM Plex Sans', sans-serif", transition: 'background 0.15s' }}
-            >
-              {isProcessing ? 'Processing…' : 'Initialise analysis pipeline'}
-              {!isProcessing && <span style={{ fontSize: 16 }}>→</span>}
-            </button>
+            {(() => {
+              // PAR-91: don't offer this as an active "first-time setup" action
+              // while we haven't confirmed the deal's real state yet (checking),
+              // and don't frame it as first-time setup at all once analysis has
+              // already completed — the label/enabled-state must reflect what we
+              // actually know, not default to "never analysed" framing.
+              const isChecking = analysisState === 'checking';
+              const hasExistingAnalysis = analysisState === 'done';
+              const isDisabled = isChecking || statementQueue.length === 0 || queueHasPending || isProcessing || !!auditedConfirmForm;
+              const label = isChecking
+                ? 'Checking analysis status…'
+                : isProcessing
+                ? 'Processing…'
+                : hasExistingAnalysis
+                ? 'Add documents & re-run analysis'
+                : 'Initialise analysis pipeline';
+              return (
+                <button
+                  onClick={onInitialiseAnalysis}
+                  disabled={isDisabled}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '10px 20px', background: isDisabled ? 'var(--s3)' : 'var(--accent)', color: isDisabled ? 'var(--t2)' : '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: isDisabled ? 'not-allowed' : 'pointer', fontFamily: "'IBM Plex Sans', sans-serif", transition: 'background 0.15s' }}
+                >
+                  {label}
+                  {!isChecking && !isProcessing && <span style={{ fontSize: 16 }}>→</span>}
+                </button>
+              );
+            })()}
             {statementQueue.length > 0 && (
               <span style={{ fontSize: 12, color: 'var(--t1)', fontFamily: "'IBM Plex Mono', monospace" }}>
                 {statementQueue.filter(i => i.status === 'ready').length} documents indexed{queueHasPending ? ` · ${statementQueue.filter(i => i.status === 'processing' || i.status === 'uploading').length} pending` : ''}
