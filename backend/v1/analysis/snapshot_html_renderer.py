@@ -16,6 +16,7 @@ import qrcode
 from jinja2 import Environment, FileSystemLoader
 from qrcode.image.svg import SvgImage
 
+from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cashflow
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 
@@ -30,14 +31,6 @@ MONTH_ABBR = {
 }
 
 REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
-EXCL_CREDIT = {
-    "opening_balance", "closing_balance", "reversal_credit",
-    "reversal_debit", "transfer",
-}
-EXCL_DEBIT = {
-    "opening_balance", "closing_balance", "reversal_debit",
-    "reversal_credit", "transfer",
-}
 
 _BANK_ALIASES = [
     ("KCB",         ["kcb", "kenya commercial bank"]),
@@ -179,7 +172,8 @@ def render_snapshot_html(
     canonical_str = decompress_canonical_json_if_needed(raw_cj)
     canonical: Dict = json.loads(canonical_str) if canonical_str else {}
 
-    # 3. Documents — merge monthly_cashflow + credit_scoring_inputs + doc pills
+    # 3. Documents — credit_scoring_inputs + doc pills (still doc-level ingestion
+    # metadata, unrelated to the monthly-cashflow unification below).
     docs = (
         sb.table("pds_documents")
         .select("id, analytics, storage_url, source_files")
@@ -187,7 +181,6 @@ def render_snapshot_html(
         .execute()
         .data or []
     )
-    monthly_merged: Dict[str, Dict[str, int]] = {}
     credit_scoring_inputs_list: List[Dict] = []
     doc_pills: List[Dict] = []
 
@@ -207,18 +200,47 @@ def render_snapshot_html(
         label = f"{bank_name or 'Bank'} · {txn_count:,} txns"
         doc_pills.append({"label": label, "active": True})
 
-        for row in analytics.get("monthly_cashflow") or []:
-            m = row.get("month") or ""
-            if not m:
-                continue
-            if m not in monthly_merged:
-                monthly_merged[m] = {"inflow_cents": 0, "outflow_cents": 0}
-            monthly_merged[m]["inflow_cents"]  += row.get("inflow_cents") or 0
-            monthly_merged[m]["outflow_cents"] += row.get("outflow_cents") or 0
-
         cs = analytics.get("credit_scoring_inputs") or {}
         if cs:
             credit_scoring_inputs_list.append(cs)
+
+    # 3b. Monthly cashflow + inflow/outflow composition — sourced from the
+    # sealed canonical_json (canon_tagged below), via the exact same
+    # monthly_cashflow() / CASHFLOW_INFLOW_ROLES that the live
+    # /analytics/monthly-cashflow endpoint (backend/v1/analytics.py) uses for
+    # the app's Analysis tab. This used to be three independent
+    # implementations that could (and did) silently disagree:
+    #   1. parity-ingestion/app/analytics.py::monthly_cashflow() — raw
+    #      pre-classification credit/debit off the bank statement, cached once
+    #      on pds_documents.analytics at ingestion time and never refreshed.
+    #   2. backend/v1/analytics.py::monthly_cashflow() — role-classified,
+    #      the trusted definition behind the live endpoint / app's Analysis tab.
+    #   3. This file's own Composition section — a third, exclude-list based
+    #      total that didn't match either of the above.
+    # Both the table and the composition section below now derive from #2's
+    # exact function and role set, applied to this snapshot's own sealed
+    # transactions/txn_entity_map, so there is exactly one definition left.
+    canon_role_by_txn: Dict[str, str] = {
+        str(m.get("txn_id") or ""): m.get("role", "")
+        for m in (canonical.get("txn_entity_map") or [])
+    }
+    canon_tagged: List[Dict] = []
+    for t in canonical.get("transactions") or []:
+        txn_date = str(t.get("txn_date") or "")
+        if not txn_date:
+            continue
+        txn_id = str(t.get("id") or t.get("txn_id") or "")
+        canon_tagged.append({
+            "role": canon_role_by_txn.get(txn_id, ""),
+            "amount_cents": int(t.get("signed_amount_cents") or 0),
+            "txn_date": txn_date,
+            "txn_id": txn_id,
+        })
+
+    monthly_merged: Dict[str, Dict[str, int]] = {
+        row["month"]: {"inflow_cents": row["inflow_cents"], "outflow_cents": row["outflow_cents"]}
+        for row in _monthly_cashflow(canon_tagged)
+    }
 
     # 4. Audited financials (optional — sets recon_available)
     af_result = (
@@ -304,21 +326,26 @@ def render_snapshot_html(
         int(sum(by_month_rev.values()) / len(by_month_rev)) if by_month_rev else 0
     )
 
-    # Inflow composition
+    # Inflow composition — CASHFLOW_INFLOW_ROLES include-list, the same
+    # definition monthly_merged above and the live endpoint use (see the
+    # "Monthly cashflow" comment above for why this used to be a third,
+    # independent, exclude-list-based total that didn't match either).
     by_role_in: Dict[str, int] = defaultdict(int)
     total_in = 0
-    for t in txns:
-        if t["signed"] > 0 and t["role"] not in EXCL_CREDIT:
-            by_role_in[t["role"]] += t["signed"]
-            total_in += t["signed"]
+    for t in canon_tagged:
+        if t["amount_cents"] > 0 and t["role"] in CASHFLOW_INFLOW_ROLES:
+            by_role_in[t["role"]] += t["amount_cents"]
+            total_in += t["amount_cents"]
 
-    # Outflow composition
+    # Outflow composition — every negative transaction counts, no role
+    # exclusions, matching the live endpoint's definition exactly.
     by_role_out: Dict[str, int] = defaultdict(int)
     total_out = 0
-    for t in txns:
-        if t["signed"] < 0 and t["role"] not in EXCL_DEBIT:
-            by_role_out[t["role"]] += t["abs"]
-            total_out += t["abs"]
+    for t in canon_tagged:
+        if t["amount_cents"] < 0:
+            amt = abs(t["amount_cents"])
+            by_role_out[t["role"]] += amt
+            total_out += amt
 
     # Income quality
     op_in = sum(v for k, v in by_role_in.items() if k in REVENUE_ROLES)
@@ -605,7 +632,7 @@ def render_snapshot_html(
     # Composition warn strings
     mpesa_cents = by_role_in.get("mpesa_inflow", 0)
     mpesa_pct   = (mpesa_cents / total_in * 100) if total_in else 0
-    mpesa_txn_count = sum(1 for t in txns if t["role"] == "mpesa_inflow" and t["signed"] > 0)
+    mpesa_txn_count = sum(1 for t in canon_tagged if t["role"] == "mpesa_inflow" and t["amount_cents"] > 0)
     mpesa_avg = (mpesa_cents / mpesa_txn_count / 100) if mpesa_txn_count > 0 else 0
     inflow_warn = (
         f"M-Pesa at {mpesa_txn_count:,} transactions (avg {currency} {mpesa_avg:,.0f} per txn) · "
