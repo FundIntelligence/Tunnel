@@ -637,6 +637,7 @@ function V1DealPageInner() {
 
   const handleReExport = async () => {
     if (!deal) return;
+    if (analysisState === 'exporting') return; // job already in flight for this deal — ignore repeat clicks
     setAnalysisState('exporting');
     setExportSuccess('');
     setExportError('');
@@ -644,17 +645,17 @@ function V1DealPageInner() {
       // Server snapshot write happens here. PDF only generates after this resolves.
       const data = await exportSnapshot(deal.id);
       setExportData(data);
-      setLastExportedAt(new Date());
       try {
         const mcRes = await getMonthlyCashflow(deal.id);
         setMonthlyCashflow(mcRes.monthly_cashflow as unknown as Array<Record<string, unknown>>);
       } catch (e) {
         console.error('getMonthlyCashflow failed after re-export:', e);
       }
-      setAnalysisState('done');
 
       // PDF now comes from the server-rendered snapshot (QR + verify page +
       // co-branding), not a client-side rebuild — see GET /deals/{id}/report.
+      // Stay in 'exporting' (button disabled) until the PDF is actually in hand —
+      // "complete" must never be shown before the file the user asked for exists.
       const res = await downloadReport(deal.id);
       if (!res.ok) throw new Error(await res.text());
       const blob = await res.blob();
@@ -665,6 +666,8 @@ function V1DealPageInner() {
       a.click();
       URL.revokeObjectURL(url);
 
+      setLastExportedAt(new Date());
+      setAnalysisState('done');
       setExportSuccess('Snapshot saved. PDF downloading.');
       setTimeout(() => setExportSuccess(''), 5000);
     } catch (e) {
