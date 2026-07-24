@@ -199,7 +199,7 @@ def extract_aggregates(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     # Tag each transaction with its role and entity_id
     tagged: List[Dict] = []
     for tx in transactions:
-        tid = tx.get("txn_id", "")
+        tid = tx.get("id") or tx.get("txn_id", "")
         tagged.append({
             **tx,
             "role": role_map.get(tid, "other"),

@@ -358,7 +358,7 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
         </div>
 
         {/* Corpus description card */}
-        {!corpusReady && (
+        {!effectiveCorpusReady && (
           <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
             <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
               Parity Intelligence is available once analysis completes. Run analysis from the Documents tab to activate.
@@ -465,17 +465,17 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={corpusReady ? "Ask anything about this borrower's financials..." : 'Run analysis first to enable Parity Review...'}
-            disabled={!corpusReady || loading}
+            placeholder={effectiveCorpusReady ? "Ask anything about this borrower's financials..." : 'Run analysis first to enable Parity Review...'}
+            disabled={!effectiveCorpusReady || loading}
             rows={2}
-            style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: 'var(--t1)', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !corpusReady ? 0.4 : 1 }}
+            style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: 'var(--t1)', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !effectiveCorpusReady ? 0.4 : 1 }}
           />
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10, gap: 8, alignItems: 'center' }}>
             <span style={{ fontSize: 10, color: 'var(--b1)', fontFamily: "'IBM Plex Mono', monospace" }}>ctrl+enter to send</span>
             <button
               onClick={() => void doAsk()}
-              disabled={!corpusReady || loading || !question.trim()}
-              style={{ padding: '7px 16px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: !corpusReady || loading || !question.trim() ? 'not-allowed' : 'pointer', opacity: !corpusReady || loading || !question.trim() ? 0.4 : 1, fontFamily: "'IBM Plex Sans', sans-serif" }}
+              disabled={!effectiveCorpusReady || loading || !question.trim()}
+              style={{ padding: '7px 16px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: !effectiveCorpusReady || loading || !question.trim() ? 'not-allowed' : 'pointer', opacity: !effectiveCorpusReady || loading || !question.trim() ? 0.4 : 1, fontFamily: "'IBM Plex Sans', sans-serif" }}
             >
               {loading ? 'Computing...' : 'Send'}
             </button>
