@@ -27,7 +27,15 @@ export default function SnapshotTab({
 }: SnapshotTabProps) {
   return (
     <div style={{ maxWidth: 720 }}>
-      {!run ? (
+      {analysisState === 'checking' && !run ? (
+        // Same false-negative class as PR #101/#102: 'checking' means we haven't
+        // confirmed a snapshot's absence yet, so this must never render the
+        // "no snapshot" copy — that would be a confirmed-negative claim before
+        // the check has actually resolved.
+        <div style={{ padding: '48px 0', display: 'flex', justifyContent: 'center' }}>
+          <AnalystStatus stage="checking" />
+        </div>
+      ) : !run ? (
         <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--t2)', fontSize: 13 }}>
           Run analysis first to generate a snapshot.
         </div>
