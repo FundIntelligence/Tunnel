@@ -168,3 +168,52 @@ because their snapshots predate it. Only the two deals explicitly
 re-tested tonight (`e21404a2-...`, `2a619980-...`) have fresh,
 post-fix snapshots. Needs a decision: bulk re-export the other demo
 deals, or scope the demo to the two already-verified ones.
+
+## Addendum — Export Snapshot button: premature "complete" status (PR #104)
+
+Separate bug, same session, different code path (Snapshot tab export flow,
+not the cold-start rehydration mount effects above — no overlap, safe to
+land independently).
+
+**Symptom (reported by user):** clicking "Save & Export PDF" on the
+Snapshot tab immediately showed a "complete" state and updated "Last
+exported" timestamp, but the PDF file itself landed later. Because the UI
+already claimed completion, impatient users clicked again — 2-3 times —
+and files arrived in a batch roughly matching the click count.
+
+**Root cause:** `handleReExport` (`app/v1/deal/page.tsx`) calls two
+independent backend endpoints in sequence:
+1. `POST /deals/{id}/export` — writes/returns the snapshot. Cheap on
+   repeat calls: `export()` (`backend/v1/api.py`) short-circuits to the
+   cached snapshot when no docs/overrides changed since the last export.
+2. `GET /deals/{id}/report` — renders HTML and runs weasyprint to
+   generate the PDF from scratch, **every call, with no caching**.
+
+The old code set `analysisState` to `'done'` and stamped
+`lastExportedAt` right after step 1 resolved — before step 2 (the actual
+PDF) had even started. That both re-enabled the button and displayed
+"Last exported" ahead of the real deliverable. Because the button
+re-enabled early, each impatient re-click ran the full flow again,
+including a genuinely separate, redundant, non-cached weasyprint PDF
+render for step 2 — real wasted backend work, not just a display glitch.
+
+**Fix:** keep `analysisState` at `'exporting'` ("Generating PDF…", button
+disabled) for the entire flow, and only stamp `lastExportedAt` / flip to
+`'done'` after the PDF blob is actually in hand. Added an explicit
+in-flight guard (`if (analysisState === 'exporting') return;`) so a click
+during an active job for the deal is a no-op rather than starting a
+second job.
+
+**Validation status:** `tsc --noEmit` is clean on the touched file. Live
+click-through validation on the two real deals
+(`2a619980-0f74-4d9f-bb3b-648ab1eb9c95`,
+`e21404a2-6bef-4484-a1cb-3fedea4bb2d6`) against the PR's preview
+deployment was **attempted but blocked** — both the per-PR preview URL and
+the `parity-sme-staging.vercel.app` alias returned a per-action browser
+approval wall that could not be cleared in this session. This is
+**unvalidated in a live browser** and needs manual confirmation before
+being considered closed, per the "Lesson" section above: code-level
+tracing and a clean type-check are not a substitute for exercising the
+actual click path.
+
+PR: [#104](../../pull/104).
