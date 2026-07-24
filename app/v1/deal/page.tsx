@@ -202,30 +202,62 @@ function V1DealPageInner() {
   // never call the export endpoint on a deal that has no run at all; exportSnapshot
   // itself short-circuits to the existing snapshot when nothing changed, so this
   // doesn't create a new analysis_run.
+  //
+  // Two outcomes must be told apart, or an unknown/failed check looks
+  // identical to "this deal was never analysed" (misleadingly telling an
+  // analyst to start over on a deal that already has validated results):
+  //   1. getLatestAnalysis genuinely returns no run — idle is correct.
+  //   2. Any call throws (cold start, network blip, transient 409/401/5xx) —
+  //      we don't actually know whether this deal has a run or not, so we
+  //      must NOT assert "no analysis" either. Surface a distinct, retryable
+  //      error state instead. The guard is latched as soon as we reach any
+  //      conclusive outcome (case 1, success, or case 2) so we don't loop
+  //      forever, but retryRehydrate clears it for an explicit retry.
   useEffect(() => {
     if (!deal?.id || analysisState !== 'idle' || rehydratedDealId.current === deal.id) return;
-    rehydratedDealId.current = deal.id;
+    const dealId = deal.id;
     (async () => {
+      let analysis_run;
       try {
-        const { analysis_run } = await getLatestAnalysis(deal.id);
-        if (!analysis_run) return;
-        const data = await exportSnapshot(deal.id);
+        ({ analysis_run } = await getLatestAnalysis(dealId));
+      } catch (e) {
+        console.error('getLatestAnalysis failed on rehydrate:', e);
+        setErrorMsg("Could not check this deal's analysis status (a temporary network or server issue). If analysis already completed, your results are safe — retry to check again.");
+        rehydratedDealId.current = dealId;
+        setAnalysisState('error');
+        return;
+      }
+      if (!analysis_run) {
+        rehydratedDealId.current = dealId;
+        return;
+      }
+      try {
+        const data = await exportSnapshot(dealId);
         setExportData(data);
-        const txRes = await listDealTransactions(deal.id);
+        const txRes = await listDealTransactions(dealId);
         setRawTransactions(txRes.transactions as unknown as Array<Record<string, unknown>>);
         try {
-          const csiRes = await getCreditScoringInputs(deal.id);
+          const csiRes = await getCreditScoringInputs(dealId);
           setCreditScoringInputs(csiRes);
         } catch (e) {
           console.error('getCreditScoringInputs failed on rehydrate:', e);
         }
+        rehydratedDealId.current = dealId;
         setAnalysisState('done');
-      } catch {
-        // No existing analysis, or documents still processing — leave at 'idle',
-        // same as a deal that has never been analysed.
+      } catch (e) {
+        console.error('Rehydration failed after finding an existing analysis run:', e);
+        setErrorMsg('Found a completed analysis for this deal but could not load it (a temporary network or server issue). Your results are safe — retry to reload them.');
+        rehydratedDealId.current = dealId;
+        setAnalysisState('error');
       }
     })();
   }, [deal?.id, analysisState]);
+
+  const retryRehydrate = useCallback(() => {
+    rehydratedDealId.current = null;
+    setErrorMsg('');
+    setAnalysisState('idle');
+  }, []);
 
   useEffect(() => {
     setStatementQueue((prev) => {
@@ -855,6 +887,8 @@ function V1DealPageInner() {
               onGoToDocuments={() => setActiveTab('documents')}
               onGoToQueue={() => setActiveTab('queue')}
               onDrill={setDrillModal}
+              errorMsg={errorMsg}
+              onRetry={retryRehydrate}
             />
           )}
 

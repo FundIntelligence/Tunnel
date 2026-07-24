@@ -35,6 +35,8 @@ export interface AnalysisTabProps {
   onGoToDocuments: () => void;
   onGoToQueue: () => void;
   onDrill: (modal: DrillModalState) => void;
+  errorMsg?: string;
+  onRetry?: () => void;
 }
 
 export default function AnalysisTab({
@@ -57,6 +59,8 @@ export default function AnalysisTab({
   onGoToDocuments,
   onGoToQueue,
   onDrill,
+  errorMsg,
+  onRetry,
 }: AnalysisTabProps) {
   const csi = creditScoringInputs as Record<string, unknown> | null;
   const confPct = run ? (run.final_confidence_bp / 100).toFixed(1) : null;
@@ -71,6 +75,14 @@ export default function AnalysisTab({
         <div style={{ padding: '48px 0', textAlign: 'center' }}>
           <div style={{ fontSize: 13, color: 'var(--t1)', marginBottom: 16 }}>No analysis run yet. Upload documents and initialise the pipeline.</div>
           <button onClick={onGoToDocuments} style={{ padding: '9px 18px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, fontSize: 13, cursor: 'pointer' }}>← Go to Documents</button>
+        </div>
+      )}
+      {analysisState === 'error' && !run && (
+        <div style={{ padding: '48px 0', textAlign: 'center' }}>
+          <div style={{ fontSize: 13, color: 'var(--red)', marginBottom: 16, maxWidth: 480, marginLeft: 'auto', marginRight: 'auto' }}>{errorMsg || 'Something went wrong loading this analysis.'}</div>
+          {onRetry && (
+            <button onClick={onRetry} style={{ padding: '9px 18px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, fontSize: 13, cursor: 'pointer' }}>Retry</button>
+          )}
         </div>
       )}
       {(isProcessing || run) && (
