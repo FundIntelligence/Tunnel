@@ -425,6 +425,147 @@ def test_supplier_payment_analysis_moderate_and_diversified_concentration():
     assert "Supplier spend is well-diversified across counterparties." in html2
 
 
+# ── tax compliance analysis (PAR-63) ─────────────────────────────────────────
+# Live recompute over txns, NOT the cached pds_documents.analytics.
+# credit_scoring_inputs blob — see PAR-63_new_sections_spec.md Section 3.
+
+def test_tax_compliance_analysis_real_fixture_matches_cached_blob_not_detected():
+    """The real Buildex fixture's live txns span 2 real months (2025-01,
+    2025-02 — txn-1/txn-2/txn-3) with zero tax_payment-role transactions
+    among them, so the live recompute correctly lands on "0 of 2" months /
+    NOT_DETECTED — the same categorical value the cached credit_scoring_inputs
+    blob happens to carry for this fixture, but this time both the numerator
+    (tax months) and denominator (total months) are genuinely sourced from
+    the same live txns list (pds_raw_transactions + pds_txn_entity_map), not
+    a mix of live txns and canonical_json. An earlier version of this section
+    computed the denominator from period_months (canonical_json-derived),
+    which happened to read "0 of 0" for this fixture only because the
+    fixture's sealed canonical_json carries no transactions at all — a
+    data-source inconsistency caught in PR #110 review before merge, not a
+    genuine finding about this deal."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Tax Compliance Analysis" in html
+    assert "KES 0" in html
+    assert "0 of 2" in html
+    assert "NOT_DETECTED" in html
+    assert (
+        "No tax payments detected in bank activity. This does not necessarily "
+        "indicate non-compliance — tax may be paid from an account outside this "
+        "statement set, or by a third party. Verify against a KRA compliance certificate."
+    ) in html
+
+
+def _tax_txn_fixture(tax_months: list, non_tax_months: list, *, amount_cents: int = 500000):
+    """One tax_payment debit per month in `tax_months`, one revenue credit per
+    month in `non_tax_months` (so period_months covers the full set) —
+    entity_id-agnostic, this section doesn't need pds_entities."""
+    raw_txns, txn_map = [], []
+    i = 0
+    for m in tax_months:
+        tid = f"tax{i}"
+        raw_txns.append({
+            "id": tid, "txn_date": f"{m}-15", "signed_amount_cents": -amount_cents,
+            "abs_amount_cents": amount_cents, "normalized_descriptor": "KRA PAYE", "balance_cents": None,
+        })
+        txn_map.append({"txn_id": tid, "role": "tax_payment"})
+        i += 1
+    for m in non_tax_months:
+        tid = f"rev{i}"
+        raw_txns.append({
+            "id": tid, "txn_date": f"{m}-05", "signed_amount_cents": amount_cents,
+            "abs_amount_cents": amount_cents, "normalized_descriptor": "PAYMENT IN", "balance_cents": None,
+        })
+        txn_map.append({"txn_id": tid, "role": "revenue_operational"})
+        i += 1
+    return raw_txns, txn_map
+
+
+def test_tax_compliance_analysis_compliant_status():
+    """Tax activity in 10 of 12 months (>=80%) -> COMPLIANT. Uses canonical_json
+    (sealed transactions/txn_entity_map) so monthly_merged/period_months are
+    populated, unlike the bare real-fixture snapshot above."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:10]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []  # observed state — no FY scoping
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "10 of 12" in html
+    assert "COMPLIANT" in html
+    assert "Tax payment pattern is consistent with the business's stated activity level." in html
+
+
+def test_tax_compliance_analysis_partial_status():
+    """Tax activity in 3 of 12 months (<80%, >0) -> PARTIAL."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:3]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "3 of 12" in html
+    assert "PARTIAL" in html
+    assert "Partial tax payment pattern — verify against filed returns." in html
+
+
+def test_tax_compliance_analysis_renders_in_observed_state_without_audited_financials():
+    """Confirms the section renders (not gated on recon_available) when no
+    audited financials are submitted at all — same both-states requirement
+    as Supplier Payment Analysis."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    raw_txns, txn_map = _tax_txn_fixture(months, months)  # tax every month -> COMPLIANT
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Tax Compliance Analysis" in html
+    assert "12 of 12" in html
+    assert "COMPLIANT" in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():

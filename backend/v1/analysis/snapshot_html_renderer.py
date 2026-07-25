@@ -729,6 +729,66 @@ def render_snapshot_html(
     else:
         supplier_payments_ctx = {"available": False}
 
+    # ── Tax Compliance Analysis (PAR-63) ──────────────────────────────────────
+    # Live recompute over the same txns list already in scope for this render
+    # — NOT the cached pds_documents.analytics.credit_scoring_inputs blob
+    # (credit_scoring_inputs_list above). A stale cache silently drifting
+    # after an analyst override or reprocessing is exactly the "wrong answer
+    # without an error" risk PARITY_SCIENCE.md flags for an investor-facing
+    # compliance conclusion. Mirrors the by_month_rev/procurement_cents
+    # aggregation pattern already used in this file — no new query, no new
+    # style. Renders in both recon_available states — depends only on live
+    # transaction data.
+    _TAX_ROLES = ("tax_payment", "kra_payment")
+    tax_months_active: set = set()
+    tax_total_cents_active = 0
+    # Denominator must come from the same txns list as the numerator above —
+    # period_months (used elsewhere in this file) is derived from
+    # monthly_merged/canon_tagged, which is sourced from canonical_json, not
+    # from txns. Mixing the two would compute a ratio whose numerator and
+    # denominator disagree on which data source is authoritative, silently
+    # defeating the whole point of live-recomputing this section instead of
+    # trusting a cache. See PAR-63 PR #110 review — caught before merge.
+    all_months_active: set = set()
+    for t in txns:
+        m = (t["txn_date"] or "")[:7]
+        if t["txn_date"] and _in_active_period(m):
+            all_months_active.add(m)
+            if t["role"] in _TAX_ROLES and t["signed"] < 0:
+                tax_months_active.add(m)
+                tax_total_cents_active += t["abs"]
+
+    n_tax_months   = len(tax_months_active)
+    n_total_months = len(all_months_active)
+
+    if n_total_months == 0:
+        kra_compliance = "NOT_DETECTED"
+    elif n_tax_months >= n_total_months * 0.8:
+        kra_compliance = "COMPLIANT"
+    elif n_tax_months > 0:
+        kra_compliance = "PARTIAL"
+    else:
+        kra_compliance = "NOT_DETECTED"
+
+    if kra_compliance == "COMPLIANT":
+        tax_compliance_clause = "Tax payment pattern is consistent with the business's stated activity level."
+    elif kra_compliance == "PARTIAL":
+        tax_compliance_clause = "Partial tax payment pattern — verify against filed returns."
+    else:
+        tax_compliance_clause = (
+            "No tax payments detected in bank activity. This does not necessarily "
+            "indicate non-compliance — tax may be paid from an account outside this "
+            "statement set, or by a third party. Verify against a KRA compliance certificate."
+        )
+
+    tax_compliance_ctx: Dict[str, Any] = {
+        "total_str":      _fmt_kes(tax_total_cents_active),
+        "n_tax_months":   n_tax_months,
+        "n_total_months": n_total_months,
+        "kra_compliance": kra_compliance,
+        "clause":         tax_compliance_clause,
+    }
+
     # ── Tax ───────────────────────────────────────────────────────────────────
     tax_freq_str  = (
         f"{len(tax_txns) / tax_months_count:.1f} / month" if tax_months_count > 0 else "--"
@@ -1121,6 +1181,7 @@ def render_snapshot_html(
         "account_coverage":   account_coverage_ctx,
         "inventory":          inventory_ctx,
         "supplier_payments":  supplier_payments_ctx,
+        "tax_compliance":     tax_compliance_ctx,
     }
 
     return template.render(**context)
