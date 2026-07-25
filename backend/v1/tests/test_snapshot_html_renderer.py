@@ -566,6 +566,115 @@ def test_tax_compliance_analysis_renders_in_observed_state_without_audited_finan
     assert "COMPLIANT" in html
 
 
+# ── monthly cashflow pattern (PAR-63) ────────────────────────────────────────
+# Peak/trough + trend summary over the existing monthly_merged/period_months
+# (canonical_json-sourced) — confirmed single-source, no cross-source split
+# (unlike the bug fixed in Tax Compliance Analysis).
+
+def _cashflow_snapshot_tables(canon_transactions, canon_txn_entity_map):
+    document_rows = [{
+        "id": "doc-1", "storage_url": "inline://STATEMENT.pdf", "source_files": [],
+        "analytics": {"summary": {"total_transactions": len(canon_transactions)}, "credit_scoring_inputs": {}},
+    }]
+    return {
+        "pds_deals": [{"company_name": "Cashflow Pattern Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2026-01-30T08:00:00+00:00",
+            "canonical_json": json.dumps({
+                "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                            "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                            "reconciliation_status": "NOT_RUN"},
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map,
+            }),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [],
+        "pds_raw_transactions": [],
+        "pds_txn_entity_map": [],
+    }
+
+
+def test_monthly_cashflow_pattern_real_fixture_no_crash_no_trend_note():
+    """The real Buildex fixture's sealed canonical_json carries no
+    transactions at all (confirmed during the Tax Compliance investigation),
+    so period_months is empty — confirms this renders the pre-existing
+    'No cashflow data available.' note without a broken/empty trend
+    sentence tacked on, rather than crashing or emitting stray text."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "No cashflow data available." in html
+    assert "trend" not in html.lower().split("Monthly Cashflow")[-1].split("</table>")[0]
+
+
+def test_monthly_cashflow_pattern_single_month_insufficient_for_trend():
+    """Exactly one month of data -> the "cannot yet be established" message,
+    not a peak/trough claim over a single point."""
+    canon_transactions = [
+        {"id": "in1", "txn_date": "2025-01-05", "signed_amount_cents": 500000},
+        {"id": "out1", "txn_date": "2025-01-20", "signed_amount_cents": -200000},
+    ]
+    canon_txn_entity_map = [
+        {"txn_id": "in1", "role": "revenue_operational"},
+        {"txn_id": "out1", "role": "supplier"},
+    ]
+    tables = _cashflow_snapshot_tables(canon_transactions, canon_txn_entity_map)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Only one month of data is available — a trend cannot yet be established." in html
+
+
+def test_monthly_cashflow_pattern_positive_trend_with_peak_and_trough():
+    """3 months: net worsens then recovers to above the first month -> POSITIVE
+    trend (last > first), with the trough correctly identified as the worst
+    month (Feb), not just the first or last."""
+    canon_transactions, canon_txn_entity_map = [], []
+    # Jan: net +300,000 (500,000 in - 200,000 out)
+    # Feb: net -400,000 (100,000 in - 500,000 out) -- the trough
+    # Mar: net +600,000 (800,000 in - 200,000 out) -- the peak, and > Jan (first)
+    rows = [
+        ("2025-01", 500000, 200000),
+        ("2025-02", 100000, 500000),
+        ("2025-03", 800000, 200000),
+    ]
+    for i, (m, in_amt, out_amt) in enumerate(rows):
+        in_id, out_id = f"m{i}in", f"m{i}out"
+        canon_transactions.append({"id": in_id, "txn_date": f"{m}-05", "signed_amount_cents": in_amt})
+        canon_transactions.append({"id": out_id, "txn_date": f"{m}-20", "signed_amount_cents": -out_amt})
+        canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
+        canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
+    tables = _cashflow_snapshot_tables(canon_transactions, canon_txn_entity_map)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Trough of KES -4,000 in Feb 2025" in html
+    assert "peak of KES 6,000 in Mar 2025" in html
+    assert "The trend over the observed period is net POSITIVE." in html
+
+
+def test_monthly_cashflow_pattern_negative_trend():
+    """3 months, net declines from first to last -> NEGATIVE trend clause."""
+    canon_transactions, canon_txn_entity_map = [], []
+    rows = [
+        ("2025-01", 800000, 200000),   # net +600,000 (first, also peak)
+        ("2025-02", 400000, 300000),   # net +100,000
+        ("2025-03", 200000, 500000),   # net -300,000 (last, also trough)
+    ]
+    for i, (m, in_amt, out_amt) in enumerate(rows):
+        in_id, out_id = f"m{i}in", f"m{i}out"
+        canon_transactions.append({"id": in_id, "txn_date": f"{m}-05", "signed_amount_cents": in_amt})
+        canon_transactions.append({"id": out_id, "txn_date": f"{m}-20", "signed_amount_cents": -out_amt})
+        canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
+        canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
+    tables = _cashflow_snapshot_tables(canon_transactions, canon_txn_entity_map)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Trough of KES -3,000 in Mar 2025" in html
+    assert "peak of KES 6,000 in Jan 2025" in html
+    assert "The trend over the observed period is net NEGATIVE — recent months show declining net position." in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():

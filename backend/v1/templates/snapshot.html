@@ -1050,6 +1050,9 @@ body {
         </tbody>
         <tfoot>
           <tr><td colspan="5" class="cf-foot">{{ cashflow_note | default('') }}</td></tr>
+          {% if cashflow_peak_trough_note or cashflow_trend_note %}
+          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }} {{ cashflow_trend_note | default('') }}</td></tr>
+          {% endif %}
         </tfoot>
       </table>
     </div>
