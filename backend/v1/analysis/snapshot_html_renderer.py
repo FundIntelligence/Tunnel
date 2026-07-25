@@ -881,6 +881,51 @@ def render_snapshot_html(
         "clause":         tax_compliance_clause,
     }
 
+    # ── Inter-Account Transfer Analysis (PAR-63) — honest limitation stub ────
+    # Self-transfer/cash-sweep detection between a company's own bank accounts
+    # depends on transfer_matcher.match_transfers() pairing transactions across
+    # DIFFERENT accounts, which requires per-transaction account_id tagging.
+    # Confirmed (read-only investigation, no code changed there) that this
+    # tagging is not currently populated correctly by the ingestion pipeline —
+    # every transaction resolves to the same undifferentiated account value,
+    # so the matcher cannot find a single pair for any deal today. That gap is
+    # tracked separately (PAR-102) and is explicitly out of scope for this
+    # renderer work — not touching transfer_matcher.py, reconciliation_engine.py,
+    # classifier.py, or any account_id/ingestion code here.
+    #
+    # Deliberately NOT rendering a bare "0 self-transfers detected" — that
+    # would misrepresent a known infrastructure gap as a real finding. The one
+    # thing this section CAN honestly check with existing data: whether an
+    # analyst has manually overridden any transaction to a transfer-type role
+    # (transfer/internal_transfer are both in the override role list — see
+    # api.py's _VALID_OVERRIDE_ROLES), since manual overrides don't depend on
+    # the broken automatic matcher at all.
+    _TRANSFER_ROLES = ("transfer", "internal_transfer")
+    manual_transfer_count = sum(1 for t in txns if t["role"] in _TRANSFER_ROLES)
+
+    if manual_transfer_count > 0:
+        transfer_override_note = (
+            f"{manual_transfer_count} transaction(s) were manually flagged by an analyst "
+            "as self-transfers via override — see the Overrides section. This is "
+            "analyst-asserted, not system-detected, and does not reflect automatic "
+            "self-transfer/cash-sweep detection."
+        )
+    else:
+        transfer_override_note = "No transactions have been manually flagged as self-transfers for this deal."
+
+    inter_account_transfer_ctx: Dict[str, Any] = {
+        "note": (
+            "Self-transfer / cash-sweep analysis between this company's own bank accounts "
+            "is not currently available. Detection depends on each transaction being tagged "
+            "with the specific account it belongs to, and that per-account tagging is not "
+            "yet populated correctly in the current ingestion pipeline — every transaction "
+            "currently resolves to the same undifferentiated account value, so the matching "
+            "logic cannot distinguish between a company's own accounts. This is a known "
+            "infrastructure gap, not a finding that no such transfers exist."
+        ),
+        "override_note": transfer_override_note,
+    }
+
     # ── Tax ───────────────────────────────────────────────────────────────────
     tax_freq_str  = (
         f"{len(tax_txns) / tax_months_count:.1f} / month" if tax_months_count > 0 else "--"
@@ -1277,6 +1322,7 @@ def render_snapshot_html(
         "supplier_payments":  supplier_payments_ctx,
         "tax_compliance":     tax_compliance_ctx,
         "transaction_patterns": transaction_patterns_ctx,
+        "inter_account_transfer": inter_account_transfer_ctx,
     }
 
     return template.render(**context)

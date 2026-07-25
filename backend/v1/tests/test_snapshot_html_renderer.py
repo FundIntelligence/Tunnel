@@ -791,6 +791,60 @@ def test_transaction_pattern_analysis_top_pick_by_severity_then_amount():
     ) in html
 
 
+# ── inter-account transfer analysis (PAR-63) — honest limitation stub ────────
+# Self-transfer detection depends on transfer_matcher.match_transfers() pairing
+# transactions across DIFFERENT account_id values. Confirmed (separate
+# read-only investigation, PAR-102) that account_id is not currently
+# populated distinctly in production — every transaction resolves to the same
+# undifferentiated value — so the matcher cannot find a single pair for any
+# real deal today. This section must never render a bare "0 detected"; it
+# states the limitation plainly instead.
+
+def test_inter_account_transfer_analysis_real_fixture_shows_limitation_stub():
+    """Real Buildex fixture — confirms the stub renders the honest limitation
+    note (not a misleading '0 self-transfers detected') and the correct
+    'no manual overrides' branch, since none of this fixture's transactions
+    carry a transfer/internal_transfer role."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Inter-Account Transfer Analysis" in html
+    assert (
+        "Self-transfer / cash-sweep analysis between this company's own bank accounts "
+        "is not currently available."
+    ) in html
+    assert "not yet populated correctly in the current ingestion pipeline" in html
+    assert "No transactions have been manually flagged as self-transfers for this deal." in html
+    # Must never claim automatic detection ran and found nothing.
+    assert "0 self-transfers detected" not in html
+    assert "self-transfers detected" not in html.lower()
+
+
+def test_inter_account_transfer_analysis_reports_manual_overrides():
+    """Manual analyst overrides to transfer/internal_transfer roles don't
+    depend on the broken automatic matcher — confirms the override count is
+    still honestly surfaced when present, distinct from system detection."""
+    tables = dict(_TABLES)
+    tables["pds_raw_transactions"] = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "X", "balance_cents": None},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": -500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "Y", "balance_cents": None},
+    ]
+    tables["pds_txn_entity_map"] = [
+        {"txn_id": "t1", "role": "transfer"},
+        {"txn_id": "t2", "role": "internal_transfer"},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert (
+        "2 transaction(s) were manually flagged by an analyst as self-transfers via "
+        "override — see the Overrides section. This is analyst-asserted, not "
+        "system-detected, and does not reflect automatic self-transfer/cash-sweep detection."
+    ) in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():
