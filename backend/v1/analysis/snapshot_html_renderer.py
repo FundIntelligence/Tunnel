@@ -442,6 +442,39 @@ def render_snapshot_html(
     else:
         cashflow_note = "No cashflow data available."
 
+    # ── Monthly Cashflow Pattern (PAR-63) ─────────────────────────────────────
+    # Peak/trough + trend summary over the same monthly_merged/period_months
+    # already used above for cashflow_note/neg_months — single source
+    # (canonical_json via canon_tagged), confirmed self-consistent (no
+    # numerator/denominator split across sources, unlike the bug fixed in
+    # Tax Compliance Analysis). No new computation beyond what this file
+    # already tracks; this is a one-time summary sentence, not a new series.
+    if len(period_months) < 2:
+        cashflow_trend_note = "Only one month of data is available — a trend cannot yet be established." if period_months else ""
+        cashflow_peak_trough_note = ""
+    else:
+        nets_by_month = {
+            m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]
+            for m in period_months
+        }
+        trough_month = min(nets_by_month, key=lambda m: nets_by_month[m])
+        peak_month   = max(nets_by_month, key=lambda m: nets_by_month[m])
+        first_net = nets_by_month[period_months[0]]
+        last_net  = nets_by_month[period_months[-1]]
+        if last_net > first_net:
+            trend_clause = "The trend over the observed period is net POSITIVE."
+        elif last_net < first_net:
+            trend_clause = "The trend over the observed period is net NEGATIVE — recent months show declining net position."
+        else:
+            trend_clause = "Net position is broadly stable with no clear directional trend."
+        cashflow_peak_trough_note = (
+            f"Trough of {_fmt_kes(nets_by_month[trough_month])} in "
+            f"{MONTH_ABBR.get(trough_month[5:7], trough_month[5:7])} {trough_month[:4]}; "
+            f"peak of {_fmt_kes(nets_by_month[peak_month])} in "
+            f"{MONTH_ABBR.get(peak_month[5:7], peak_month[5:7])} {peak_month[:4]}."
+        )
+        cashflow_trend_note = trend_clause
+
     # ── Period label ────────────────────────────────────────────────────────
     fy = str(af.get("financial_year") or "") if recon_available else ""
     if fy:
@@ -1153,6 +1186,8 @@ def render_snapshot_html(
         "kms":                kms,
         "cashflow_rows":      cashflow_rows_ctx,
         "cashflow_note":      cashflow_note,
+        "cashflow_peak_trough_note": cashflow_peak_trough_note,
+        "cashflow_trend_note": cashflow_trend_note,
         "inflow_total_str":   _fmt_kes_millions(total_in),
         "inflow_segments":    inflow_segments,
         "inflow_warn":        inflow_warn,
