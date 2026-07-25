@@ -264,6 +264,51 @@ def test_loan_facilities_handles_empty_breakdown():
     assert "<html" in html  # renders without raising even with zero facilities
 
 
+# ── inventory analysis (PAR-63) ──────────────────────────────────────────────
+
+def test_inventory_analysis_missing_data_note():
+    """The real Buildex fixture's audited-financials row has no inventory_cents
+    or cost_of_sales_cents — confirms the section renders the explicit
+    missing-data note rather than a misleading zero/blank."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert (
+        "Inventory and/or cost of sales figures were not present in the audited "
+        "financial statements provided for FY2025 — inventory analysis cannot be "
+        "computed for this deal."
+    ) in html
+
+
+def test_inventory_analysis_computes_turnover_and_dio_when_data_present():
+    """Synthetic inventory_cents/cost_of_sales_cents (the real Buildex fixture
+    doesn't carry these fields) — confirms the arithmetic path: turnover =
+    cost_of_sales_cents / inventory_cents, DIO = 365 / turnover, and that the
+    result lands in the correct risk-clause bucket (turnover >= 6 -> LOW risk)."""
+    tables = dict(_TABLES)
+    tables["pds_audited_financials"] = [{
+        **_AUDITED_FINANCIALS_ROWS[0],
+        "inventory_cents": 290000000,       # KES 2,900,000
+        "cost_of_sales_cents": 1750000000,  # KES 17,500,000
+        "extraction_confidence": 0.92,
+    }]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    expected_turnover = 1750000000 / 290000000  # 6.0344827... -> "6.0x"
+    expected_dio = 365 / expected_turnover        # 60.48... -> "60 days"
+    assert round(expected_turnover, 1) == 6.0
+    assert round(expected_dio) == 60
+
+    assert "KES 2,900,000" in html
+    assert "KES 17,500,000" in html
+    assert "6.0x" in html
+    assert "60 days" in html
+    assert "0.92" in html
+    assert "Inventory turns over quickly relative to cost of sales — LOW inventory risk." in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():
