@@ -430,22 +430,25 @@ def test_supplier_payment_analysis_moderate_and_diversified_concentration():
 # credit_scoring_inputs blob — see PAR-63_new_sections_spec.md Section 3.
 
 def test_tax_compliance_analysis_real_fixture_matches_cached_blob_not_detected():
-    """The real Buildex fixture has zero tax_payment-role transactions, so the
-    live recompute correctly lands on NOT_DETECTED — the same value the
-    cached credit_scoring_inputs blob happens to carry for this fixture.
-    NOTE: this is not a rigorous cross-check of the two computations against
-    each other — the fixture's sealed canonical_json carries no
-    transactions/txn_entity_map at all (only a bare "metrics" key), so
-    n_total_months is 0 here, not a real statement-period month count. Both
-    paths agreeing on NOT_DETECTED in this specific fixture doesn't validate
-    the ratio logic against real multi-month data — see the two tests below
-    (COMPLIANT/PARTIAL) for that."""
+    """The real Buildex fixture's live txns span 2 real months (2025-01,
+    2025-02 — txn-1/txn-2/txn-3) with zero tax_payment-role transactions
+    among them, so the live recompute correctly lands on "0 of 2" months /
+    NOT_DETECTED — the same categorical value the cached credit_scoring_inputs
+    blob happens to carry for this fixture, but this time both the numerator
+    (tax months) and denominator (total months) are genuinely sourced from
+    the same live txns list (pds_raw_transactions + pds_txn_entity_map), not
+    a mix of live txns and canonical_json. An earlier version of this section
+    computed the denominator from period_months (canonical_json-derived),
+    which happened to read "0 of 0" for this fixture only because the
+    fixture's sealed canonical_json carries no transactions at all — a
+    data-source inconsistency caught in PR #110 review before merge, not a
+    genuine finding about this deal."""
     _patch_supabase()
     _patch_recon()
     html = renderer.render_snapshot_html("deal-fixture")
     assert "Tax Compliance Analysis" in html
     assert "KES 0" in html
-    assert "0 of 0" in html
+    assert "0 of 2" in html
     assert "NOT_DETECTED" in html
     assert (
         "No tax payments detected in bank activity. This does not necessarily "

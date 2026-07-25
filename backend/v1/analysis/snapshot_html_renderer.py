@@ -742,15 +742,24 @@ def render_snapshot_html(
     _TAX_ROLES = ("tax_payment", "kra_payment")
     tax_months_active: set = set()
     tax_total_cents_active = 0
+    # Denominator must come from the same txns list as the numerator above —
+    # period_months (used elsewhere in this file) is derived from
+    # monthly_merged/canon_tagged, which is sourced from canonical_json, not
+    # from txns. Mixing the two would compute a ratio whose numerator and
+    # denominator disagree on which data source is authoritative, silently
+    # defeating the whole point of live-recomputing this section instead of
+    # trusting a cache. See PAR-63 PR #110 review — caught before merge.
+    all_months_active: set = set()
     for t in txns:
-        if t["role"] in _TAX_ROLES and t["signed"] < 0:
-            m = (t["txn_date"] or "")[:7]
-            if _in_active_period(m):
+        m = (t["txn_date"] or "")[:7]
+        if t["txn_date"] and _in_active_period(m):
+            all_months_active.add(m)
+            if t["role"] in _TAX_ROLES and t["signed"] < 0:
                 tax_months_active.add(m)
                 tax_total_cents_active += t["abs"]
 
     n_tax_months   = len(tax_months_active)
-    n_total_months = len(period_months)
+    n_total_months = len(all_months_active)
 
     if n_total_months == 0:
         kra_compliance = "NOT_DETECTED"
