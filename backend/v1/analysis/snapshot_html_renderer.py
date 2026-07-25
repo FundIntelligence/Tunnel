@@ -245,7 +245,10 @@ def render_snapshot_html(
     # 4. Audited financials (optional — sets recon_available)
     af_result = (
         sb.table("pds_audited_financials")
-        .select("loan_breakdown, turnover_cents, profit_before_tax_cents, financial_year")
+        .select(
+            "loan_breakdown, turnover_cents, profit_before_tax_cents, financial_year, "
+            "inventory_cents, cost_of_sales_cents, extraction_confidence"
+        )
         .eq("deal_id", deal_id)
         .execute()
         .data or []
@@ -877,6 +880,59 @@ def render_snapshot_html(
     loan_var_raw          = loans_r.get("variance_pct")
     loan_variance_str     = f"{loan_var_raw:.1f}%" if loan_var_raw is not None else "0%"
 
+    # ── Inventory Analysis (PAR-63, recon state only) ────────────────────────
+    # Single fiscal-year audited-financials figure, not a monthly time series.
+    # turnover = cost_of_sales_cents / inventory_cents; DIO = 365 / turnover.
+    inv_fy = str(af.get("financial_year") or "") if recon_available else ""
+    inventory_cents_raw     = af.get("inventory_cents") if recon_available else None
+    cost_of_sales_cents_raw = af.get("cost_of_sales_cents") if recon_available else None
+    extraction_confidence_raw = af.get("extraction_confidence") if recon_available else None
+
+    inventory_data_present = (
+        recon_available
+        and inventory_cents_raw is not None
+        and cost_of_sales_cents_raw is not None
+        and int(inventory_cents_raw) > 0
+    )
+    if inventory_data_present:
+        inventory_cents     = int(inventory_cents_raw)
+        cost_of_sales_cents = int(cost_of_sales_cents_raw)
+        inventory_turnover   = cost_of_sales_cents / inventory_cents
+        dio_days             = 365 / inventory_turnover if inventory_turnover > 0 else None
+        if inventory_turnover >= 6:
+            inventory_clause = "Inventory turns over quickly relative to cost of sales — LOW inventory risk."
+        elif inventory_turnover >= 3:
+            inventory_clause = "Inventory turnover is moderate."
+        else:
+            inventory_clause = (
+                "Inventory turns over slowly — may indicate slow-moving stock or "
+                "overstocking risk."
+            )
+        inventory_ctx: Dict[str, Any] = {
+            "available":      True,
+            "financial_year": inv_fy,
+            "inventory_str":  _fmt_kes(inventory_cents),
+            "cogs_str":       _fmt_kes(cost_of_sales_cents),
+            "turnover_str":   f"{inventory_turnover:.1f}x",
+            "dio_str":        f"{dio_days:.0f} days" if dio_days is not None else "--",
+            "clause":         inventory_clause,
+            "confidence_str": (
+                f"{extraction_confidence_raw:.2f}" if extraction_confidence_raw is not None else "not recorded"
+            ),
+        }
+    else:
+        inventory_ctx = {
+            "available": False,
+            "financial_year": inv_fy,
+            "note": (
+                f"Inventory and/or cost of sales figures were not present in the audited "
+                f"financial statements provided for FY{inv_fy} — inventory analysis cannot "
+                "be computed for this deal."
+            ) if recon_available else (
+                "Inventory analysis requires audited financials — not yet submitted for this deal."
+            ),
+        }
+
     # ── Verify-page summary (reuses figures already computed above) ──────────
     if recon_available:
         loan_recon_label = (loans_r.get("status") or "VARIANCE").replace("_", " ").title()
@@ -983,6 +1039,7 @@ def render_snapshot_html(
         "recon_fiscal_note":  recon_fiscal_note,
         "patterns":           patterns,
         "account_coverage":   account_coverage_ctx,
+        "inventory":          inventory_ctx,
     }
 
     return template.render(**context)
