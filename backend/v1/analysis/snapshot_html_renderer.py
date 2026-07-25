@@ -262,8 +262,19 @@ def render_snapshot_html(
         "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor, balance_cents",
         deal_id,
     )
-    map_rows   = _paginate(sb, "pds_txn_entity_map", "txn_id, role", deal_id)
+    # PAR-63: entity_id added so Supplier Payment Analysis can attribute spend
+    # to a counterparty name (pds_entities), not just a role-level total.
+    map_rows   = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
     role_by_txn = {r["txn_id"]: r["role"] for r in map_rows}
+    entity_id_by_txn = {r["txn_id"]: r.get("entity_id") for r in map_rows}
+
+    # PAR-63: entity display names for the Supplier Payment Analysis section.
+    # One deal-scoped, paginated fetch (same _paginate helper already used for
+    # pds_raw_transactions/pds_txn_entity_map above) — not a per-row lookup.
+    entity_rows = _paginate(sb, "pds_entities", "entity_id, display_name", deal_id)
+    entity_name_by_id: Dict[str, str] = {
+        e["entity_id"]: e.get("display_name") for e in entity_rows
+    }
 
     txns = [{
         "txn_date": t["txn_date"],
@@ -277,6 +288,7 @@ def render_snapshot_html(
         "desc":     t["normalized_descriptor"] or "",
         "balance":  t["balance_cents"],
         "role":     role_by_txn.get(t["id"], "other"),
+        "entity_id": entity_id_by_txn.get(t["id"]),
     } for t in txn_rows]
 
     # 6. Reconciliation engine (only when audited financials present).
@@ -648,6 +660,53 @@ def render_snapshot_html(
         f"Procurement outflows ({procurement_pct:.0f}%) — cash procurement controls and cross-border "
         "documentation should be verified · observed supplier payments represent partial COGS visibility"
     ) if procurement_pct > 50 else ""
+
+    # ── Supplier Payment Analysis (PAR-63) ────────────────────────────────────
+    # Same role set as procurement_cents above, but broken out per counterparty
+    # entity (not just a role-level total) so a top-supplier concentration
+    # figure can be surfaced. Renders in both recon_available states — this
+    # depends only on live transaction/entity data, not audited financials.
+    _SUPPLIER_ROLES = ("supplier", "supplier_payment")
+    supplier_by_entity: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "count": 0})
+    for t in txns:
+        if t["role"] in _SUPPLIER_ROLES and t["signed"] < 0:
+            eid = t.get("entity_id") or ""
+            supplier_by_entity[eid]["total"] += t["abs"]
+            supplier_by_entity[eid]["count"] += 1
+
+    supplier_total_cents  = sum(v["total"] for v in supplier_by_entity.values())
+    supplier_txn_count    = sum(v["count"] for v in supplier_by_entity.values())
+    supplier_entity_count = len(supplier_by_entity)
+
+    if supplier_by_entity and supplier_total_cents > 0:
+        top_eid, top_data = max(supplier_by_entity.items(), key=lambda kv: kv[1]["total"])
+        top_supplier_name = (
+            entity_name_by_id.get(top_eid)
+            or (top_eid[:16] + "…" if len(top_eid) > 16 else top_eid)
+            or "--"
+        )
+        top_supplier_pct = top_data["total"] / supplier_total_cents * 100
+        # Thresholds mirror the >30% "HIGH concentration" convention
+        # PARITY_SCIENCE.md Part III defines for Customer Concentration —
+        # reused here for the supplier side by analogy, not independently
+        # codified for suppliers. See PAR-63_new_sections_spec.md Section 2.
+        if top_supplier_pct >= 30:
+            supplier_concentration_clause = "This represents HIGH supplier concentration risk."
+        elif top_supplier_pct >= 15:
+            supplier_concentration_clause = "This represents MODERATE supplier concentration."
+        else:
+            supplier_concentration_clause = "Supplier spend is well-diversified across counterparties."
+        supplier_payments_ctx: Dict[str, Any] = {
+            "available":    True,
+            "total_str":    _fmt_kes(supplier_total_cents),
+            "txn_count":    supplier_txn_count,
+            "entity_count": supplier_entity_count,
+            "top_name":     top_supplier_name,
+            "top_pct_str":  f"{top_supplier_pct:.1f}%",
+            "clause":       supplier_concentration_clause,
+        }
+    else:
+        supplier_payments_ctx = {"available": False}
 
     # ── Tax ───────────────────────────────────────────────────────────────────
     tax_freq_str  = (
@@ -1040,6 +1099,7 @@ def render_snapshot_html(
         "patterns":           patterns,
         "account_coverage":   account_coverage_ctx,
         "inventory":          inventory_ctx,
+        "supplier_payments":  supplier_payments_ctx,
     }
 
     return template.render(**context)

@@ -309,6 +309,92 @@ def test_inventory_analysis_computes_turnover_and_dio_when_data_present():
     assert "Inventory turns over quickly relative to cost of sales — LOW inventory risk." in html
 
 
+# ── supplier payment analysis (PAR-63) ───────────────────────────────────────
+
+def test_supplier_payment_analysis_real_fixture_has_no_entity_id():
+    """The real Buildex fixture's txn_entity_map rows don't include an
+    entity_id at all — confirms the section still renders honestly (total,
+    txn count, 100% concentration on the one supplier txn) with an explicit
+    '--' top-supplier name rather than fabricating one when entity
+    attribution genuinely isn't available."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Supplier Payment Analysis" in html
+    # txn-2: signed_amount_cents -200000 = KES 2,000, the only supplier-role txn
+    assert "KES 2,000" in html
+    assert "-- · 100.0%" in html
+    assert "This represents HIGH supplier concentration risk." in html
+
+
+def test_supplier_payment_analysis_top_entity_by_name_and_concentration():
+    """Synthetic entity data (pds_entities + txn_entity_map.entity_id) — the
+    real Buildex fixture doesn't carry entity attribution. Confirms the
+    pds_entities join correctly attributes spend per counterparty name and
+    picks the right top supplier by total, not by transaction count."""
+    tables = dict(_TABLES)
+    tables["pds_raw_transactions"] = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": -800000,
+         "abs_amount_cents": 800000, "normalized_descriptor": "SUPPLIER A", "balance_cents": None},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": -100000,
+         "abs_amount_cents": 100000, "normalized_descriptor": "SUPPLIER B", "balance_cents": None},
+        {"id": "t3", "txn_date": "2025-01-07", "signed_amount_cents": -100000,
+         "abs_amount_cents": 100000, "normalized_descriptor": "SUPPLIER B", "balance_cents": None},
+    ]
+    tables["pds_txn_entity_map"] = [
+        {"txn_id": "t1", "role": "supplier_payment", "entity_id": "ent-A"},
+        {"txn_id": "t2", "role": "supplier_payment", "entity_id": "ent-B"},
+        {"txn_id": "t3", "role": "supplier_payment", "entity_id": "ent-B"},
+    ]
+    tables["pds_entities"] = [
+        {"entity_id": "ent-A", "display_name": "Timber Traders Ltd"},
+        {"entity_id": "ent-B", "display_name": "Glass Supplies Co"},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    # ent-A: 800000/1000000 = 80% -> top supplier by total, despite ent-B
+    # having more transactions (2 vs 1).
+    assert "KES 10,000" in html
+    assert "Timber Traders Ltd · 80.0%" in html
+    assert "This represents HIGH supplier concentration risk." in html
+
+
+def test_supplier_payment_analysis_moderate_and_diversified_concentration():
+    """Confirms the 30%/15% concentration thresholds both branch correctly,
+    not just the >=30% HIGH case exercised above."""
+    tables = dict(_TABLES)
+    tables["pds_raw_transactions"] = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": -200000,
+         "abs_amount_cents": 200000, "normalized_descriptor": "A", "balance_cents": None},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": -200000,
+         "abs_amount_cents": 200000, "normalized_descriptor": "B", "balance_cents": None},
+        {"id": "t3", "txn_date": "2025-01-07", "signed_amount_cents": -200000,
+         "abs_amount_cents": 200000, "normalized_descriptor": "C", "balance_cents": None},
+        {"id": "t4", "txn_date": "2025-01-08", "signed_amount_cents": -200000,
+         "abs_amount_cents": 200000, "normalized_descriptor": "D", "balance_cents": None},
+        {"id": "t5", "txn_date": "2025-01-09", "signed_amount_cents": -200000,
+         "abs_amount_cents": 200000, "normalized_descriptor": "E", "balance_cents": None},
+    ]
+    tables["pds_txn_entity_map"] = [
+        {"txn_id": "t1", "role": "supplier_payment", "entity_id": "ent-1"},
+        {"txn_id": "t2", "role": "supplier_payment", "entity_id": "ent-2"},
+        {"txn_id": "t3", "role": "supplier_payment", "entity_id": "ent-3"},
+        {"txn_id": "t4", "role": "supplier_payment", "entity_id": "ent-4"},
+        {"txn_id": "t5", "role": "supplier_payment", "entity_id": "ent-5"},
+    ]
+    tables["pds_entities"] = [
+        {"entity_id": f"ent-{i}", "display_name": f"Supplier {i}"} for i in range(1, 6)
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    # 5 equal suppliers -> each 20% -> top is 20% -> MODERATE (15-30%) bucket.
+    assert "20.0%" in html
+    assert "This represents MODERATE supplier concentration." in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():
