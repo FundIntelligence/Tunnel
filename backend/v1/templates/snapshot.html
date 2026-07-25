@@ -1292,6 +1292,19 @@ body {
       <div class="cashflow-note">{{ tax_compliance.clause }}</div>
     </div>
 
+    <!-- TRANSACTION PATTERN ANALYSIS (PAR-63) — renders in both states -->
+    <div class="sec">
+      <div class="sec-label">Transaction Pattern Analysis <span class="sec-label-badge">Sealed Snapshot · Deterministic</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Critical-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.critical_count }}</td></tr>
+          <tr><td>High-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.high_count }}</td></tr>
+          <tr><td>Total patterns flagged</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.total_flagged }} of {{ transaction_patterns.total_txn_count }} transactions</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ transaction_patterns.clause }}</div>
+    </div>
+
   </div><!-- end page-body -->
 
   <div class="page-footer">

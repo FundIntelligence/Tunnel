@@ -675,6 +675,122 @@ def test_monthly_cashflow_pattern_negative_trend():
     assert "The trend over the observed period is net NEGATIVE — recent months show declining net position." in html
 
 
+# ── transaction pattern analysis (PAR-63) ────────────────────────────────────
+# tx["anomalies"] is sealed into canonical_json.transactions[] by
+# anomaly_detector.py during run_pipeline() — never persisted to any DB
+# column, so it can ONLY be read from canonical_json. Both the anomaly
+# aggregation and the total-transaction count must come from the same raw
+# canonical.get("transactions") list (not canon_tagged, which drops
+# date-less rows, and not total_txn_count, which is the live-fetch count) —
+# confirmed self-consistent before building this section, per the audit
+# reflex applied after the Tax Compliance cross-source bug.
+
+def _anomaly_snapshot_tables(canon_transactions, canon_txn_entity_map=None):
+    document_rows = [{
+        "id": "doc-1", "storage_url": "inline://STATEMENT.pdf", "source_files": [],
+        "analytics": {"summary": {"total_transactions": len(canon_transactions)}, "credit_scoring_inputs": {}},
+    }]
+    return {
+        "pds_deals": [{"company_name": "Anomaly Co", "currency": "KES", "analyst_notes": ""}],
+        "pds_snapshots": [{
+            "sha256_hash": _SHA,
+            "created_at": "2026-01-30T08:00:00+00:00",
+            "canonical_json": json.dumps({
+                "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                            "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                            "reconciliation_status": "NOT_RUN"},
+                "transactions": canon_transactions,
+                "txn_entity_map": canon_txn_entity_map or [],
+            }),
+        }],
+        "pds_documents": document_rows,
+        "pds_audited_financials": [],
+        "pds_raw_transactions": [],
+        "pds_txn_entity_map": [],
+    }
+
+
+def test_transaction_pattern_analysis_real_fixture_zero_of_zero():
+    """The real Buildex fixture's sealed canonical_json carries no
+    transactions at all (confirmed during the Tax Compliance / Monthly
+    Cashflow investigations), so this section correctly and honestly reads
+    "0 of 0 transactions" — the denominator is genuinely 0 here, not a
+    fallback or a mismatch with a different data source, since both the
+    anomaly count and the transaction count are read from the same
+    (empty) canonical_json.transactions list."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Transaction Pattern Analysis" in html
+    assert "0 of 0 transactions" in html
+    assert "No high-severity transaction patterns were detected." in html
+
+
+def test_transaction_pattern_analysis_no_anomalies_present():
+    """3 real transactions in canonical_json, none carrying an "anomalies"
+    key at all (as if sealed by a version of the pipeline before
+    anomaly_detector.py existed) -> total_txn_count reflects the real
+    transaction count (3), total_flagged is 0, no crash on the missing key."""
+    canon_transactions = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 500000},
+        {"id": "t2", "txn_date": "2025-01-10", "signed_amount_cents": -200000},
+        {"id": "t3", "txn_date": "2025-02-01", "signed_amount_cents": 300000},
+    ]
+    tables = _anomaly_snapshot_tables(canon_transactions)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "0 of 3 transactions" in html
+    assert "No high-severity transaction patterns were detected." in html
+
+
+def test_transaction_pattern_analysis_critical_anomaly_picked_as_top():
+    """Mixed severities (CRITICAL, MEDIUM, and one transaction with no
+    anomalies at all) -> critical_count/high_count/total_flagged all count
+    correctly, and the CRITICAL item is selected as the top pattern over the
+    MEDIUM one regardless of amount."""
+    canon_transactions = [
+        {"id": "t1", "txn_date": "2025-03-14", "signed_amount_cents": 100000000,
+         "anomalies": [{"type": "ROUND_NUMBER_LARGE_AMOUNT", "severity": "CRITICAL",
+                         "reason": "perfectly round large amount"}]},
+        {"id": "t2", "txn_date": "2025-04-02", "signed_amount_cents": -50000000,
+         "anomalies": [{"type": "HIGH_SUPPLIER_CONCENTRATION", "severity": "MEDIUM",
+                         "reason": "single txn = 12% of outflow"}]},
+        {"id": "t3", "txn_date": "2025-05-05", "signed_amount_cents": 30000000, "anomalies": []},
+    ]
+    tables = _anomaly_snapshot_tables(canon_transactions)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Critical-severity patterns</td><td class=\"rt-figure\" style=\"text-align:right\">1" in html
+    assert "High-severity patterns</td><td class=\"rt-figure\" style=\"text-align:right\">0" in html
+    assert "2 of 3 transactions" in html
+    assert (
+        "The most significant: a ROUND_NUMBER_LARGE_AMOUNT of KES 1,000,000 on "
+        "2025-03-14 (perfectly round large amount)."
+    ) in html
+
+
+def test_transaction_pattern_analysis_top_pick_by_severity_then_amount():
+    """Two HIGH-severity anomalies with different amounts, no CRITICAL ones
+    -> the larger-amount HIGH item is picked as top, confirming the
+    severity-then-amount tie-break, not first-seen-wins."""
+    canon_transactions = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 20000000,
+         "anomalies": [{"type": "LARGE_TRANSACTION", "severity": "HIGH",
+                         "reason": "20% of avg monthly inflow"}]},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": 90000000,
+         "anomalies": [{"type": "NEW_ENTITY_LARGE_AMOUNT", "severity": "HIGH",
+                         "reason": "large amount from entity with only 1 transaction total"}]},
+    ]
+    tables = _anomaly_snapshot_tables(canon_transactions)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "High-severity patterns</td><td class=\"rt-figure\" style=\"text-align:right\">2" in html
+    assert (
+        "The most significant: a NEW_ENTITY_LARGE_AMOUNT of KES 900,000 on "
+        "2025-01-06 (large amount from entity with only 1 transaction total)."
+    ) in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():
