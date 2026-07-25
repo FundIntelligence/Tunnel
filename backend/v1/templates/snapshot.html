@@ -1171,6 +1171,25 @@ body {
       </div>
     </div>
 
+    <!-- RECONCILED STATE: inventory analysis (PAR-63) -->
+    <div class="sec">
+      <div class="sec-label">Inventory Analysis <span class="sec-label-badge">Audited Financials{{ ' · FY' + inventory.financial_year if inventory.financial_year else '' }}</span></div>
+      {% if inventory.available %}
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Inventory</td><td class="rt-figure" style="text-align:right">{{ inventory.inventory_str }}</td></tr>
+          <tr><td>Cost of sales</td><td class="rt-figure" style="text-align:right">{{ inventory.cogs_str }}</td></tr>
+          <tr><td>Inventory turnover</td><td class="rt-figure" style="text-align:right">{{ inventory.turnover_str }}</td></tr>
+          <tr><td>Days Inventory Outstanding</td><td class="rt-figure" style="text-align:right">{{ inventory.dio_str }}</td></tr>
+          <tr><td>Extraction confidence</td><td class="rt-figure" style="text-align:right">{{ inventory.confidence_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ inventory.clause }}</div>
+      {% else %}
+      <div class="cashflow-note" style="border-top:none">{{ inventory.note }}</div>
+      {% endif %}
+    </div>
+
     {% else %}
     <!-- OBSERVED STATE: full composition bars -->
     <div class="sec">
