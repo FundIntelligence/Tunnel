@@ -762,6 +762,65 @@ def render_snapshot_html(
     else:
         supplier_payments_ctx = {"available": False}
 
+    # ── Transaction Pattern Analysis (PAR-63) ─────────────────────────────────
+    # tx["anomalies"] is computed by anomaly_detector.py during run_pipeline()
+    # and mutated onto the same raw transaction dicts that flow through to
+    # build_pds_payload() — it's sealed into canonical_json.transactions[] but
+    # never written to any DB column, so it can ONLY be read from
+    # canonical_json, not from the live pds_raw_transactions fetch (txns).
+    # Both the anomaly aggregation AND the total-transaction denominator below
+    # are read from the SAME raw canonical.get("transactions") list, in a
+    # single pass — deliberately not canon_tagged (which silently drops any
+    # row missing a txn_date, line ~230 above) or total_txn_count (which is
+    # len(txns), the live-fetch count) — to avoid the exact numerator/
+    # denominator cross-source mismatch caught in Tax Compliance Analysis
+    # (PR #110 review). Legacy snapshots sealed before anomaly_detector.py
+    # existed simply have no "anomalies" key per transaction — treated as an
+    # empty list, not an error.
+    _SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
+    canon_raw_transactions = canonical.get("transactions") or []
+    total_txn_count_canon = len(canon_raw_transactions)
+
+    all_anomalies: List[Dict[str, Any]] = []
+    for t in canon_raw_transactions:
+        for a in (t.get("anomalies") or []):
+            all_anomalies.append({
+                "type":     a.get("type") or "UNKNOWN",
+                "severity": a.get("severity") or "LOW",
+                "reason":   a.get("reason") or "",
+                "abs_amount_cents": abs(int(t.get("signed_amount_cents") or 0)),
+                "txn_date": t.get("txn_date") or "",
+            })
+
+    total_flagged  = len(all_anomalies)
+    critical_count = sum(1 for a in all_anomalies if a["severity"] == "CRITICAL")
+    high_count     = sum(1 for a in all_anomalies if a["severity"] == "HIGH")
+
+    if all_anomalies:
+        top_anomaly = max(
+            all_anomalies,
+            key=lambda a: (_SEVERITY_RANK.get(a["severity"], 0), a["abs_amount_cents"]),
+        )
+    else:
+        top_anomaly = None
+
+    if top_anomaly and top_anomaly["severity"] in ("CRITICAL", "HIGH"):
+        top_pattern_clause = (
+            f"The most significant: a {top_anomaly['type']} of "
+            f"{_fmt_kes(top_anomaly['abs_amount_cents'])} on {top_anomaly['txn_date']} "
+            f"({top_anomaly['reason']})."
+        )
+    else:
+        top_pattern_clause = "No high-severity transaction patterns were detected."
+
+    transaction_patterns_ctx: Dict[str, Any] = {
+        "critical_count":  critical_count,
+        "high_count":      high_count,
+        "total_flagged":   total_flagged,
+        "total_txn_count": total_txn_count_canon,
+        "clause":          top_pattern_clause,
+    }
+
     # ── Tax Compliance Analysis (PAR-63) ──────────────────────────────────────
     # Live recompute over the same txns list already in scope for this render
     # — NOT the cached pds_documents.analytics.credit_scoring_inputs blob
@@ -1217,6 +1276,7 @@ def render_snapshot_html(
         "inventory":          inventory_ctx,
         "supplier_payments":  supplier_payments_ctx,
         "tax_compliance":     tax_compliance_ctx,
+        "transaction_patterns": transaction_patterns_ctx,
     }
 
     return template.render(**context)
