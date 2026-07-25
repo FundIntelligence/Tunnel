@@ -106,8 +106,22 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
     Error,
     { rowId: string; newRole: string; reasonCategory: OverrideReasonCategory; reasonNote: string }
   >({
-    mutationFn: ({ rowId, newRole, reasonCategory, reasonNote: note }) =>
-      resolveTransaction(dealId, rowId, newRole, analystInitials, reasonCategory, note),
+    mutationFn: async ({ rowId, newRole, reasonCategory, reasonNote: note }) => {
+      try {
+        return await resolveTransaction(dealId, rowId, newRole, analystInitials, reasonCategory, note)
+      } catch (e) {
+        // PAR-89 follow-up: export()'s delete-then-reinsert of pds_txn_entity_map
+        // is not atomic, so a resolve can land in the brief window where the
+        // deal's map rows are gone (mid re-export) and 404. That's a stale-queue
+        // read, not a real "this transaction doesn't exist" — refetch to let the
+        // window close, then retry exactly once before surfacing an error.
+        if ((e as Error & { status?: number }).status === 404) {
+          await refetch()
+          return await resolveTransaction(dealId, rowId, newRole, analystInitials, reasonCategory, note)
+        }
+        throw e
+      }
+    },
     onMutate: async ({ rowId }) => {
       await queryClient.cancelQueries({ queryKey: ['needsReview', dealId] })
       const previous = queryClient.getQueryData<{ transactions: NeedsReviewItem[]; total: number }>(['needsReview', dealId])

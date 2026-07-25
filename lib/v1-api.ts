@@ -707,7 +707,11 @@ export async function resolveTransaction(
     method: 'POST',
     body: form,
   })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) {
+    const err = new Error(await res.text()) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
   return res.json()
 }
 
