@@ -1040,11 +1040,34 @@ def export(request: Request, deal_id: str, force: bool = False):
     repos["links"].delete_eq("deal_id", deal_id)
     repos["entities"].delete_eq("deal_id", deal_id)
 
-    run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
-    repos["runs"].insert_run(run_for_db)
-    repos["links"].insert_batch(links)
-    repos["entities"].upsert_entities(entities)
-    repos["txn_map"].upsert_mappings(txn_map)
+    # Safety net only — NOT a fix for the underlying non-atomicity. The four
+    # deletes above and the four inserts below are separate PostgREST calls,
+    # not one DB transaction, so pds_txn_entity_map (and links/entities) for
+    # this deal sit genuinely EMPTY between the deletes and here. If any
+    # insert below throws, that empty state becomes PERMANENT for this deal
+    # until its next successful export — and looks identical to a deal with
+    # zero needs_review items (Corpus State would read "Needs review: 0"),
+    # not like an error. The exception still propagates (existing 500 to the
+    # caller is preserved) — this only guarantees the partial-failure state
+    # is loudly, greppably logged instead of being indistinguishable from a
+    # genuinely clean, fully-reclassified deal. See ticket for the real fix
+    # (atomic delete+reinsert, likely a Postgres RPC).
+    try:
+        run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
+        repos["runs"].insert_run(run_for_db)
+        repos["links"].insert_batch(links)
+        repos["entities"].upsert_entities(entities)
+        repos["txn_map"].upsert_mappings(txn_map)
+    except Exception:
+        logger.critical(
+            "[EXPORT][DATA_INTEGRITY_GAP] deal=%s reinsert failed after delete_eq committed — "
+            "pds_txn_entity_map/links/entities for this deal are now EMPTY, not just stale. "
+            "This deal's Review Queue will read as 0 remaining (looks clean, is not). "
+            "Needs a manual re-export to repair. See export() safety-net comment for context.",
+            deal_id,
+            exc_info=True,
+        )
+        raise
 
     stage = "SNAPSHOT_BUILD_DONE"
     logger.info("[EXPORT] stage=%s", stage)
