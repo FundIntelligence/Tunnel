@@ -309,6 +309,122 @@ def test_inventory_analysis_computes_turnover_and_dio_when_data_present():
     assert "Inventory turns over quickly relative to cost of sales — LOW inventory risk." in html
 
 
+# ── supplier payment analysis (PAR-63) ───────────────────────────────────────
+# Concentration clauses only apply at N >= 30 supplier transactions (mirrors
+# PAR-89's _MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD, applied here to
+# supplier_txn_count specifically). Below that, an explicit insufficient-data
+# message replaces the categorical HIGH/MODERATE/diversified label.
+
+def _supplier_txn_fixture(entity_totals: dict, *, amount_cents: int = 100000):
+    """Build raw_txn/txn_entity_map/entities rows: `amount_cents`-cent supplier
+    debits split across the given {entity_id: txn_count} distribution, so the
+    total transaction count and each entity's % share are easy to control."""
+    raw_txns, txn_map, seen_entities = [], [], {}
+    i = 0
+    for eid, count in entity_totals.items():
+        seen_entities[eid] = f"Supplier {eid}"
+        for _ in range(count):
+            tid = f"t{i}"
+            raw_txns.append({
+                "id": tid, "txn_date": "2025-01-05", "signed_amount_cents": -amount_cents,
+                "abs_amount_cents": amount_cents, "normalized_descriptor": "SUPPLIER", "balance_cents": None,
+            })
+            txn_map.append({"txn_id": tid, "role": "supplier_payment", "entity_id": eid})
+            i += 1
+    entities = [{"entity_id": eid, "display_name": name} for eid, name in seen_entities.items()]
+    return raw_txns, txn_map, entities
+
+
+def test_supplier_payment_analysis_real_fixture_below_threshold_shows_insufficient_data():
+    """The real Buildex fixture has exactly 1 supplier transaction — far below
+    the 30-transaction sample-size gate. Confirms the section renders the
+    honest insufficient-data message (not a misleading '100.0% HIGH' label,
+    which is mathematically guaranteed at N=1 regardless of the real supplier
+    mix) and does NOT fabricate an entity_id-less name either."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Supplier Payment Analysis" in html
+    # txn-2: signed_amount_cents -200000 = KES 2,000, the only supplier-role txn
+    assert "KES 2,000" in html
+    assert "-- · 100.0%" in html
+    assert "Insufficient supplier transaction volume for a reliable concentration assessment (N=1)." in html
+    assert "This represents HIGH supplier concentration risk." not in html
+
+
+def test_supplier_payment_analysis_below_threshold_boundary_at_29_transactions():
+    """29 supplier transactions (one below the N=30 gate) — confirms the
+    boundary itself, not just a small illustrative N."""
+    tables = dict(_TABLES)
+    raw_txns, txn_map, entities = _supplier_txn_fixture({"ent-A": 29})
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_entities"] = entities
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Insufficient supplier transaction volume for a reliable concentration assessment (N=29)." in html
+
+
+def test_supplier_payment_analysis_top_entity_by_name_and_concentration():
+    """30 supplier transactions (at the sample-size gate), 24/6 split across
+    two entities -> 80% concentration. Confirms the pds_entities join
+    correctly attributes spend per counterparty name, picks the top supplier
+    by total (not by transaction count), and that HIGH concentration renders
+    once the sample is large enough to trust."""
+    tables = dict(_TABLES)
+    raw_txns, txn_map, entities = _supplier_txn_fixture({"ent-A": 24, "ent-B": 6})
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_entities"] = [
+        {"entity_id": "ent-A", "display_name": "Timber Traders Ltd"},
+        {"entity_id": "ent-B", "display_name": "Glass Supplies Co"},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    # ent-A: 24/30 = 80% -> top supplier by total, despite ent-B having more
+    # transactions than a single ent-A transaction would suggest.
+    assert "KES 30,000" in html  # 30 txns x KES 1,000 (100000 cents) each
+    assert "Timber Traders Ltd · 80.0%" in html
+    assert "This represents HIGH supplier concentration risk." in html
+
+
+def test_supplier_payment_analysis_moderate_and_diversified_concentration():
+    """30 supplier transactions split 6 ways across 5 entities (20% each,
+    MODERATE) confirms the 15-30% bucket at a trustworthy sample size; a
+    second, more diversified fixture (10 entities, 10% each) confirms the
+    <15% diversified bucket too."""
+    tables = dict(_TABLES)
+    raw_txns, txn_map, entities = _supplier_txn_fixture(
+        {f"ent-{i}": 6 for i in range(1, 6)}
+    )
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_entities"] = entities
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    # 5 equal suppliers, 30 txns total -> each 20% -> top is 20% -> MODERATE.
+    assert "20.0%" in html
+    assert "This represents MODERATE supplier concentration." in html
+
+    tables2 = dict(_TABLES)
+    raw_txns2, txn_map2, entities2 = _supplier_txn_fixture(
+        {f"ent-{i}": 3 for i in range(1, 11)}
+    )
+    tables2["pds_raw_transactions"] = raw_txns2
+    tables2["pds_txn_entity_map"] = txn_map2
+    tables2["pds_entities"] = entities2
+    renderer._get_supabase = lambda: _FakeSupabase(tables2)
+    _patch_recon()
+    html2 = renderer.render_snapshot_html("deal-fixture")
+    # 10 equal suppliers, 30 txns total -> each 10% -> diversified (<15%).
+    assert "10.0%" in html2
+    assert "Supplier spend is well-diversified across counterparties." in html2
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():

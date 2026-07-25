@@ -1258,6 +1258,24 @@ body {
     </div>
     {% endif %}
 
+    <!-- SUPPLIER PAYMENT ANALYSIS (PAR-63) — renders in both states -->
+    <div class="sec">
+      <div class="sec-label">Supplier Payment Analysis <span class="sec-label-badge">Observed · Classified</span></div>
+      {% if supplier_payments.available %}
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Total supplier payments</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.total_str }}</td></tr>
+          <tr><td>Transactions</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.txn_count }}</td></tr>
+          <tr><td>Counterparties</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.entity_count }}</td></tr>
+          <tr><td>Top supplier</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.top_name }} · {{ supplier_payments.top_pct_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ supplier_payments.clause }}</div>
+      {% else %}
+      <div class="cashflow-note" style="border-top:none">No supplier payments classified for this deal.</div>
+      {% endif %}
+    </div>
+
   </div><!-- end page-body -->
 
   <div class="page-footer">
