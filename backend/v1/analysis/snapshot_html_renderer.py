@@ -667,6 +667,15 @@ def render_snapshot_html(
     # figure can be surfaced. Renders in both recon_available states — this
     # depends only on live transaction/entity data, not audited financials.
     _SUPPLIER_ROLES = ("supplier", "supplier_payment")
+    # PAR-89 used 30 transactions as the minimum sample before trusting a
+    # per-deal statistic (median/MAD), falling back to a flat default below
+    # that — see classifier.py's _MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD. Same
+    # cutoff, same reasoning, applied here to supplier_txn_count specifically
+    # (the actual sample the concentration % is drawn from) rather than total
+    # deal transactions: a concentration % computed over a handful of supplier
+    # transactions is not a stable finding — at N=1 it is mathematically
+    # guaranteed to read 100%, regardless of the business's real supplier mix.
+    _MIN_SUPPLIER_SAMPLE_SIZE = 30
     supplier_by_entity: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "count": 0})
     for t in txns:
         if t["role"] in _SUPPLIER_ROLES and t["signed"] < 0:
@@ -686,16 +695,28 @@ def render_snapshot_html(
             or "--"
         )
         top_supplier_pct = top_data["total"] / supplier_total_cents * 100
-        # Thresholds mirror the >30% "HIGH concentration" convention
-        # PARITY_SCIENCE.md Part III defines for Customer Concentration —
-        # reused here for the supplier side by analogy, not independently
-        # codified for suppliers. See PAR-63_new_sections_spec.md Section 2.
-        if top_supplier_pct >= 30:
-            supplier_concentration_clause = "This represents HIGH supplier concentration risk."
-        elif top_supplier_pct >= 15:
-            supplier_concentration_clause = "This represents MODERATE supplier concentration."
+
+        if supplier_txn_count < _MIN_SUPPLIER_SAMPLE_SIZE:
+            supplier_concentration_clause = (
+                f"Insufficient supplier transaction volume for a reliable "
+                f"concentration assessment (N={supplier_txn_count})."
+            )
         else:
-            supplier_concentration_clause = "Supplier spend is well-diversified across counterparties."
+            # Thresholds mirror the >30% "HIGH concentration" convention
+            # PARITY_SCIENCE.md Part III defines for Customer Concentration —
+            # reused here for the supplier side by analogy, not independently
+            # codified for suppliers. BORROWED THRESHOLD, PENDING FORMAL
+            # PARITY SCIENCE SIGN-OFF — see PAR-63_new_sections_spec.md
+            # Section 2 and the PR description's open-items list. Needs its
+            # own Part III Supplier Concentration pattern entry (Signal/
+            # Confidence/Action) before being treated as a settled rule.
+            if top_supplier_pct >= 30:
+                supplier_concentration_clause = "This represents HIGH supplier concentration risk."
+            elif top_supplier_pct >= 15:
+                supplier_concentration_clause = "This represents MODERATE supplier concentration."
+            else:
+                supplier_concentration_clause = "Supplier spend is well-diversified across counterparties."
+
         supplier_payments_ctx: Dict[str, Any] = {
             "available":    True,
             "total_str":    _fmt_kes(supplier_total_cents),
