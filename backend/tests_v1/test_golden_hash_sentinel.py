@@ -76,7 +76,28 @@ GOLDEN_FIXTURE = [
 # bug — but whether anomaly data BELONGS in the immutable seal is a design question
 # worth an explicit call. Touching it would require a SCHEMA_VERSION bump and is not
 # part of this test-fix change.
-GOLDEN_HASH_EXPECTED = "f2e98e6843e165af0316249add926fd5003e83fa696f60921eac72fb358be9d4"
+#
+# Updated 24 July 2026 — f2e98e68… → 96c74f19… . PAR-89: classifier.py's flat
+# KES 100,000 large-positive-credit fallback replaced with a per-deal relative
+# threshold (median + scaled MAD) plus an absolute ceiling; SCHEMA_VERSION
+# bumped 1.0.2 → 1.0.3 and CONFIG_VERSION 1.0.3 → 1.0.4 in the same change
+# (both intentional — see backend/v1/config.py). Two independent, deliberate
+# causes, both expected to change this hash:
+#   1. run_pipeline now stamps a "role_reason" string onto every
+#      pds_txn_entity_map record (the human-readable flag reason, e.g. "KES
+#      340,000 credit, no keyword match, 4.2x this business's median
+#      transaction size"), which is part of the sealed txn_entity_map in the
+#      canonical payload — same category as cause #1 above (a new field
+#      entering the seal via a genuine, deliberate payload change).
+#   2. CONFIG_VERSION bump (payload field "config_version") — same category
+#      as cause #2 above, and required so already-exported deals actually
+#      get reclassified under the new logic on next export() instead of
+#      short-circuiting to a stale cached snapshot.
+# None of the 5 golden fixture transactions are large enough to hit the
+# large-positive fallback either before or after this change (max is KES 500),
+# so no role changed here — only the new role_reason field and config_version.
+# Previous hash: f2e98e6843e165af0316249add926fd5003e83fa696f60921eac72fb358be9d4
+GOLDEN_HASH_EXPECTED = "96c74f190f58bd86a869e2d0ac18e2f9a991bd63d27d6bdfc4cc3ab2028332ae"
 
 
 class TestGoldenHashSentinel(unittest.TestCase):

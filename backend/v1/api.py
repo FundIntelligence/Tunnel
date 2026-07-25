@@ -818,6 +818,12 @@ def get_needs_review_transactions(request: Request, deal_id: str):
             "signed_amount_cents": int(tx.get("signed_amount_cents") or 0),
             "entity_name": entity_name_by_id.get(m.get("entity_id") or "", ""),
             "current_role": "needs_review",
+            # PAR-89: human-readable reason the classifier flagged this row (e.g.
+            # "KES 340,000 credit, no keyword match, 4.2x this business's median
+            # transaction size"). Field name matches ReviewQueue.tsx's existing
+            # (previously always-empty) flag_reason rendering — see components/
+            # ReviewQueue.tsx:374-375. Absent on rows classified before this change.
+            "flag_reason": m.get("role_reason") or "",
         })
 
     results.sort(key=lambda r: r["txn_date"])

@@ -11,9 +11,16 @@ const ROLE_OPTIONS = [
   { value: 'payroll', label: 'Payroll', color: 'var(--amber)' },
   { value: 'loan_repayment', label: 'Loan Repayment', color: 'var(--red)' },
   { value: 'tax', label: 'Tax / KRA', color: 'var(--amber)' },
-  { value: 'intercompany', label: 'Intercompany', color: '#818CF8' },
-  { value: 'owner_draw', label: 'Owner Draw', color: '#E879F9' },
-  { value: 'ignore', label: 'Ignore / Not relevant', color: 'var(--t2)' },
+  // PAR-89: these 3 used to send values ('intercompany', 'owner_draw', 'ignore')
+  // that don't exist in backend _VALID_OVERRIDE_ROLES (api.py), so every resolve
+  // attempt with them 400'd. Renamed to the backend's existing equivalent roles
+  // rather than adding new backend roles — each concept already has a role with
+  // real downstream meaning (related_party_transfer/owner_withdrawal feed
+  // reconciliation/suggestions logic; 'other' is already the excluded/uncategorized
+  // catch-all), so a second, UI-only role would just fragment the same concept.
+  { value: 'related_party_transfer', label: 'Intercompany / Related Party', color: '#818CF8' },
+  { value: 'owner_withdrawal', label: 'Owner Draw / Withdrawal', color: '#E879F9' },
+  { value: 'other', label: 'Ignore / Not relevant', color: 'var(--t2)' },
 ]
 
 function formatCents(c: number): string {
