@@ -845,6 +845,99 @@ def test_inter_account_transfer_analysis_reports_manual_overrides():
     ) in html
 
 
+# ── risk assessment summary (PAR-63) ─────────────────────────────────────────
+# Reuses existing signals (tier, account coverage, transaction-pattern
+# rollup) plus one new computation (revenue concentration by entity), which
+# must be single-sourced from txns (live), not mixed with total_in/
+# by_role_in (canon_tagged/canonical_json) — same audit reflex as Tax
+# Compliance Analysis and Supplier Payment Analysis.
+
+def test_risk_assessment_summary_real_fixture_insufficient_revenue_sample():
+    """Real Buildex fixture has only 2 revenue-role transactions — below the
+    30-transaction concentration threshold — confirms the honest
+    'insufficient data' branch rather than a misleading concentration %,
+    plus the LOW_CONFIDENCE conclusion and the self-transfer cross-reference
+    note (consistent phrasing with Inter-Account Transfer Analysis, no
+    internal ticket ID in the rendered copy)."""
+    _patch_supabase()
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "Risk Assessment Summary" in html
+    assert "LOW_CONFIDENCE" in html
+    assert "insufficient data (N=2)" in html
+    assert "No critical transaction-pattern flags were raised." in html
+    assert (
+        "This deal is Low confidence — cash position and/or loan activity reconciliation "
+        "shows material variance. Manual review is required before credit decisioning."
+    ) in html
+    assert (
+        "This confidence tier does not yet net out self-transfers between this company's "
+        "own bank accounts — see Inter-Account Transfer Analysis above for why that "
+        "detection is not currently available."
+    ) in html
+    # No internal ticket ID in the actual visible content of this section —
+    # not a blanket check on the raw HTML string, since template source
+    # comments like "<!-- ... (PAR-63) -->" are dev-only markers that never
+    # survive into the rendered PDF (weasyprint doesn't emit HTML comments
+    # into visible content) and aren't what "analyst-facing copy" refers to.
+    risk_section = re.search(r'Risk Assessment Summary.*?</div>\s*</div>', html, re.S).group(0)
+    assert "PAR-102" not in risk_section
+    assert "PAR-63" not in risk_section
+
+
+def test_risk_assessment_summary_revenue_concentration_at_sample_threshold():
+    """30 revenue-role transactions (24/6 split across two entities) -> 80%
+    concentration, trustworthy once the sample threshold is met. Confirms
+    the observed-state conclusion clause when no audited financials are
+    submitted at all (recon_tier == 'OBSERVED')."""
+    tables = dict(_TABLES)
+    raw_txns, txn_map = [], []
+    for i in range(24):
+        tid = f"a{i}"
+        raw_txns.append({"id": tid, "txn_date": "2025-01-05", "signed_amount_cents": 100000,
+                          "abs_amount_cents": 100000, "normalized_descriptor": "REV", "balance_cents": None})
+        txn_map.append({"txn_id": tid, "role": "revenue_operational", "entity_id": "ent-A"})
+    for i in range(6):
+        tid = f"b{i}"
+        raw_txns.append({"id": tid, "txn_date": "2025-01-05", "signed_amount_cents": 100000,
+                          "abs_amount_cents": 100000, "normalized_descriptor": "REV", "balance_cents": None})
+        txn_map.append({"txn_id": tid, "role": "revenue_operational", "entity_id": "ent-B"})
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    tables["pds_entities"] = [
+        {"entity_id": "ent-A", "display_name": "Big Customer Ltd"},
+        {"entity_id": "ent-B", "display_name": "Small Customer Ltd"},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "OBSERVED" in html
+    assert "80.0%" in html
+    assert (
+        "This report covers bank-observed data only — audited financials have not been "
+        "submitted, so the 4-point reconciliation has not run. Confidence reflects income "
+        "quality and cashflow composition indicators only, not a reconciled tier."
+    ) in html
+
+
+def test_risk_assessment_summary_critical_anomaly_surfaced():
+    """A CRITICAL transaction-pattern flag (sealed in canonical_json) is
+    reflected in the risk summary's anomaly rollup line, cross-referencing
+    Transaction Pattern Analysis rather than duplicating the detail."""
+    canon_transactions = [
+        {"id": "t1", "txn_date": "2025-03-14", "signed_amount_cents": 100000000,
+         "anomalies": [{"type": "ROUND_NUMBER_LARGE_AMOUNT", "severity": "CRITICAL",
+                         "reason": "perfectly round large amount"}]},
+    ]
+    tables = _anomaly_snapshot_tables(canon_transactions)
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert (
+        "1 critical transaction-pattern flag(s) were also raised "
+        "(see Transaction Pattern Analysis)."
+    ) in html
+
+
 # ── build_snapshot_context / render_html equivalent — company name + report id ──
 
 def test_render_html_contains_company_name_and_report_id():
