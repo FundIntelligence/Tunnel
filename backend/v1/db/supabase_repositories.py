@@ -422,6 +422,40 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
         return sum(1 for r in rows if (r.get("role") or "") == "needs_review")
 
 
+class ExportPersistenceRepo(BaseRepo):
+    """PAR-95: wraps export()'s delete+reinsert of pds_txn_entity_map/links/
+    entities/pds_analysis_runs in a single .rpc() call to the
+    export_persist_deal_state Postgres function (migration 026), so the whole
+    sequence commits or rolls back as one DB transaction instead of four
+    separate PostgREST calls. See that migration for the exact delete/insert
+    semantics it replicates."""
+
+    def __init__(self):
+        # No single table backs this repo — it only needs self.client for
+        # .rpc(). "pds_analysis_runs" is an arbitrary anchor table.
+        super().__init__("pds_analysis_runs")
+
+    def persist_deal_state(
+        self,
+        *,
+        deal_id: str,
+        run: Dict[str, Any],
+        links: Iterable[Dict[str, Any]],
+        entities: Iterable[Dict[str, Any]],
+        txn_map: Iterable[Dict[str, Any]],
+    ) -> None:
+        self.client.rpc(
+            "export_persist_deal_state",
+            {
+                "p_deal_id": deal_id,
+                "p_run": run,
+                "p_links": list(links),
+                "p_entities": list(entities),
+                "p_txn_map": list(txn_map),
+            },
+        ).execute()
+
+
 class OverrideLogRepo(BaseRepo):
     def __init__(self):
         super().__init__("pds_override_log")

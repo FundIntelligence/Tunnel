@@ -202,6 +202,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         AnalysisRunsRepo, SnapshotsRepo,
         EnrichmentsRepo, ClassificationOverridesRepo, CustomFlagsRepo,
         AccountCoverageRepo, OverrideLogRepo, IntelligenceLogRepo,
+        ExportPersistenceRepo,
     )
     return {
         "deals": DealsRepo(),
@@ -215,6 +216,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         "intelligence_log": IntelligenceLogRepo(),
         "runs": AnalysisRunsRepo(),
         "snapshots": SnapshotsRepo(),
+        "export_persistence": ExportPersistenceRepo(),
         "enrichments": EnrichmentsRepo(),
         "cls_overrides": ClassificationOverridesRepo(),
         "custom_flags": CustomFlagsRepo(),
@@ -1036,34 +1038,31 @@ def export(request: Request, deal_id: str, force: bool = False):
         if lnk.get("id") is None:
             del lnk["id"]
 
-    repos["txn_map"].delete_eq("deal_id", deal_id)
-    repos["links"].delete_eq("deal_id", deal_id)
-    repos["entities"].delete_eq("deal_id", deal_id)
-
-    # Safety net only — NOT a fix for the underlying non-atomicity. The four
-    # deletes above and the four inserts below are separate PostgREST calls,
-    # not one DB transaction, so pds_txn_entity_map (and links/entities) for
-    # this deal sit genuinely EMPTY between the deletes and here. If any
-    # insert below throws, that empty state becomes PERMANENT for this deal
-    # until its next successful export — and looks identical to a deal with
-    # zero needs_review items (Corpus State would read "Needs review: 0"),
-    # not like an error. The exception still propagates (existing 500 to the
-    # caller is preserved) — this only guarantees the partial-failure state
-    # is loudly, greppably logged instead of being indistinguishable from a
-    # genuinely clean, fully-reclassified deal. See ticket for the real fix
-    # (atomic delete+reinsert, likely a Postgres RPC).
+    # PAR-95: delete+reinsert of pds_txn_entity_map/links/entities/run now
+    # happens inside a single Postgres function call (export_persist_deal_state,
+    # migration 026), not four separate PostgREST calls — Postgres wraps one
+    # function call in one transaction, so a failure partway through rolls
+    # back the deletes too. pds_txn_entity_map (and links/entities) for this
+    # deal are never observably empty to a concurrent reader. The critical
+    # log below is now a genuine last-resort: it only fires if the RPC call
+    # itself fails to reach/complete on the DB (network error, etc.), in
+    # which case Postgres has already rolled back and the deal's prior state
+    # is intact — this is not the PAR-93 data-integrity gap anymore, just a
+    # loud record that an export attempt failed.
     try:
         run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
-        repos["runs"].insert_run(run_for_db)
-        repos["links"].insert_batch(links)
-        repos["entities"].upsert_entities(entities)
-        repos["txn_map"].upsert_mappings(txn_map)
+        repos["export_persistence"].persist_deal_state(
+            deal_id=deal_id,
+            run=run_for_db,
+            links=links,
+            entities=entities,
+            txn_map=txn_map,
+        )
     except Exception:
         logger.critical(
-            "[EXPORT][DATA_INTEGRITY_GAP] deal=%s reinsert failed after delete_eq committed — "
-            "pds_txn_entity_map/links/entities for this deal are now EMPTY, not just stale. "
-            "This deal's Review Queue will read as 0 remaining (looks clean, is not). "
-            "Needs a manual re-export to repair. See export() safety-net comment for context.",
+            "[EXPORT] deal=%s export_persist_deal_state RPC failed — Postgres has rolled back "
+            "the whole delete+reinsert as one transaction, so pds_txn_entity_map/links/entities "
+            "for this deal still hold their prior state, not an empty one. Export must be retried.",
             deal_id,
             exc_info=True,
         )

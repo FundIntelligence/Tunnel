@@ -289,16 +289,68 @@ class MemorySnapshotsRepo(SnapshotsRepository):
         return decode_snapshot_row(copy.deepcopy(latest))
 
 
+class MemoryExportPersistenceRepo:
+    """Simulates export_persist_deal_state (migration 026, PAR-95) for tests.
+
+    The real RPC gets its all-or-nothing behavior for free from Postgres
+    wrapping one function call in one transaction. This double has no
+    transaction to lean on, so it snapshots the four affected stores up
+    front and restores them verbatim if anything raises partway through —
+    otherwise a forced failure in a test would leave the in-memory stores
+    empty (the exact bug PAR-95 fixes) instead of rolled back, and tests
+    exercising the failure path would pass for the wrong reason.
+    """
+
+    def __init__(self, runs_repo, links_repo, entities_repo, txn_map_repo):
+        self._runs = runs_repo
+        self._links = links_repo
+        self._entities = entities_repo
+        self._txn_map = txn_map_repo
+
+    def persist_deal_state(
+        self,
+        *,
+        deal_id: str,
+        run: Dict[str, Any],
+        links: Iterable[Dict[str, Any]],
+        entities: Iterable[Dict[str, Any]],
+        txn_map: Iterable[Dict[str, Any]],
+    ) -> None:
+        runs_snapshot = copy.deepcopy(self._runs._store)
+        links_snapshot = copy.deepcopy(self._links._store)
+        entities_snapshot = copy.deepcopy(self._entities._store)
+        txn_map_snapshot = copy.deepcopy(self._txn_map._store)
+        try:
+            self._txn_map.delete_eq("deal_id", deal_id)
+            self._links.delete_eq("deal_id", deal_id)
+            self._entities.delete_eq("deal_id", deal_id)
+            self._runs.insert_run(run)
+            self._links.insert_batch(links)
+            self._entities.upsert_entities(entities)
+            self._txn_map.upsert_mappings(txn_map)
+        except Exception:
+            self._runs._store = runs_snapshot
+            self._links._store = links_snapshot
+            self._entities._store = entities_snapshot
+            self._txn_map._store = txn_map_snapshot
+            raise
+
+
 def build_memory_repos() -> Dict[str, Any]:
+    runs = MemoryAnalysisRunsRepo()
+    links = MemoryTransferLinksRepo()
+    entities = MemoryEntitiesRepo()
+    txn_map = MemoryTxnEntityMapRepo()
     return {
         "deals": MemoryDealsRepo(),
         "documents": MemoryDocumentsRepo(),
         "raw": MemoryRawTxRepo(),
-        "links": MemoryTransferLinksRepo(),
-        "entities": MemoryEntitiesRepo(),
-        "txn_map": MemoryTxnEntityMapRepo(),
+        "links": links,
+        "entities": entities,
+        "txn_map": txn_map,
         "overrides": MemoryOverridesRepo(),
         "override_log": MemoryOverrideLogRepo(),
-        "runs": MemoryAnalysisRunsRepo(),
+        "runs": runs,
         "snapshots": MemorySnapshotsRepo(),
+        "export_persistence": MemoryExportPersistenceRepo(runs, links, entities, txn_map),
     }
