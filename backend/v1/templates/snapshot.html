@@ -1312,6 +1312,21 @@ body {
       <div class="cashflow-note">{{ inter_account_transfer.override_note }}</div>
     </div>
 
+    <!-- RISK ASSESSMENT SUMMARY (PAR-63) -->
+    <div class="sec">
+      <div class="sec-label">Risk Assessment Summary <span class="sec-label-badge">Rollup</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Overall confidence tier</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.tier }}</td></tr>
+          <tr><td>Account coverage advisory</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.advisory_tier }}{{ ' (' + risk_assessment.missing_pct + '% coverage)' if risk_assessment.missing_pct != '--' else '' }}</td></tr>
+          <tr><td>Revenue concentration (largest entity)</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.largest_rev_pct_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ risk_assessment.anomaly_summary }}</div>
+      <div class="cashflow-note">{{ risk_assessment.conclusion }}</div>
+      <div class="cashflow-note">{{ risk_assessment.transfer_note }}</div>
+    </div>
+
   </div><!-- end page-body -->
 
   <div class="page-footer">

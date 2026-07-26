@@ -1260,6 +1260,102 @@ def render_snapshot_html(
             ),
         }
 
+    # ── Risk Assessment Summary (PAR-63) ──────────────────────────────────────
+    # Reuses existing signals only — tier, account coverage, and the
+    # transaction-pattern rollup are all already computed above; this section
+    # adds exactly one new computation (revenue concentration by entity).
+    #
+    # Confirmed Item 2's pds_entities join (entity_name_by_id) still returns
+    # correctly before reusing it here — not assumed: the supplier-side tests
+    # that depend on the same join (test_supplier_payment_analysis_*) were
+    # re-run and still pass unchanged going into this section.
+    #
+    # largest_rev_pct's numerator AND denominator are both computed from txns
+    # (the live pds_raw_transactions fetch) — mirroring exactly how Supplier
+    # Payment Analysis computes its concentration. Deliberately NOT mixing in
+    # total_in/by_role_in (computed from canon_tagged, i.e. canonical_json) —
+    # that would repeat the exact numerator/denominator cross-source mismatch
+    # caught in Tax Compliance Analysis (PR #110 review). Same minimum-sample
+    # gate as supplier concentration (PAR-89's 30-transaction threshold) for
+    # the same reason: a concentration % over a handful of revenue
+    # transactions is not a stable finding.
+    revenue_by_entity: Dict[str, int] = defaultdict(int)
+    revenue_txn_count = 0
+    for t in txns:
+        if t["role"] in REVENUE_ROLES and t["signed"] > 0:
+            eid = t.get("entity_id") or ""
+            revenue_by_entity[eid] += t["signed"]
+            revenue_txn_count += 1
+
+    revenue_total_cents = sum(revenue_by_entity.values())
+
+    if not revenue_by_entity or revenue_total_cents <= 0:
+        largest_rev_pct_str = "--"
+    elif revenue_txn_count < _MIN_SUPPLIER_SAMPLE_SIZE:
+        largest_rev_pct_str = f"insufficient data (N={revenue_txn_count})"
+    else:
+        top_rev_eid, top_rev_total = max(revenue_by_entity.items(), key=lambda kv: kv[1])
+        largest_rev_pct_str = f"{(top_rev_total / revenue_total_cents * 100):.1f}%"
+
+    risk_critical_count = transaction_patterns_ctx["critical_count"]
+    if risk_critical_count > 0:
+        risk_anomaly_summary = (
+            f"{risk_critical_count} critical transaction-pattern flag(s) were also raised "
+            "(see Transaction Pattern Analysis)."
+        )
+    else:
+        risk_anomaly_summary = "No critical transaction-pattern flags were raised."
+
+    # Overall conclusion — restates _compute_tier()'s own existing blocking
+    # logic (snapshot_generator.py) in prose, not a new/invented rule. Handles
+    # the OBSERVED state (no audited financials at all) as its own case, since
+    # the original spec draft only anticipated HIGH/MEDIUM/LOW_CONFIDENCE.
+    risk_advisory_tier = account_coverage_ctx.get("advisory_tier", "--") if account_coverage_ctx.get("available") else "--"
+    if recon_tier == "OBSERVED":
+        risk_conclusion = (
+            "This report covers bank-observed data only — audited financials have not been "
+            "submitted, so the 4-point reconciliation has not run. Confidence reflects income "
+            "quality and cashflow composition indicators only, not a reconciled tier."
+        )
+    elif recon_tier == "HIGH_CONFIDENCE":
+        risk_conclusion = "This deal meets Parity's threshold for high-confidence credit analysis."
+    elif recon_tier == "MEDIUM_CONFIDENCE" and risk_advisory_tier == "CRITICAL":
+        risk_conclusion = (
+            "Confidence is capped at Medium because of a critical account-coverage gap — "
+            "resolve missing bank statement coverage before treating this as high-confidence."
+        )
+    elif recon_tier == "MEDIUM_CONFIDENCE":
+        risk_conclusion = (
+            "This deal is Medium confidence — cash position or loan activity reconciliation "
+            "did not reach exact-match tolerance."
+        )
+    else:
+        risk_conclusion = (
+            "This deal is Low confidence — cash position and/or loan activity reconciliation "
+            "shows material variance. Manual review is required before credit decisioning."
+        )
+
+    # Self-transfer-netting caveat — same known gap as Inter-Account Transfer
+    # Analysis, cross-referenced rather than independently re-described, so
+    # the two sections don't drift into two different explanations of the
+    # same issue. No internal ticket reference in the rendered copy (same
+    # rule applied to Item 6's stub).
+    risk_transfer_note = (
+        "This confidence tier does not yet net out self-transfers between this company's own "
+        "bank accounts — see Inter-Account Transfer Analysis above for why that detection "
+        "is not currently available."
+    )
+
+    risk_assessment_ctx: Dict[str, Any] = {
+        "tier":                   recon_tier,
+        "advisory_tier":          risk_advisory_tier,
+        "missing_pct":            account_coverage_ctx.get("coverage_pct", "--") if account_coverage_ctx.get("available") else "--",
+        "largest_rev_pct_str":    largest_rev_pct_str,
+        "anomaly_summary":        risk_anomaly_summary,
+        "conclusion":             risk_conclusion,
+        "transfer_note":          risk_transfer_note,
+    }
+
     # ── Render template ───────────────────────────────────────────────────────
     templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
     env = Environment(loader=FileSystemLoader(os.path.abspath(templates_dir)))
@@ -1323,6 +1419,7 @@ def render_snapshot_html(
         "tax_compliance":     tax_compliance_ctx,
         "transaction_patterns": transaction_patterns_ctx,
         "inter_account_transfer": inter_account_transfer_ctx,
+        "risk_assessment":    risk_assessment_ctx,
     }
 
     return template.render(**context)
