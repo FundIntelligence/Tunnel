@@ -1305,9 +1305,18 @@ body {
       <div class="cashflow-note">{{ transaction_patterns.clause }}</div>
     </div>
 
-    <!-- INTER-ACCOUNT TRANSFER ANALYSIS (PAR-63) — honest limitation stub -->
+    <!-- INTER-ACCOUNT TRANSFER ANALYSIS (PAR-63; live-checked per PAR-102) -->
     <div class="sec">
-      <div class="sec-label">Inter-Account Transfer Analysis <span class="sec-label-badge">Not Available</span></div>
+      <div class="sec-label">Inter-Account Transfer Analysis <span class="sec-label-badge">{{ inter_account_transfer.badge_label }}</span></div>
+      {% if inter_account_transfer.pairs %}
+      <table class="loan-table">
+        <tbody>
+          {% for pair in inter_account_transfer.pairs %}
+          <tr><td>{{ pair.label }}</td><td class="rt-figure" style="text-align:right">{{ pair.count }} txns, {{ pair.total_str }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
       <div class="cashflow-note" style="border-top:none">{{ inter_account_transfer.note }}</div>
       <div class="cashflow-note">{{ inter_account_transfer.override_note }}</div>
     </div>

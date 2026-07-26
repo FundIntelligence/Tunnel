@@ -183,6 +183,9 @@ def render_snapshot_html(
     )
     credit_scoring_inputs_list: List[Dict] = []
     doc_pills: List[Dict] = []
+    # PAR-102: document_id -> detected bank label, reused by Inter-Account
+    # Transfer Analysis below to name each side of a detected transfer pair.
+    doc_bank_by_id: Dict[str, Optional[str]] = {}
 
     for doc in docs:
         analytics = doc.get("analytics") or {}
@@ -197,6 +200,7 @@ def render_snapshot_html(
                 bank_name = _bank_label(str(sf))
                 if bank_name:
                     break
+        doc_bank_by_id[doc.get("id")] = bank_name
         label = f"{bank_name or 'Bank'} · {txn_count:,} txns"
         doc_pills.append({"label": label, "active": True})
 
@@ -259,7 +263,8 @@ def render_snapshot_html(
     # 5. Paginated transactions + roles
     txn_rows = _paginate(
         sb, "pds_raw_transactions",
-        "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor, balance_cents",
+        "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor, balance_cents, "
+        "account_id, document_id",
         deal_id,
     )
     # PAR-63: entity_id added so Supplier Payment Analysis can attribute spend
@@ -881,25 +886,20 @@ def render_snapshot_html(
         "clause":         tax_compliance_clause,
     }
 
-    # ── Inter-Account Transfer Analysis (PAR-63) — honest limitation stub ────
+    # ── Inter-Account Transfer Analysis (PAR-63; live-checked per PAR-102) ───
     # Self-transfer/cash-sweep detection between a company's own bank accounts
     # depends on transfer_matcher.match_transfers() pairing transactions across
     # DIFFERENT accounts, which requires per-transaction account_id tagging.
-    # Confirmed (read-only investigation, no code changed there) that this
-    # tagging is not currently populated correctly by the ingestion pipeline —
-    # every transaction resolves to the same undifferentiated account value,
-    # so the matcher cannot find a single pair for any deal today. That gap is
-    # tracked separately (PAR-102) and is explicitly out of scope for this
-    # renderer work — not touching transfer_matcher.py, reconciliation_engine.py,
-    # classifier.py, or any account_id/ingestion code here.
-    #
-    # Deliberately NOT rendering a bare "0 self-transfers detected" — that
-    # would misrepresent a known infrastructure gap as a real finding. The one
-    # thing this section CAN honestly check with existing data: whether an
-    # analyst has manually overridden any transaction to a transfer-type role
-    # (transfer/internal_transfer are both in the override role list — see
-    # api.py's _VALID_OVERRIDE_ROLES), since manual overrides don't depend on
-    # the broken automatic matcher at all.
+    # PAR-102 fixed that tagging (str(document_id) per source document) for
+    # deals ingested after commit 64bebd4, but older/still-broken deals still
+    # resolve every transaction to the same undifferentiated account value.
+    # This section now checks pds_transfer_links directly rather than
+    # asserting the old blanket "not available" for every deal:
+    #   - real transfer_links rows exist       -> render the real breakdown
+    #   - zero rows AND 2+ distinct account_id  -> detection ran, genuine zero
+    #   - zero rows AND <2 distinct account_id  -> honest limitation stub
+    #     (unchanged copy — still accurate for any deal whose account_id
+    #     tagging is still broken)
     _TRANSFER_ROLES = ("transfer", "internal_transfer")
     manual_transfer_count = sum(1 for t in txns if t["role"] in _TRANSFER_ROLES)
 
@@ -913,8 +913,52 @@ def render_snapshot_html(
     else:
         transfer_override_note = "No transactions have been manually flagged as self-transfers for this deal."
 
-    inter_account_transfer_ctx: Dict[str, Any] = {
-        "note": (
+    transfer_link_rows = (
+        sb.table("pds_transfer_links")
+        .select("txn_out_id, txn_in_id, abs_amount_cents")
+        .eq("deal_id", deal_id)
+        .execute()
+        .data or []
+    )
+    document_id_by_txn: Dict[str, Optional[str]] = {t["id"]: t.get("document_id") for t in txn_rows}
+    distinct_account_ids = {t.get("account_id") for t in txn_rows if t.get("account_id")}
+
+    def _account_label(txn_id: str, fallback: str) -> str:
+        doc_id = document_id_by_txn.get(txn_id)
+        return doc_bank_by_id.get(doc_id) or (f"Account {doc_id[:8]}" if doc_id else fallback)
+
+    if transfer_link_rows:
+        total_count = len(transfer_link_rows)
+        total_cents = sum(l["abs_amount_cents"] for l in transfer_link_rows)
+        pair_agg: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "cents": 0})
+        for link in transfer_link_rows:
+            out_label = _account_label(link["txn_out_id"], "Account A")
+            in_label  = _account_label(link["txn_in_id"], "Account B")
+            key = f"{out_label} -> {in_label}"
+            pair_agg[key]["count"] += 1
+            pair_agg[key]["cents"] += link["abs_amount_cents"]
+        transfer_pairs = [
+            {"label": key, "count": agg["count"], "total_str": _fmt_kes(agg["cents"])}
+            for key, agg in sorted(pair_agg.items())
+        ]
+        inter_account_transfer_note = (
+            f"{total_count} inter-account transfer pair(s) detected between this company's own "
+            f"bank accounts, totaling {_fmt_kes(total_cents)}. Detected automatically by pairing "
+            "same-amount, opposite-sign transactions across different accounts within a short "
+            "window — see the breakdown above."
+        )
+        inter_account_badge = "Detected"
+    elif len(distinct_account_ids) >= 2:
+        transfer_pairs = []
+        inter_account_transfer_note = (
+            "Self-transfer / cash-sweep detection ran for this deal — transactions are tagged "
+            "with distinct per-account identifiers — and found no qualifying inter-account "
+            "transfer pairs in this period. This is a genuine result, not an infrastructure gap."
+        )
+        inter_account_badge = "No Transfers Found"
+    else:
+        transfer_pairs = []
+        inter_account_transfer_note = (
             "Self-transfer / cash-sweep analysis between this company's own bank accounts "
             "is not currently available. Detection depends on each transaction being tagged "
             "with the specific account it belongs to, and that per-account tagging is not "
@@ -922,7 +966,13 @@ def render_snapshot_html(
             "currently resolves to the same undifferentiated account value, so the matching "
             "logic cannot distinguish between a company's own accounts. This is a known "
             "infrastructure gap, not a finding that no such transfers exist."
-        ),
+        )
+        inter_account_badge = "Not Available"
+
+    inter_account_transfer_ctx: Dict[str, Any] = {
+        "badge_label": inter_account_badge,
+        "pairs": transfer_pairs,
+        "note": inter_account_transfer_note,
         "override_note": transfer_override_note,
     }
 
