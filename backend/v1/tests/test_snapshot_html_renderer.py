@@ -845,6 +845,80 @@ def test_inter_account_transfer_analysis_reports_manual_overrides():
     ) in html
 
 
+# ── inter-account transfer analysis (PAR-102) — live check replaces the stub
+# when pds_transfer_links actually has rows for the deal, since the account_id
+# fix (commit 64bebd4) means the "every transaction is undifferentiated"
+# premise no longer holds universally.
+
+def test_inter_account_transfer_analysis_renders_real_data_when_links_exist():
+    """Mirrors the real MBAKSTESTBUILDEX deal (63de219d): two documents with
+    distinct account_id/document_id values and populated pds_transfer_links.
+    Confirms the stub is replaced with a genuine breakdown, not the canned
+    'not currently available' copy."""
+    tables = dict(_TABLES)
+    tables["pds_documents"] = [
+        {"id": "docA", "storage_url": "inline://EQUITY STATEMENT.pdf", "source_files": [],
+         "analytics": {"summary": {"total_transactions": 1}}},
+        {"id": "docB", "storage_url": "inline://KCB STATEMENT.pdf", "source_files": [],
+         "analytics": {"summary": {"total_transactions": 1}}},
+    ]
+    tables["pds_raw_transactions"] = [
+        {"id": "tA1", "txn_date": "2025-01-05", "signed_amount_cents": -500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "TRANSFER OUT", "balance_cents": None,
+         "account_id": "docA", "document_id": "docA"},
+        {"id": "tB1", "txn_date": "2025-01-06", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "TRANSFER IN", "balance_cents": None,
+         "account_id": "docB", "document_id": "docB"},
+    ]
+    tables["pds_transfer_links"] = [
+        {"txn_out_id": "tA1", "txn_in_id": "tB1", "abs_amount_cents": 500000},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Inter-Account Transfer Analysis" in html
+    assert "1 inter-account transfer pair(s) detected" in html
+    assert "KES 5,000" in html
+    assert "Equity -> KCB" in html
+    assert "1 txns, KES 5,000" in html
+    # Scope the negative checks to this section only — "is not currently
+    # available" also legitimately appears in the (unchanged, out-of-scope)
+    # Risk Assessment Summary cross-reference note.
+    section = re.search(r'Inter-Account Transfer Analysis.*?</div>\s*</div>', html, re.S).group(0)
+    assert "is not currently available" not in section
+    assert "genuine result, not an infrastructure gap" not in section
+
+
+def test_inter_account_transfer_analysis_genuine_zero_distinct_from_stub():
+    """Two distinct account_id values but zero pds_transfer_links rows: the
+    matcher genuinely ran and found nothing, which must render a distinct
+    message from the 'account_id is broken' stub — a real zero is not the
+    same finding as an infrastructure gap."""
+    tables = dict(_TABLES)
+    tables["pds_raw_transactions"] = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "X", "balance_cents": None,
+         "account_id": "acc-1", "document_id": "docA"},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": -300000,
+         "abs_amount_cents": 300000, "normalized_descriptor": "Y", "balance_cents": None,
+         "account_id": "acc-2", "document_id": "docB"},
+    ]
+    tables["pds_transfer_links"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Inter-Account Transfer Analysis" in html
+    assert (
+        "Self-transfer / cash-sweep detection ran for this deal — transactions are tagged "
+        "with distinct per-account identifiers — and found no qualifying inter-account "
+        "transfer pairs in this period. This is a genuine result, not an infrastructure gap."
+    ) in html
+    # Must not claim the old infrastructure-gap stub for a deal whose account_id is fine.
+    assert "not yet populated correctly in the current ingestion pipeline" not in html
+
+
 # ── risk assessment summary (PAR-63) ─────────────────────────────────────────
 # Reuses existing signals (tier, account coverage, transaction-pattern
 # rollup) plus one new computation (revenue concentration by entity), which
