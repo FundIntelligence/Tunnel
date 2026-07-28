@@ -2258,7 +2258,11 @@ def get_audited_financials(request: Request, deal_id: str):
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     af_repo = AuditedFinancialsRepo()
-    records = af_repo.get_by_deal_id(deal_id)
+    try:
+        records = af_repo.get_by_deal_id(deal_id)
+    except Exception as exc:
+        logger.exception("[AUDITED_FINANCIALS] DB read failed for deal=%s", deal_id)
+        _error("SERVICE_UNAVAILABLE", "Unable to retrieve audited financials at this time", details={"message": str(exc)})
     records.sort(key=lambda r: r.get("financial_year") or 0, reverse=True)
     return {"deal_id": deal_id, "records": records}
 
