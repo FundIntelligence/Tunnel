@@ -44,8 +44,16 @@ class BaseRepo:
             return
         self.client.table(self.table).insert(items).execute()
 
-    def select_eq(self, column: str, value: Any) -> List[Dict[str, Any]]:
+    def select_eq(self, column: str, value: Any, order_by: str = "id") -> List[Dict[str, Any]]:
         # Paginate: one .range(0, N) with a large N still hits the server max (~1000 rows).
+        # An .order() is required for .range() to paginate correctly: without a stable
+        # sort, Postgres is free to return rows in a different order on each page request,
+        # so consecutive .range() calls can return the same row twice (or skip one) —
+        # confirmed live on parity-staging where this silently duplicated a raw transaction
+        # across two pages and blew up the downstream ON CONFLICT upsert in
+        # export_persist_deal_state with "cannot affect row a second time". Defaults to
+        # "id" (present on nearly every table here); pass order_by explicitly for the
+        # handful of tables without an id column (e.g. pds_entities, pds_txn_entity_map).
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:
@@ -54,6 +62,7 @@ class BaseRepo:
                 self.client.table(self.table)
                 .select("*")
                 .eq(column, value)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -71,7 +80,9 @@ class BaseRepo:
                 break
         return out
 
-    def select_eq2(self, col1: str, val1: Any, col2: str, val2: Any) -> List[Dict[str, Any]]:
+    def select_eq2(
+        self, col1: str, val1: Any, col2: str, val2: Any, order_by: str = "id"
+    ) -> List[Dict[str, Any]]:
         """Same pagination as select_eq, with a second equality filter pushed to the DB."""
         out: List[Dict[str, Any]] = []
         offset = 0
@@ -82,6 +93,7 @@ class BaseRepo:
                 .select("*")
                 .eq(col1, val1)
                 .eq(col2, val2)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -404,7 +416,9 @@ class EntitiesRepo(EntitiesRepository, BaseRepo):
                 self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_entities has no "id" column (PK is entity_id) — order by that instead
+        # of select_eq's "id" default.
+        return self.select_eq("deal_id", deal_id, order_by="entity_id")
 
 
 class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
@@ -420,18 +434,20 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
             self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_txn_entity_map has no "id" column (PK is txn_id) — order by that
+        # instead of select_eq's "id" default.
+        return self.select_eq("deal_id", deal_id, order_by="txn_id")
 
     def list_needs_review_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         """Filters role='needs_review' in the DB query instead of pulling every
         mapping row for the deal and filtering in Python."""
-        return self.select_eq2("deal_id", deal_id, "role", "needs_review")
+        return self.select_eq2("deal_id", deal_id, "role", "needs_review", order_by="txn_id")
 
     def update_role(self, txn_uuid: str, new_role: str) -> None:
         self.client.table(self.table).update({"role": new_role}).eq("txn_id", txn_uuid).execute()
 
     def count_needs_review(self, deal_id: str) -> int:
-        rows = self.select_eq("deal_id", deal_id)
+        rows = self.select_eq("deal_id", deal_id, order_by="txn_id")
         return sum(1 for r in rows if (r.get("role") or "") == "needs_review")
 
     def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
@@ -547,6 +563,22 @@ class IntelligenceLogRepo(BaseRepo):
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
+
+
+class ReviewThresholdLogRepo(BaseRepo):
+    """
+    PAR-89 part B: append-only diagnostics log for the large-positive-credit
+    review-threshold heuristic (median/mad/threshold/ratio per flagged txn).
+    Deliberately write-once — no update method. Callers must wrap writes in
+    try/except (see api.py's export flow) — this table is never read back by
+    the pipeline and a write failure must not affect classification/export.
+    """
+
+    def __init__(self):
+        super().__init__("pds_review_threshold_log")
+
+    def insert_log_many(self, entries: Iterable[Dict[str, Any]]) -> None:
+        self.insert_many(entries)
 
 
 class OverridesRepo(OverridesRepository, BaseRepo):

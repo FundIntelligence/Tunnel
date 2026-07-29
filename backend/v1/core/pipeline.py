@@ -1,5 +1,5 @@
 import uuid
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..config import SCHEMA_VERSION, CONFIG_VERSION
 from ..parsing.common import canonical_hash
@@ -17,10 +17,18 @@ def run_pipeline(
     raw_transactions: List[Dict],
     overrides: List[Dict],
     accrual: Dict,
+    review_threshold_log_out: Optional[List[Dict]] = None,
 ) -> Tuple[Dict, List[Dict], List[Dict], List[Dict]]:
     """
     Returns (analysis_run, transfer_links, entities, txn_entity_records)
     txn_entity_records: list of {txn_id, entity_id, role, role_version}
+
+    review_threshold_log_out (PAR-89 part B, optional): if provided, this list
+    is appended with one diagnostics dict per transaction flagged via the
+    large-positive-no-keyword-match fallback — {deal_id, txn_id, median_cents,
+    mad_cents, threshold_cents, amount_cents, ratio} — for the caller to
+    persist to the review_threshold_log table. Default None means "don't
+    bother collecting" — no behavior change for existing callers.
     """
     # Step 1: transfer matching
     txs, transfer_links = match_transfers(raw_transactions)
@@ -32,13 +40,18 @@ def run_pipeline(
     # PAR-89: compute the per-deal relative large-positive threshold once
     # (not per transaction) — see compute_relative_large_positive_threshold_cents
     # for the method and fallback conditions.
-    large_positive_threshold_cents, median_txn_abs_cents = compute_relative_large_positive_threshold_cents(txs)
+    large_positive_threshold_cents, median_txn_abs_cents, mad_txn_abs_cents = (
+        compute_relative_large_positive_threshold_cents(txs)
+    )
     txn_entity_records = []
     for tx in txs:
+        diagnostics = {} if review_threshold_log_out is not None else None
         role, role_reason = classify_with_reason(
             tx,
             large_positive_threshold_cents=large_positive_threshold_cents,
             median_txn_abs_cents=median_txn_abs_cents,
+            mad_txn_abs_cents=mad_txn_abs_cents,
+            flag_diagnostics_out=diagnostics,
         )
         tx["role"] = role
         txn_entity_records.append(
@@ -51,6 +64,14 @@ def run_pipeline(
                 "role_reason": role_reason,
             }
         )
+        if diagnostics:
+            review_threshold_log_out.append(
+                {
+                    "deal_id": deal_id,
+                    "txn_id": tx["txn_id"],
+                    **diagnostics,
+                }
+            )
 
     # Step 3.5: anomaly detection — annotates each tx["anomalies"] in-place
     entity_id_to_display = {e["entity_id"]: e["display_name"] for e in entities}
