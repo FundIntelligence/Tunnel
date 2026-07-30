@@ -837,8 +837,23 @@ def render_snapshot_html(
     # style. Renders in both recon_available states — depends only on live
     # transaction data.
     _TAX_ROLES = ("tax_payment", "kra_payment")
+    # PAR-100: minimum tax-transaction sample before trusting a categorical
+    # COMPLIANT/PARTIAL status — the same arithmetic-soundness principle as
+    # Supplier Payment Analysis's _MIN_SUPPLIER_SAMPLE_SIZE (30 txns): at a
+    # handful of transactions the ratio can't produce a meaningful answer
+    # regardless of the real pattern. Deliberately NOT reusing 30 here — tax
+    # payments are monthly-cadence (PAYE/VAT), realistically capping around
+    # 12-24/year for any real deal, so a 30-transaction floor would make
+    # almost every deal (including the canonical MBAKSTESTBUILDEX fixture,
+    # at 5) read "insufficient data" regardless of how genuinely compliant
+    # the pattern is — that would defeat the section's purpose rather than
+    # protect it. 3 requires at least a quarter's worth of tax activity
+    # before asserting a categorical status, without over-tightening for a
+    # role whose real-world volume is inherently low.
+    _MIN_TAX_SAMPLE_SIZE = 3
     tax_months_active: set = set()
     tax_total_cents_active = 0
+    tax_txn_count_active = 0
     # Denominator must come from the same txns list as the numerator above —
     # period_months (used elsewhere in this file) is derived from
     # monthly_merged/canon_tagged, which is sourced from canonical_json, not
@@ -854,12 +869,21 @@ def render_snapshot_html(
             if t["role"] in _TAX_ROLES and t["signed"] < 0:
                 tax_months_active.add(m)
                 tax_total_cents_active += t["abs"]
+                tax_txn_count_active += 1
 
     n_tax_months   = len(tax_months_active)
     n_total_months = len(all_months_active)
 
-    if n_total_months == 0:
+    # A genuine zero (n_tax_txns == 0) is already an honest, meaningful
+    # finding — NOT_DETECTED, with its own explanatory clause below — and is
+    # left untouched. The insufficient-data gate only applies to the thin
+    # nonzero case (1-2 transactions), where the ratio itself is otherwise
+    # able to compute a confident-looking but statistically meaningless
+    # categorical status.
+    if n_total_months == 0 or tax_txn_count_active == 0:
         kra_compliance = "NOT_DETECTED"
+    elif tax_txn_count_active < _MIN_TAX_SAMPLE_SIZE:
+        kra_compliance = "INSUFFICIENT_DATA"
     elif n_tax_months >= n_total_months * 0.8:
         kra_compliance = "COMPLIANT"
     elif n_tax_months > 0:
@@ -871,6 +895,11 @@ def render_snapshot_html(
         tax_compliance_clause = "Tax payment pattern is consistent with the business's stated activity level."
     elif kra_compliance == "PARTIAL":
         tax_compliance_clause = "Partial tax payment pattern — verify against filed returns."
+    elif kra_compliance == "INSUFFICIENT_DATA":
+        tax_compliance_clause = (
+            f"Insufficient tax transaction volume for a reliable compliance "
+            f"assessment (N={tax_txn_count_active})."
+        )
     else:
         tax_compliance_clause = (
             "No tax payments detected in bank activity. This does not necessarily "

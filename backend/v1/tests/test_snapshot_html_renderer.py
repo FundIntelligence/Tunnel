@@ -538,6 +538,68 @@ def test_tax_compliance_analysis_partial_status():
     assert "Partial tax payment pattern — verify against filed returns." in html
 
 
+def test_tax_compliance_analysis_insufficient_data_below_min_sample():
+    """PAR-100: 2 tax-role transactions across a 12-month period is below
+    _MIN_TAX_SAMPLE_SIZE (3) — at that sample size the ratio is otherwise
+    mathematically able to assert a confident PARTIAL/COMPLIANT status
+    regardless of the real pattern (same soundness class as Supplier
+    Payment's N=1 bug, PR #109). Confirms the honest insufficient-data
+    message renders instead, and neither COMPLIANT nor PARTIAL appears."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:2]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "2 of 12" in html
+    assert "INSUFFICIENT_DATA" in html
+    assert "Insufficient tax transaction volume for a reliable compliance assessment (N=2)." in html
+    assert "Partial tax payment pattern" not in html
+    assert "Tax payment pattern is consistent with the business's stated activity level." not in html
+
+
+def test_tax_compliance_analysis_at_min_sample_boundary_not_insufficient():
+    """Exactly 3 tax transactions (_MIN_TAX_SAMPLE_SIZE itself) — confirms
+    the boundary is inclusive: N=3 is trusted (falls through to the normal
+    COMPLIANT/PARTIAL logic), only N<3 is gated as insufficient."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:3]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "INSUFFICIENT_DATA" not in html
+    assert "PARTIAL" in html
+
+
 def test_tax_compliance_analysis_renders_in_observed_state_without_audited_financials():
     """Confirms the section renders (not gated on recon_available) when no
     audited financials are submitted at all — same both-states requirement
