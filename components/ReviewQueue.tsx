@@ -344,7 +344,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
               </div>
             )}
             {['DATE', 'DESCRIPTION', 'DR/CR', 'ROLE', 'AMOUNT'].map((h) => (
-              <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--b1)', letterSpacing: '0.1em' }}>{h}</span>
+              <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.1em' }}>{h}</span>
             ))}
           </div>
         )}
