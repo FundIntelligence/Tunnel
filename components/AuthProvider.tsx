@@ -1,7 +1,8 @@
 'use client'
 
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { User, Session } from '@supabase/supabase-js'
+import posthog from 'posthog-js'
 import { createBrowserClient } from '@/lib/supabase'
 import { setApiToken } from '@/lib/auth-bridge'
 import { useRouter } from 'next/navigation'
@@ -24,6 +25,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
   const router = useRouter()
+  const identifiedUserId = useRef<string | null>(null)
+
+  const resetPostHog = useCallback(() => {
+    if (posthog.__loaded) {
+      posthog.reset()
+    }
+    identifiedUserId.current = null
+  }, [])
+
+  const identifyPostHogUser = useCallback((authenticatedUser: User) => {
+    if (!posthog.__loaded || identifiedUserId.current === authenticatedUser.id) return
+
+    if (identifiedUserId.current) {
+      resetPostHog()
+    }
+
+    posthog.identify(authenticatedUser.id, authenticatedUser.email ? { email: authenticatedUser.email } : {})
+    identifiedUserId.current = authenticatedUser.id
+  }, [resetPostHog])
   
   // Lazy client creation - only create when actually needed (client-side)
   const getSupabaseClient = () => {
@@ -44,6 +64,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setSession(session)
         setUser(session?.user ?? null)
         setApiToken(session?.access_token ?? null)
+        if (session?.user) {
+          identifyPostHogUser(session.user)
+        }
       } catch (error) {
         console.warn('Failed to get session:', error)
         setApiToken(null)
@@ -60,7 +83,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setSession(session)
         setUser(session?.user ?? null)
         setApiToken(session?.access_token ?? null)
-        if (event === 'SIGNED_IN') {
+        if (event === 'SIGNED_IN' && session?.user) {
+          identifyPostHogUser(session.user)
           document.cookie = 'sb-auth-hint=1; path=/; max-age=86400; SameSite=Lax'
           // Only redirect if coming from login/auth pages — don't interrupt an active session
           const path = window.location.pathname
@@ -70,6 +94,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (event === 'SIGNED_OUT') {
+          resetPostHog()
           document.cookie = 'sb-auth-hint=; path=/; max-age=0'
           router.push('/login')
         }
@@ -79,7 +104,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       subscription.unsubscribe()
     }
-  }, [router])
+  }, [identifyPostHogUser, resetPostHog, router])
 
   const signIn = async (email: string, password: string) => {
     const supabase = getSupabaseClient()

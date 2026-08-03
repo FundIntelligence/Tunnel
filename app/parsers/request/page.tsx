@@ -2,6 +2,7 @@
 
 import { useState, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import posthog from 'posthog-js';
 
 const COUNTRIES = [
   'Kenya', 'Nigeria', 'Uganda', 'Tanzania', 'Ghana',
@@ -60,6 +61,10 @@ export default function RequestParserPage() {
         throw new Error((data as { error?: string }).error ?? `Error ${res.status}`);
       }
 
+      posthog.capture('parser_format_requested', {
+        country,
+        account_type: accountType,
+      });
       setSubmitted(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Submission failed — please try again.');

@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
 import { getExportSummary, downloadSnapshotPdf, exportTransactionsCsvBlob, ExportSummary } from '@/lib/v1-api'
+import posthog from 'posthog-js'
 
 const CHECKLIST = [
   { key: 'files', label: 'Documents uploaded', check: (s: ExportSummary) => s.files_uploaded > 0 },
@@ -64,6 +65,7 @@ export default function ExportPage() {
       a.download = `parity-snapshot-${dealId.slice(0, 8)}.pdf`
       a.click()
       URL.revokeObjectURL(url)
+      posthog.capture('snapshot_pdf_downloaded', { deal_id: dealId })
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : 'PDF download failed')
     } finally {
@@ -84,6 +86,7 @@ export default function ExportPage() {
       a.download = `parity-transactions-${dealId.slice(0, 8)}.csv`
       a.click()
       URL.revokeObjectURL(url)
+      posthog.capture('transactions_csv_exported', { deal_id: dealId })
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : 'CSV export failed')
     } finally {

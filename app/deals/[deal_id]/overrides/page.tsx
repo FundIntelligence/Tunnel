@@ -5,6 +5,7 @@ import { useRouter, useParams } from 'next/navigation'
 import { createBrowserClient } from '@/lib/supabase'
 import { getNeedsReviewTransactions, resolveTransaction } from '@/lib/v1-api'
 import type { NeedsReviewTransaction } from '@/lib/v1-api'
+import posthog from 'posthog-js'
 
 const ROLES: { value: string; label: string }[] = [
   { value: 'revenue_operational', label: 'Revenue: Operational' },
@@ -110,6 +111,10 @@ export default function OverridesPage() {
     setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], resolving: true, error: '' } }))
     try {
       await resolveTransaction(dealId, txn.row_id, state.selectedRole, analystInitials)
+      posthog.capture('transaction_override_resolved', {
+        deal_id: dealId,
+        assigned_role: state.selectedRole,
+      })
       setRowStates((prev) => ({ ...prev, [txn.row_id]: { ...prev[txn.row_id], resolving: false, resolved: true } }))
     } catch (err: any) {
       setRowStates((prev) => ({

@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { createBrowserClient } from '@/lib/supabase'
 import { createDeal } from '@/lib/v1-api'
+import posthog from 'posthog-js'
 
 export default function NewDealPage() {
   const router = useRouter()
@@ -32,6 +33,10 @@ export default function NewDealPage() {
     setError('')
     try {
       const { deal } = await createDeal('KES', dealName.trim(), undefined, companyName.trim())
+      posthog.capture('deal_created', {
+        deal_id: deal.id,
+        currency: 'KES',
+      })
       router.push(`/v1/deal?deal_id=${deal.id}`)
     } catch (err: any) {
       setError(err?.message || 'Failed to create deal. Please try again.')
