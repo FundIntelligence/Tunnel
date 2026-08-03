@@ -5,6 +5,7 @@ import { useRouter, useParams } from 'next/navigation'
 import { createBrowserClient } from '@/lib/supabase'
 import { intelligenceAsk, logIntelligenceEntry } from '@/lib/v1-api'
 import type { QueryType, UserRole } from '@/lib/v1-api'
+import posthog from 'posthog-js'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -160,6 +161,10 @@ function ResponseBubble({
     setLogging(true)
     try {
       const { logged_count } = await logIntelligenceEntry(dealId, msg.id)
+      posthog.capture('intelligence_entry_logged', {
+        deal_id: dealId,
+        query_type: msg.queryType,
+      })
       setLoggedAt(fmtTime(new Date()))
       onLogged(logged_count)
     } catch {
@@ -311,6 +316,11 @@ export default function ReviewPage() {
     ])
     setQuery('')
     setAsking(true)
+    posthog.capture('intelligence_query_submitted', {
+      deal_id: dealId,
+      query_type: queryType,
+      user_role: userRole,
+    })
 
     // Minimum computing display time
     const [result] = await Promise.allSettled([
