@@ -857,16 +857,16 @@ def resolve_transaction(
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     # Fetch the txn-entity map row to get original role and entity
-    all_maps = repos["txn_map"].list_by_deal(deal_id)
-    txn_map_row = next((m for m in all_maps if str(m.get("txn_id")) == row_id), None)
+    # PAR-96: point lookup instead of list_by_deal(deal_id) + Python scan —
+    # this used to be a full-deal fetch just to find one row by id.
+    txn_map_row = repos["txn_map"].get_by_deal_and_txn(deal_id, row_id)
     if not txn_map_row:
         _error("NOT_FOUND", f"Transaction mapping {row_id} not found for deal {deal_id}")
 
     original_role = txn_map_row.get("role") or "needs_review"
 
-    # Fetch the raw transaction for its SHA256 hash
-    all_txns = repos["raw"].list_by_deal(deal_id)
-    tx_row = next((t for t in all_txns if str(t.get("id")) == row_id), None)
+    # Fetch the raw transaction for its SHA256 hash (point lookup, same reasoning)
+    tx_row = repos["raw"].get_by_deal_and_id(deal_id, row_id)
     txn_hash = tx_row.get("txn_id") or "" if tx_row else ""
 
     user_id = _extract_user_id_from_request(request)
@@ -892,12 +892,10 @@ def resolve_transaction(
     if hasattr(repos["txn_map"], "update_role"):
         repos["txn_map"].update_role(row_id, new_role)
 
-    # Count remaining needs_review for this deal
-    remaining = sum(
-        1 for m in repos["txn_map"].list_by_deal(deal_id)
-        if (m.get("role") or "").lower() == "needs_review"
-        and str(m.get("txn_id")) != row_id
-    )
+    # Count remaining needs_review for this deal — DB-side COUNT (PAR-96),
+    # not a third full-deal fetch. Same semantics as before: role == 'needs_review'
+    # excluding the row just resolved above.
+    remaining = repos["txn_map"].count_needs_review_excluding(deal_id, row_id)
 
     return {"success": True, "remaining_count": remaining}
 

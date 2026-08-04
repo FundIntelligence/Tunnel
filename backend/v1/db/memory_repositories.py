@@ -125,6 +125,12 @@ class MemoryRawTxRepo(RawTransactionsRepository):
         wanted = set(values)
         return [copy.deepcopy(r) for r in self._store if r.get(column) in wanted]
 
+    def get_by_deal_and_id(self, deal_id: str, row_id: str) -> Optional[Dict[str, Any]]:
+        for r in self._store:
+            if r.get("deal_id") == deal_id and str(r.get("id")) == str(row_id):
+                return copy.deepcopy(r)
+        return None
+
 
 class MemoryTransferLinksRepo(TransferLinksRepository):
     def __init__(self):
@@ -188,6 +194,20 @@ class MemoryTxnEntityMapRepo(TxnEntityMapRepository):
 
     def count_needs_review(self, deal_id: str) -> int:
         return len(self.list_needs_review_by_deal(deal_id))
+
+    def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
+        for m in self._store.values():
+            if m.get("deal_id") == deal_id and str(m.get("txn_id")) == str(txn_id):
+                return copy.deepcopy(m)
+        return None
+
+    def count_needs_review_excluding(self, deal_id: str, exclude_txn_id: str) -> int:
+        return sum(
+            1 for m in self._store.values()
+            if m.get("deal_id") == deal_id
+            and (m.get("role") or "").lower() == "needs_review"
+            and str(m.get("txn_id")) != str(exclude_txn_id)
+        )
 
     def delete_eq(self, column: str, value: Any) -> None:
         self._store = {k: v for k, v in self._store.items() if v.get(column) != value}
