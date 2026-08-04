@@ -452,10 +452,22 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
         list_by_deal(deal_id) + a Python scan over the whole deal. Same semantics
         as the resolve_transaction() call site it replaces: role == 'needs_review'
         (already lowercase in the DB, per the equivalent DB-side filter in
-        list_needs_review_by_deal above) excluding the just-resolved row."""
+        list_needs_review_by_deal above) excluding the just-resolved row.
+
+        PAR-96 hotfix: originally used .select("*", count="exact", head=True) —
+        confirmed live against parity-staging (2026-08-04, postgrest-py 0.17.2)
+        that head=True silently makes res.count come back 0 regardless of the
+        actual count, even though the identical query without head=True returns
+        the correct count. Not caught locally because the in-memory test double
+        doesn't exercise real PostgREST HTTP/count semantics at all, and the one
+        existing test asserting remaining_count happened to expect 0 anyway in
+        its fixture (a coincidental false-positive, not a real check). Dropping
+        head=True and projecting only txn_id (not "*") keeps this far cheaper
+        than the original full-deal scan it replaced, without the broken
+        HEAD-request path."""
         res = (
             self.client.table(self.table)
-            .select("*", count="exact", head=True)
+            .select("txn_id", count="exact")
             .eq("deal_id", deal_id)
             .eq("role", "needs_review")
             .neq("txn_id", exclude_txn_id)
