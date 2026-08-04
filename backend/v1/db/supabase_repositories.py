@@ -508,6 +508,20 @@ class OverrideLogRepo(BaseRepo):
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
 
+    def get_latest_update_at(self, deal_id: str) -> Optional[str]:
+        """PAR-111: export()'s short-circuit freshness check needs this to
+        notice a fresh Review Queue resolution — see OverridesRepo.get_latest_update_at
+        for the sibling check on pds_overrides (a genuinely different, still-live
+        table: entity-level classification overrides fed into run_pipeline(),
+        vs. this table's per-transaction resolve_transaction() audit log,
+        overlaid onto run_pipeline()'s output afterward per PAR-77). Both can
+        invalidate a cached export, so the freshness check must take the max
+        of both, not just one."""
+        rows = self.select_eq("deal_id", deal_id)
+        if not rows:
+            return ""
+        return max((r.get("created_at") or "") for r in rows)
+
 
 class IntelligenceLogRepo(BaseRepo):
     def __init__(self):

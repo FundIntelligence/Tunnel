@@ -960,7 +960,17 @@ def export(request: Request, deal_id: str, force: bool = False):
     # Skipped when force=True to rebuild the snapshot unconditionally.
     latest_snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
     latest_doc_at = repos["documents"].get_latest_update_at(deal_id)
-    latest_override_at = repos["overrides"].get_latest_update_at(deal_id) or ""
+    # PAR-111: pds_overrides (entity-level overrides, fed into run_pipeline()) and
+    # pds_override_log (per-transaction Review Queue resolutions, overlaid onto
+    # run_pipeline()'s output per PAR-77) are both real, both still-live tables
+    # that can change what export() produces — this check was only ever reading
+    # the former, so a fresh resolve_transaction() call never invalidated the
+    # short-circuit and export() could silently keep serving a pre-resolution
+    # snapshot. Take the max of both.
+    latest_override_at = max(
+        repos["overrides"].get_latest_update_at(deal_id) or "",
+        (repos["override_log"].get_latest_update_at(deal_id) if repos.get("override_log") else "") or "",
+    )
     snap_created_at = (latest_snapshot or {}).get("created_at") or ""
     snap_config_version = (latest_snapshot or {}).get("config_version")
     if not force and (

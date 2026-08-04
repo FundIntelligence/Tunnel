@@ -235,7 +235,10 @@ class MemoryOverridesRepo(OverridesRepository):
 class MemoryOverrideLogRepo:
     """Mirrors OverrideLogRepo (pds_override_log) — append-only Review Queue
     resolution audit trail. Not part of the OverridesRepository interface;
-    a separate, unrelated table (see PAR-77)."""
+    a separate table from pds_overrides (see PAR-77) — but PAR-111: still a
+    real input to export()'s freshness check (get_latest_update_at below),
+    since a resolution here changes what a re-export overlays onto
+    run_pipeline()'s output."""
 
     def __init__(self):
         self._store: List[Dict[str, Any]] = []
@@ -247,6 +250,12 @@ class MemoryOverrideLogRepo:
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return [copy.deepcopy(o) for o in self._store if o.get("deal_id") == deal_id]
+
+    def get_latest_update_at(self, deal_id: str) -> Optional[str]:
+        rows = [o for o in self._store if o.get("deal_id") == deal_id]
+        if not rows:
+            return ""
+        return max((r.get("created_at") or "") for r in rows)
 
 
 class MemoryAnalysisRunsRepo(AnalysisRunsRepository):
