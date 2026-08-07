@@ -247,6 +247,19 @@ class RawTxRepo(RawTransactionsRepository, BaseRepo):
     def list_by_document(self, document_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("document_id", document_id)
 
+    def get_by_deal_and_id(self, deal_id: str, row_id: str) -> Optional[Dict[str, Any]]:
+        """PAR-96: point lookup for a single raw transaction, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal."""
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .eq("id", row_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
     def get_all_transactions_for_export(
         self, deal_id: str, year: Optional[int] = None
     ) -> Sequence[Dict[str, Any]]:
@@ -421,6 +434,47 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
         rows = self.select_eq("deal_id", deal_id)
         return sum(1 for r in rows if (r.get("role") or "") == "needs_review")
 
+    def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
+        """PAR-96: point lookup for a single txn_map row, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal."""
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .eq("txn_id", txn_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    def count_needs_review_excluding(self, deal_id: str, exclude_txn_id: str) -> int:
+        """PAR-96: DB-side COUNT for the post-resolve remaining-count, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal. Same semantics
+        as the resolve_transaction() call site it replaces: role == 'needs_review'
+        (already lowercase in the DB, per the equivalent DB-side filter in
+        list_needs_review_by_deal above) excluding the just-resolved row.
+
+        PAR-96 hotfix: originally used .select("*", count="exact", head=True) —
+        confirmed live against parity-staging (2026-08-04, postgrest-py 0.17.2)
+        that head=True silently makes res.count come back 0 regardless of the
+        actual count, even though the identical query without head=True returns
+        the correct count. Not caught locally because the in-memory test double
+        doesn't exercise real PostgREST HTTP/count semantics at all, and the one
+        existing test asserting remaining_count happened to expect 0 anyway in
+        its fixture (a coincidental false-positive, not a real check). Dropping
+        head=True and projecting only txn_id (not "*") keeps this far cheaper
+        than the original full-deal scan it replaced, without the broken
+        HEAD-request path."""
+        res = (
+            self.client.table(self.table)
+            .select("txn_id", count="exact")
+            .eq("deal_id", deal_id)
+            .eq("role", "needs_review")
+            .neq("txn_id", exclude_txn_id)
+            .execute()
+        )
+        return res.count or 0
+
 
 class ExportPersistenceRepo(BaseRepo):
     """PAR-95: wraps export()'s delete+reinsert of pds_txn_entity_map/links/
@@ -465,6 +519,20 @@ class OverrideLogRepo(BaseRepo):
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
+
+    def get_latest_update_at(self, deal_id: str) -> Optional[str]:
+        """PAR-111: export()'s short-circuit freshness check needs this to
+        notice a fresh Review Queue resolution — see OverridesRepo.get_latest_update_at
+        for the sibling check on pds_overrides (a genuinely different, still-live
+        table: entity-level classification overrides fed into run_pipeline(),
+        vs. this table's per-transaction resolve_transaction() audit log,
+        overlaid onto run_pipeline()'s output afterward per PAR-77). Both can
+        invalidate a cached export, so the freshness check must take the max
+        of both, not just one."""
+        rows = self.select_eq("deal_id", deal_id)
+        if not rows:
+            return ""
+        return max((r.get("created_at") or "") for r in rows)
 
 
 class IntelligenceLogRepo(BaseRepo):

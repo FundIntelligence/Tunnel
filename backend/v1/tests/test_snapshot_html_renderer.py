@@ -1211,19 +1211,29 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     instance of the same bug fixed above in the summary cashflow note — missed
     the first time because it's a separate code path. Confirms both now use the
     real observed-period length (13 here) instead of a hardcoded 12.
+
+    Also covers PAR-100: the cached pds_documents.analytics.credit_scoring_inputs
+    blob here is deliberately stale (CONSISTENT / 1 month), the opposite of the
+    live picture (payroll present in only 4 of 13 months -> IRREGULAR) — proves
+    the "Irregular payroll" card is driven entirely by a live pass over
+    pds_raw_transactions/pds_txn_entity_map, not the cache.
     """
     months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
     # 3 net-negative months so the "Net-negative months" pattern triggers (>2).
     neg = {"2025-02", "2025-05", "2025-08"}
+    # 4 of 13 months carry a live payroll-role transaction -> IRREGULAR (< 80%).
+    payroll_months = {"2025-01", "2025-04", "2025-07", "2025-10"}
     document_rows = [{
         "id": "doc-1",
         "storage_url": "inline://STATEMENT.pdf",
         "source_files": [],
         "analytics": {
             "summary": {"total_transactions": len(months)},
+            # Deliberately stale/mismatched vs the live txns below — proves
+            # this cached blob is no longer consulted for this card (PAR-100).
             "credit_scoring_inputs": {
-                "payroll_stability": "IRREGULAR",
-                "payroll_months_detected": 4,
+                "payroll_stability": "CONSISTENT",
+                "payroll_months_detected": 1,
             },
         },
     }]
@@ -1238,6 +1248,23 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
         canon_transactions.append({"id": out_id, "txn_date": f"{m}-10", "signed_amount_cents": -out_amt})
         canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
         canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
+    # Live pds_raw_transactions/pds_txn_entity_map: one txn per month (so
+    # n_total_months == 13), plus a "payroll" role txn in 4 of those months.
+    raw_txn_rows, txn_map_rows = [], []
+    for i, m in enumerate(months):
+        rid = f"r{i}"
+        raw_txn_rows.append({
+            "id": rid, "txn_date": f"{m}-05", "signed_amount_cents": 100000,
+            "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": rid, "role": "revenue_operational"})
+        if m in payroll_months:
+            pid = f"p{i}"
+            raw_txn_rows.append({
+                "id": pid, "txn_date": f"{m}-25", "signed_amount_cents": -80000,
+                "abs_amount_cents": 80000, "normalized_descriptor": "PAYROLL", "balance_cents": None,
+            })
+            txn_map_rows.append({"txn_id": pid, "role": "payroll"})
     tables = {
         "pds_deals": [{"company_name": "CrossYear Co", "currency": "KES", "analyst_notes": ""}],
         "pds_snapshots": [{
@@ -1255,8 +1282,8 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
         }],
         "pds_documents": document_rows,
         "pds_audited_financials": [],
-        "pds_raw_transactions": [],
-        "pds_txn_entity_map": [],
+        "pds_raw_transactions": raw_txn_rows,
+        "pds_txn_entity_map": txn_map_rows,
     }
     renderer._get_supabase = lambda: _FakeSupabase(tables)
 
@@ -1265,6 +1292,50 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     assert "3 of 13 months net-negative" in html
     assert "Payroll detected in 4 of 13 months" in html
     assert "of 12 months" not in html
+
+
+def test_irregular_payroll_pattern_absent_when_live_data_is_consistent():
+    """Inverse of the above: the cached blob says IRREGULAR (stale), but the
+    live pds_raw_transactions show payroll present in every one of 3 months
+    (CONSISTENT) — confirms the pattern card does NOT render, since a stale
+    cache asserting IRREGULAR must not override a live-consistent picture."""
+    months = ["2025-01", "2025-02", "2025-03"]
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {
+            "summary": {"total_transactions": len(months)},
+            "credit_scoring_inputs": {
+                "payroll_stability": "IRREGULAR",
+                "payroll_months_detected": 1,
+            },
+        },
+    }]
+    raw_txn_rows, txn_map_rows = [], []
+    for i, m in enumerate(months):
+        rid, pid = f"r{i}", f"p{i}"
+        raw_txn_rows.append({
+            "id": rid, "txn_date": f"{m}-05", "signed_amount_cents": 100000,
+            "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": rid, "role": "revenue_operational"})
+        raw_txn_rows.append({
+            "id": pid, "txn_date": f"{m}-25", "signed_amount_cents": -80000,
+            "abs_amount_cents": 80000, "normalized_descriptor": "PAYROLL", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": pid, "role": "payroll"})
+    tables = dict(_TABLES)
+    tables["pds_documents"] = document_rows
+    tables["pds_raw_transactions"] = raw_txn_rows
+    tables["pds_txn_entity_map"] = txn_map_rows
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Irregular payroll" not in html
+    assert "Payroll detected in" not in html
 
 
 # ── single source of truth: PDF vs live /analytics/monthly-cashflow ─────────
