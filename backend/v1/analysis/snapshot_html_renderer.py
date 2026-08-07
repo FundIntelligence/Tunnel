@@ -846,7 +846,16 @@ def render_snapshot_html(
     # denominator disagree on which data source is authoritative, silently
     # defeating the whole point of live-recomputing this section instead of
     # trusting a cache. See PAR-63 PR #110 review — caught before merge.
+    #
+    # PAR-100: payroll_months_active piggybacks on this same single pass so
+    # the "Irregular payroll" Observed Pattern card below (~line 1030) can
+    # share n_total_months as its denominator too, instead of pairing a
+    # cached pds_documents.analytics.credit_scoring_inputs numerator
+    # (populated once at ingestion, never refreshed) with this file's live
+    # period — the exact numerator/denominator cross-source split this
+    # section was already rebuilt to avoid for tax compliance.
     all_months_active: set = set()
+    payroll_months_active: set = set()
     for t in txns:
         m = (t["txn_date"] or "")[:7]
         if t["txn_date"] and _in_active_period(m):
@@ -854,9 +863,25 @@ def render_snapshot_html(
             if t["role"] in _TAX_ROLES and t["signed"] < 0:
                 tax_months_active.add(m)
                 tax_total_cents_active += t["abs"]
+            if t["role"] == "payroll":
+                payroll_months_active.add(m)
 
     n_tax_months   = len(tax_months_active)
     n_total_months = len(all_months_active)
+    n_payroll_months = len(payroll_months_active)
+
+    # Mirrors backend/v1/analytics.py::credit_scoring_inputs()'s own
+    # payroll_stability thresholds (consistent/mostly-consistent/irregular
+    # cutoffs) — same classification, recomputed live over this render's
+    # txns/active-period instead of read from the stale cached blob.
+    if n_total_months == 0 or n_payroll_months == 0:
+        payroll_stability_live = "NOT_DETECTED"
+    elif n_payroll_months == n_total_months:
+        payroll_stability_live = "CONSISTENT"
+    elif n_payroll_months >= n_total_months * 8 // 10:
+        payroll_stability_live = "MOSTLY_CONSISTENT"
+    else:
+        payroll_stability_live = "IRREGULAR"
 
     if n_total_months == 0:
         kra_compliance = "NOT_DETECTED"
@@ -1025,17 +1050,17 @@ def render_snapshot_html(
             })
             break
 
-    for cs in credit_scoring_inputs_list:
-        if cs.get("payroll_stability") == "IRREGULAR":
-            m_det = cs.get("payroll_months_detected") or 0
-            tag   = "Pattern"
-            patterns.append({
-                "name": "Irregular payroll",
-                "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-                "data_statement": f"Payroll detected in {m_det} of {len(period_months)} months",
-                "check_prompt": "→ Review: casual workforce or payroll routed off-statement?",
-            })
-            break
+    # PAR-100: payroll_stability_live/n_payroll_months/n_total_months are all
+    # computed above from the single live pass over txns (same block as Tax
+    # Compliance Analysis) — no cached credit_scoring_inputs field used here.
+    if payroll_stability_live == "IRREGULAR":
+        tag = "Pattern"
+        patterns.append({
+            "name": "Irregular payroll",
+            "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
+            "data_statement": f"Payroll detected in {n_payroll_months} of {n_total_months} months",
+            "check_prompt": "→ Review: casual workforce or payroll routed off-statement?",
+        })
 
     if len(neg_months) > 2:
         label_months = ", ".join(
