@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from typing import Iterator, List, Optional, Union
 
 import pdfplumber
+from pdfminer.pdfdocument import PDFPasswordIncorrect
 
 # Explicit word-grouping tolerances. Previously an implicit pdfplumber
 # default (`extract_words()` with no args) repeated ad hoc across ~10 bank
@@ -98,11 +99,44 @@ class NormalizedDocument:
         self.close()
 
 
-def parse_pdf(file_path: str) -> NormalizedDocument:
+class PDFLockedError(Exception):
+    """Raised by `parse_pdf()` when a PDF is encrypted and the supplied
+    password (or the absence of one) doesn't open it.
+
+    This is the one shared, bank-agnostic signal for "this file needs a
+    password" (PAR-69). Every `detect_*`/`extract_*` function already
+    routes through `parse_pdf()`/`as_document()`, so catching this in one
+    place at the router/dispatch layer covers every current and future
+    bank extractor — no per-bank password handling needed. NCBA's
+    "e-Statement Of Account" template is the first caller; PAR-14 (Co-op
+    Layout C) is expected to be the next.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        super().__init__(f"PDF is password-protected: {file_path}")
+
+
+def parse_pdf(file_path: str, password: Optional[str] = None) -> NormalizedDocument:
     """Open the PDF exactly once and eagerly extract per-page text (cheap).
     Returns a `NormalizedDocument` — use as a context manager to guarantee
-    the underlying file handle is closed."""
-    pdf = pdfplumber.open(file_path)
+    the underlying file handle is closed.
+
+    `password`, when given, is passed to pdfplumber for this open call
+    only — never stored, logged, or reused across calls. Raises
+    `PDFLockedError` if the file is encrypted and the password (or lack of
+    one) doesn't unlock it; callers that want to prompt the analyst for a
+    password should catch that specifically instead of treating it as a
+    generic parse failure.
+    """
+    try:
+        pdf = (
+            pdfplumber.open(file_path, password=password)
+            if password is not None
+            else pdfplumber.open(file_path)
+        )
+    except PDFPasswordIncorrect as exc:
+        raise PDFLockedError(file_path) from exc
     return NormalizedDocument(file_path, pdf)
 
 

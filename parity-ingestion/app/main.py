@@ -5,7 +5,9 @@ import uuid
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from typing import Optional
+
+from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 
 from app.analytics import run_analytics
@@ -13,6 +15,7 @@ from app.models import ExtractionResult
 from app.extractors.mpesa_extractor import extract_mpesa_csv
 from app.extractors.pdf_type_detector import is_scanned_pdf
 from app.extractors.docai_extractor import extract_with_docai
+from app.extractors.pdf_document import PDFLockedError
 from app.normaliser import normalise_all
 
 logger = logging.getLogger(__name__)
@@ -41,7 +44,7 @@ def health() -> dict:
 
 
 @app.post("/v1/ingest/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), password: Optional[str] = Form(None)):
     filename = file.filename or "upload"
     ext = Path(filename).suffix.lower()
 
@@ -59,22 +62,51 @@ async def upload(file: UploadFile = File(...)):
 
     try:
         if ext == ".pdf":
-            if is_scanned_pdf(str(dest)):
+            from app.extractors.router import (
+                route_extract,
+                PASSWORD_REQUIRED_RESPONSE,
+                PASSWORD_INCORRECT_RESPONSE,
+            )
+
+            # PAR-69: password is a per-request field, never persisted — not
+            # written to `dest`, `_results`, or any log line below. A locked
+            # PDF re-uploaded later must supply it again. `is_scanned_pdf`
+            # runs first (decides OCR vs. text routing) and needs the same
+            # password to even open a locked file, so it shares the same
+            # `PDFLockedError` signal `route_extract()` uses below.
+            try:
+                scanned = is_scanned_pdf(str(dest), password=password)
+            except PDFLockedError:
+                resp = PASSWORD_INCORRECT_RESPONSE if password else PASSWORD_REQUIRED_RESPONSE
+                raise HTTPException(status_code=401, detail=resp["message"])
+
+            if scanned:
                 result = extract_with_docai(str(dest), doc_id=result_id, filename=filename)
             else:
-                from app.extractors.router import route_extract
-
-                result = route_extract(str(dest))
+                result = route_extract(str(dest), password=password)
                 if isinstance(result, dict) and result.get("status") == "UNSUPPORTED_FORMAT":
                     raise HTTPException(
                         status_code=415,
                         detail=result.get("message", "Bank format not recognised."),
+                    )
+                if isinstance(result, dict) and result.get("status") in (
+                    "PASSWORD_REQUIRED",
+                    "PASSWORD_INCORRECT",
+                ):
+                    raise HTTPException(
+                        status_code=401,
+                        detail=result.get("message", "This PDF requires a password."),
                     )
         else:
             result = extract_mpesa_csv(str(dest))
         normalise_all(result)
         rows = result.normalised_transactions or []
         logger.info("[INGESTION] Parsed rows: %d", len(rows))
+    except HTTPException:
+        # Preserve the intended status code (415 unsupported, 401 password)
+        # instead of letting the generic handler below flatten it to a 500.
+        dest.unlink(missing_ok=True)
+        raise
     except Exception as exc:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
