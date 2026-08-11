@@ -37,4 +37,18 @@ jobs:
           set -euo pipefail
           DEPLOY_URL="$(vercel deploy --prod --yes --token=${{ secrets.VERCEL_TOKEN }})"
           echo "Deployed: $DEPLOY_URL"
-          vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }}
+          # Unlike parity-sme-staging (deploy-staging.yml), this project already
+          # has autoAssignCustomDomains enabled, so `vercel deploy --prod` alone
+          # already aliases parity-admin-three.vercel.app to the new deployment —
+          # confirmed live (PAR-146). `vercel promote` here is only a safety net
+          # in case that ever changes, so a 409 "already the current production
+          # deployment" is expected and not a real failure; only a different
+          # error should fail the job.
+          set +e
+          PROMOTE_OUTPUT="$(vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }} 2>&1)"
+          PROMOTE_EXIT=$?
+          set -e
+          echo "$PROMOTE_OUTPUT"
+          if [ "$PROMOTE_EXIT" -ne 0 ] && ! echo "$PROMOTE_OUTPUT" | grep -q "already the current production deployment"; then
+            exit "$PROMOTE_EXIT"
+          fi
