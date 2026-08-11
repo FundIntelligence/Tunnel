@@ -26,7 +26,6 @@ Any field change must be applied to all three.
 import json
 import logging
 import uuid
-import os
 from datetime import datetime, timezone
 from typing import Optional, List
 
@@ -38,6 +37,7 @@ from ..db.supabase_repositories import DealsRepo, SnapshotsRepo
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .auth import require_musa_api_key
 from .currency_utils import country_to_currency
+from .musa_deploy_config import API_BASE_URL
 from .musa_file_processor import process_musa_session
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ def _build_session_response(
 ) -> SessionResponse:
     """Build SessionResponse from database row"""
     if base_url is None:
-        base_url = os.getenv("API_BASE_URL", "https://parity-ingestion.onrender.com")
+        base_url = API_BASE_URL
     session_id = session_data["session_id"]
     status = session_data["status"]
 
