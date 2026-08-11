@@ -40,6 +40,7 @@ from ..db.supabase_repositories import (
 )
 from ..ingestion.service import IngestionService
 from .currency_utils import country_to_currency
+from .musa_deploy_config import API_BASE_URL, PARITY_FRONTEND_URL
 
 logger = logging.getLogger(__name__)
 
@@ -325,8 +326,7 @@ async def _notify_parser_request(
     Best-effort only: this must never affect musa_sessions state or the
     webhook Musa actually depends on.
     """
-    frontend_url = os.getenv("PARITY_FRONTEND_URL", "https://parity-sme-staging.vercel.app")
-    notify_url = f"{frontend_url.rstrip('/')}/api/request-parser"
+    notify_url = f"{PARITY_FRONTEND_URL}/api/request-parser"
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -513,8 +513,7 @@ async def process_musa_session(
             {"status": "complete", "completed_at": completed_at, "error_message": partial_note}
         ).eq("session_id", session_id).execute()
 
-        base_url = os.getenv("API_BASE_URL", "https://parity-ingestion.onrender.com")
-        pdf_url = f"{base_url}/v1/deals/{deal_id}/snapshot/pdf"
+        pdf_url = f"{API_BASE_URL}/v1/deals/{deal_id}/snapshot/pdf"
 
         logger.info(
             "[MUSA] Session complete session=%s pdf_url=%s partial=%s",
