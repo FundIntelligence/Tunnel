@@ -1,7 +1,15 @@
 import { getSupabaseStaging } from '@/lib/supabase-staging'
+import { requireAdminSession } from '@/lib/require-admin-session'
+import { isOntologyQaAllowed } from '@/lib/ontology-qa-access'
 import { NextResponse } from 'next/server'
 
 export async function GET() {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+  if (!isOntologyQaAllowed(session.email)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
   const supabase = getSupabaseStaging()
   const { data, error } = await supabase
     .from('pds_deals')

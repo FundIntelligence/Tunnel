@@ -1,4 +1,6 @@
 import { getSupabaseStaging } from '@/lib/supabase-staging'
+import { requireAdminSession } from '@/lib/require-admin-session'
+import { isOntologyQaAllowed } from '@/lib/ontology-qa-access'
 import { NextResponse } from 'next/server'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
@@ -53,6 +55,12 @@ async function fetchClassificationOverrides(supabase: SupabaseClient, txnIds: st
 }
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+  if (!isOntologyQaAllowed(session.email)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
   const { id } = await params
   const supabase = getSupabaseStaging()
 

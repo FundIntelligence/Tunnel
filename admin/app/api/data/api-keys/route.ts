@@ -1,7 +1,11 @@
 import { getSupabase } from '@/lib/supabase'
+import { requireAdminSession } from '@/lib/require-admin-session'
 import { NextResponse } from 'next/server'
 
 export async function GET() {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+
   const supabase = getSupabase()
   const { data, error } = await supabase
     .from('api_keys')

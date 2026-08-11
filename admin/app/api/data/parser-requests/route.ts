@@ -1,4 +1,5 @@
 import { getSupabase } from '@/lib/supabase'
+import { requireAdminSession } from '@/lib/require-admin-session'
 import { NextRequest, NextResponse } from 'next/server'
 
 // `parser_requests` ("auto" — Musa/GBFund failure paths, backend/v1/api.py:2355
@@ -8,6 +9,9 @@ import { NextRequest, NextResponse } from 'next/server'
 // form-submitted request is invisible here regardless of whether it was
 // stored correctly (PAR-45).
 export async function GET() {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+
   const supabase = getSupabase()
 
   const [autoResult, manualResult] = await Promise.all([
@@ -32,6 +36,9 @@ export async function GET() {
 }
 
 export async function PATCH(request: NextRequest) {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+
   const supabase = getSupabase()
   const { id, status } = await request.json()
   const { error } = await supabase

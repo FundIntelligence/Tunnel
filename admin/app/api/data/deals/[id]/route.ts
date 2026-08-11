@@ -1,7 +1,11 @@
 import { getSupabase } from '@/lib/supabase'
+import { requireAdminSession } from '@/lib/require-admin-session'
 import { NextRequest, NextResponse } from 'next/server'
 
 export async function GET(_: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const session = await requireAdminSession()
+  if (session instanceof NextResponse) return session
+
   const supabase = getSupabase()
   const { id } = await params
   const [dealRes, docsRes, runsRes] = await Promise.all([
