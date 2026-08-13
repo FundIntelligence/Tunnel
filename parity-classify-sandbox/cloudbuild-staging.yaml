@@ -1,0 +1,48 @@
+# PAR-132: staging-only deploy for the isolated classify sandbox service.
+# No cloudbuild-prod.yaml exists yet on purpose — this pass is staging only.
+#
+# Build context is the repo root (not `dir: parity-classify-sandbox`, unlike
+# backend/cloudbuild-staging.yaml) because the Dockerfile also needs
+# backend/v1/{core,integrations,db} — see Dockerfile for which files.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - parity-classify-sandbox/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tunnel/parity-classify-sandbox:$COMMIT_SHA
+      - .
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tunnel/parity-classify-sandbox:$COMMIT_SHA
+
+  # First deploy must be `gcloud run deploy` (service doesn't exist yet) with
+  # env vars set once; subsequent CI runs can switch to `services update`
+  # (image only) the same way backend/cloudbuild-staging.yaml does, once the
+  # service + its SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are provisioned.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - parity-classify-sandbox
+      - --platform=managed
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tunnel/parity-classify-sandbox:$COMMIT_SHA
+      - --region=us-central1
+      - --memory=512Mi
+      - --cpu=1
+      - --timeout=30
+      - --concurrency=40
+      - --min-instances=0
+      - --max-instances=2
+      - --allow-unauthenticated
+      - --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tunnel/parity-classify-sandbox:$COMMIT_SHA
