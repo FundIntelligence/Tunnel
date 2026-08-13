@@ -44,24 +44,65 @@ from drifting apart.
 
 ## Supabase project
 
-This pass targets the already-provisioned `parity-staging` Supabase project
-(`kstuensfekanfberjubz`) — migration 027 and `increment_api_key_usage()` are
-already live there. The separate, pre-seeded isolated Supabase project
-referenced in the PAR-132 decision doc (`kmgggdrpfsxtvyhjqncy`) could not be
-confirmed: it doesn't appear in this Supabase account's project list and
-`get_project` on it returns a bare permission error rather than a clear
-not-found, for the second session in a row. It may exist under different
-account credentials (PAR-58, the ticket that would have created it, is still
-in Backlog / never started per Linear's own history) — if so, re-point
-`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` at it once someone with access to
-that project can confirm it's the intended target.
+**Current target: ParitySandbox (`vksrelnjoejzqkiwqano`)**, a dedicated
+isolated project under the ParityBenchmark org — created by Weever to
+replace both the unreachable `kmgggdrpfsxtvyhjqncy` (PAR-58's original,
+never-confirmed reference) and the `parity-staging` substitution this
+service ran against for one pass while that was unresolved.
+
+**History, so this doesn't get re-litigated:**
+1. PAR-132's decision doc named `kmgggdrpfsxtvyhjqncy` as already
+   seeded/unused. Two sessions running confirmed it's not reachable under
+   the connected Supabase account (`list_projects` doesn't show it,
+   `get_project` returns a bare permission error) — and PAR-58, the ticket
+   that would have created it, was still Backlog/never-started per Linear.
+2. First pass of this PR substituted `parity-staging` (`kstuensfekanfberjubz`)
+   as the target rather than block indefinitely, since migration 027 /
+   `increment_api_key_usage()` were already live there.
+3. Weever then provisioned `vksrelnjoejzqkiwqano` under ParityBenchmark for
+   real, confirming this is the intended long-term isolated project — not
+   a third substitution. **This service is wired to it now**, via its own
+   `migrations/001_create_sandbox_api_keys.sql` (fresh table, RLS enabled
+   at creation — not parity-staging's copy) and its own
+   `SANDBOX_SUPABASE_URL`/`SANDBOX_SUPABASE_SERVICE_ROLE_KEY`/
+   `SANDBOX_DATABASE_URL` env vars (see below) — `parity-staging` and the
+   main backend are untouched by this change.
+4. **Still unverified as of this writing** (Supabase MCP is connected to
+   org "Parity" only — it cannot see ParityBenchmark/`vksrelnjoejzqkiwqano`
+   at all, same org-scope gap as before, now confirmed against the new ref
+   too): that the migration actually applies cleanly against a live
+   `vksrelnjoejzqkiwqano`, that RLS is actually enabled once applied, and
+   that the 5-test suite passes against real (not mocked) rows. Someone
+   with MCP/dashboard access to ParityBenchmark needs to confirm these
+   before this is production-ready — see PR discussion.
+
+**On the migration-apply mechanism** (PAR-142, "CI-apply-on-merge"): that
+ticket is still Backlog/unbuilt — there is no CI workflow in this repo that
+applies `*.sql` migrations on merge, for either backend or this service.
+The only mechanism that actually exists is the boot-time self-healing
+migrator backend/ already uses (re-runs every `IF NOT EXISTS`-guarded file
+on cold start); `app/db/migrator.py` mirrors that exactly, scoped to this
+service's own `migrations/` dir and its own `SANDBOX_DATABASE_URL`. This
+means the migration is applied by the service's own startup, not by a
+human or agent running SQL by hand against the dashboard — but it is not
+the CI-gated mechanism PAR-142 envisions, because that doesn't exist yet.
+Worth raising back on PAR-142 itself.
+
+## Env vars
+
+| Var | Purpose |
+|---|---|
+| `SANDBOX_SUPABASE_URL` | ParitySandbox project URL — mapped onto the shared `SUPABASE_URL` inside this process only (`app/config.py`), so `v1.integrations.auth`/`v1.db.supabase_client` can be reused unmodified from `backend/` without touching that shared code or the main backend's own `SUPABASE_URL`. |
+| `SANDBOX_SUPABASE_SERVICE_ROLE_KEY` | Same mapping, onto `SUPABASE_SERVICE_ROLE_KEY`. |
+| `SANDBOX_DATABASE_URL` | Direct Postgres connection string for `app/db/migrator.py` (distinct from backend's `DATABASE_URL` on purpose). |
 
 ## Local dev
 
 ```bash
 cd parity-classify-sandbox
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... .venv/bin/uvicorn app.main:app --reload --port 8080
+SANDBOX_SUPABASE_URL=... SANDBOX_SUPABASE_SERVICE_ROLE_KEY=... SANDBOX_DATABASE_URL=... \
+  .venv/bin/uvicorn app.main:app --reload --port 8080
 ```
 
 ## Tests

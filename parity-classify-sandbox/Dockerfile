@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY parity-classify-sandbox/app ./app
 COPY parity-classify-sandbox/tests ./tests
+COPY parity-classify-sandbox/migrations ./migrations
 
 # Only the core-engine + scoped-auth slice of backend/v1 this service
 # actually imports (classifier.py, metrics_engine.py, integrations/auth.py,
