@@ -1,0 +1,102 @@
+# Apply backend/migrations/*.sql to parity-staging on merge (PAR-142).
+#
+# Closes the gap PAR-142 found: migration 027 landed on staging via a raw,
+# unannotated SQL replay outside any CI path, because no automated path
+# existed at all -- the tracking table alone (schema_migrations) had already
+# proven insufficient, since a direct psql/dashboard connection can bypass it
+# entirely. This workflow is the other half: an actual apply-on-merge step,
+# so there's no reason left to reach for raw SQL by hand.
+#
+# Tracking: public.backend_migrations_applied (filename PK) records what's
+# been applied, by filename, so re-runs are idempotent -- only new files in
+# backend/migrations/ get applied. Migrations 008-027 were backfilled into
+# this table as already-applied (they were live on staging before this gate
+# existed); see the table comment in Supabase for the full note.
+#
+# backend/migrations/*.sql files are NOT idempotent (plain ALTER/CREATE, no
+# IF NOT EXISTS guards) -- on purpose, so a real error here should fail loud,
+# not be silently swallowed. See backend/migrations/README.md for the process
+# this enforces: migrations only ever reach staging through this workflow.
+
+name: Apply backend migrations
+
+on:
+  push:
+    branches:
+      - paritystaging
+    paths:
+      - 'backend/migrations/**.sql'
+  workflow_dispatch: {}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo apt-get install -y curl ca-certificates
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Validate secret present
+        run: |
+          if [ -z "$STAGING_DB_URL" ]; then
+            echo "::error::STAGING_DB_URL secret is missing."
+            exit 1
+          fi
+        env:
+          STAGING_DB_URL: ${{ secrets.STAGING_DB_URL }}
+
+      - name: Ensure tracking table exists
+        env:
+          PGSSLMODE: require
+        run: |
+          /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 <<'SQL'
+            create table if not exists public.backend_migrations_applied (
+              filename text primary key,
+              applied_at timestamptz not null default now(),
+              applied_by text not null default 'ci'
+            );
+          SQL
+
+      # Each file applies in its own transaction, immediately followed by
+      # its own tracking-row insert in the SAME transaction -- so a failed
+      # migration can never be recorded as applied, and a successful one
+      # can never be silently skipped as unapplied. Loop stops (set -e) on
+      # the first real failure so a human has to look at it, rather than
+      # applying files 3-10 while file 2 quietly failed.
+      - name: Apply new migrations
+        env:
+          PGSSLMODE: require
+        run: |
+          set -euo pipefail
+          APPLIED_ANY=0
+          for f in $(ls backend/migrations/*.sql | sort); do
+            name="$(basename "$f")"
+            already=$(/usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -tAc \
+              "select 1 from public.backend_migrations_applied where filename = '${name}'")
+            if [ "$already" = "1" ]; then
+              echo "skip (already applied): $name"
+              continue
+            fi
+            echo "applying: $name"
+            /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 <<SQL
+              begin;
+              \i $f
+              insert into public.backend_migrations_applied (filename, applied_by)
+                values ('${name}', 'ci-run-${{ github.run_id }}');
+              commit;
+SQL
+            echo "applied: $name"
+            APPLIED_ANY=1
+          done
+          if [ "$APPLIED_ANY" = "0" ]; then
+            echo "No new migrations to apply."
+          fi
