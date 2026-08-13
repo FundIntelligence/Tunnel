@@ -58,13 +58,13 @@ jobs:
         env:
           PGSSLMODE: require
         run: |
-          /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 <<'SQL'
+          /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 -c "
             create table if not exists public.backend_migrations_applied (
               filename text primary key,
               applied_at timestamptz not null default now(),
               applied_by text not null default 'ci'
             );
-          SQL
+          "
 
       # Each file applies in its own transaction, immediately followed by
       # its own tracking-row insert in the SAME transaction -- so a failed
@@ -87,13 +87,15 @@ jobs:
               continue
             fi
             echo "applying: $name"
-            /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 <<SQL
-              begin;
-              \i $f
-              insert into public.backend_migrations_applied (filename, applied_by)
-                values ('${name}', 'ci-run-${{ github.run_id }}');
-              commit;
-SQL
+            wrapper="$(mktemp)"
+            {
+              echo "begin;"
+              echo "\\i $f"
+              printf "insert into public.backend_migrations_applied (filename, applied_by) values ('%s', 'ci-run-%s');\n" "$name" "${{ github.run_id }}"
+              echo "commit;"
+            } > "$wrapper"
+            /usr/lib/postgresql/17/bin/psql "${{ secrets.STAGING_DB_URL }}" -v ON_ERROR_STOP=1 -f "$wrapper"
+            rm -f "$wrapper"
             echo "applied: $name"
             APPLIED_ANY=1
           done
