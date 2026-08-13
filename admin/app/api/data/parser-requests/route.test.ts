@@ -3,10 +3,10 @@ import { NextResponse } from 'next/server'
 import type { AdminSession } from '@/lib/require-admin-session'
 
 const autoRows = [
-  { id: 'a1', partner: 'musa', bank_name: 'KCB', status: 'pending', requested_at: '2026-07-01T00:00:00Z' },
+  { id: 'a1', partner: 'musa', bank_name: 'KCB', status: 'pending', requested_at: '2026-07-01T00:00:00Z', storage_path: null },
 ]
 const manualRows = [
-  { id: 'm1', bank_name: 'Stanbic', original_filename: 'stanbic.pdf', created_at: '2026-07-02T00:00:00Z' },
+  { id: 'm1', bank_name: 'Stanbic', original_filename: 'stanbic.pdf', created_at: '2026-07-02T00:00:00Z', storage_path: 'm1/stanbic.pdf' },
 ]
 
 function makeQuery(table: 'parser_requests' | 'pds_parser_requests') {
@@ -21,9 +21,16 @@ function makeQuery(table: 'parser_requests' | 'pds_parser_requests') {
 
 const fromMock = vi.fn((table: string) => makeQuery(table as 'parser_requests' | 'pds_parser_requests'))
 const requireAdminSessionMock = vi.fn<() => Promise<AdminSession | NextResponse>>(async () => ({ email: 'kwatukham@gmail.com' }))
+const createSignedUrlMock = vi.fn(async (path: string) => ({
+  data: { signedUrl: `https://staging.supabase.co/storage/v1/object/sign/parser-requests/${path}?token=fresh` },
+  error: null,
+}))
 
 vi.mock('@/lib/supabase', () => ({
-  getSupabase: () => ({ from: fromMock }),
+  getSupabase: () => ({
+    from: fromMock,
+    storage: { from: () => ({ createSignedUrl: createSignedUrlMock }) },
+  }),
 }))
 
 vi.mock('@/lib/require-admin-session', () => ({
@@ -33,6 +40,7 @@ vi.mock('@/lib/require-admin-session', () => ({
 describe('GET /api/data/parser-requests', () => {
   beforeEach(() => {
     fromMock.mockClear()
+    createSignedUrlMock.mockClear()
     requireAdminSessionMock.mockClear()
     requireAdminSessionMock.mockImplementation(async () => ({ email: 'kwatukham@gmail.com' }))
   })
@@ -47,14 +55,21 @@ describe('GET /api/data/parser-requests', () => {
     expect(fromMock).not.toHaveBeenCalled()
   })
 
-  it('queries both parser_requests (auto) and pds_parser_requests (manual)', async () => {
+  it('queries both parser_requests (auto) and pds_parser_requests (manual), signing storage_path fresh', async () => {
     const { GET } = await import('./route')
     const res = await GET()
     const body = await res.json()
 
     expect(fromMock).toHaveBeenCalledWith('parser_requests')
     expect(fromMock).toHaveBeenCalledWith('pds_parser_requests')
-    expect(body).toEqual({ auto: autoRows, manual: manualRows })
+    // PAR-145: no storage_path -> signed_url: null, never a stale stored URL
+    expect(body.auto).toEqual([{ ...autoRows[0], signed_url: null }])
+    // storage_path present -> signed fresh on this request, not read from a column
+    expect(createSignedUrlMock).toHaveBeenCalledWith('m1/stanbic.pdf', 36000)
+    expect(body.manual).toEqual([{
+      ...manualRows[0],
+      signed_url: 'https://staging.supabase.co/storage/v1/object/sign/parser-requests/m1/stanbic.pdf?token=fresh',
+    }])
   })
 
   it('returns 500 if the auto (parser_requests) query errors', async () => {

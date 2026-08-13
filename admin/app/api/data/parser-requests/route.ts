@@ -1,5 +1,6 @@
 import { getSupabase } from '@/lib/supabase'
 import { requireAdminSession } from '@/lib/require-admin-session'
+import { signParserRequestPaths } from '@/lib/parser-requests-signed-urls'
 import { NextRequest, NextResponse } from 'next/server'
 
 // `parser_requests` ("auto" — Musa/GBFund failure paths, backend/v1/api.py:2355
@@ -32,7 +33,16 @@ export async function GET() {
     return NextResponse.json({ error: manualResult.error.message }, { status: 500 })
   }
 
-  return NextResponse.json({ auto: autoResult.data, manual: manualResult.data })
+  // `storage_path` (both tables) points into Parity's own `parser-requests`
+  // Storage bucket — PAR-145: sign it fresh on every read instead of ever
+  // persisting a URL, so the link is never older than this response. Rows
+  // with no storage_path (nothing was ever uploaded) get signed_url: null.
+  const [auto, manual] = await Promise.all([
+    signParserRequestPaths(supabase, autoResult.data ?? []),
+    signParserRequestPaths(supabase, manualResult.data ?? []),
+  ])
+
+  return NextResponse.json({ auto, manual })
 }
 
 export async function PATCH(request: NextRequest) {
