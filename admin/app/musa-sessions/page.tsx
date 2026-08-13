@@ -265,15 +265,26 @@ export default function MusaSessionsPage() {
                                   {docUrls.length === 0 ? (
                                     <span style={{ color: 'var(--t3)' }}>—</span>
                                   ) : (
-                                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                                      {docUrls.map((url, urlIdx) => (
-                                        <li key={urlIdx}>
-                                          <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--teal)' }}>
-                                            {url}
-                                          </a>
-                                        </li>
-                                      ))}
-                                    </ul>
+                                    <>
+                                      <ul style={{ margin: 0, paddingLeft: 18 }}>
+                                        {docUrls.map((url, urlIdx) => (
+                                          <li key={urlIdx}>
+                                            <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--teal)' }}>
+                                              {url}
+                                            </a>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                      {/* PAR-145: these are Musa's own presigned URLs, captured verbatim from
+                                          their session-creation request — Parity never takes ownership of that
+                                          storage, so unlike Parser Requests' storage_path there is no credential
+                                          Parity holds to mint a fresh one. Once Musa's own expiry passes, this
+                                          link is gone for good; that's expected, not an admin bug. */}
+                                      <div style={{ fontSize: 11, color: 'var(--t3)', marginTop: 4 }}>
+                                        External links from Musa&apos;s own storage — expire independently on
+                                        their side and can&apos;t be refreshed by Parity.
+                                      </div>
+                                    </>
                                   )}
                                 </div>
 
