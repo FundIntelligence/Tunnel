@@ -67,26 +67,31 @@ service ran against for one pass while that was unresolved.
    `SANDBOX_SUPABASE_URL`/`SANDBOX_SUPABASE_SERVICE_ROLE_KEY`/
    `SANDBOX_DATABASE_URL` env vars (see below) — `parity-staging` and the
    main backend are untouched by this change.
-4. **Still unverified as of this writing** (Supabase MCP is connected to
-   org "Parity" only — it cannot see ParityBenchmark/`vksrelnjoejzqkiwqano`
-   at all, same org-scope gap as before, now confirmed against the new ref
-   too): that the migration actually applies cleanly against a live
-   `vksrelnjoejzqkiwqano`, that RLS is actually enabled once applied, and
-   that the 5-test suite passes against real (not mocked) rows. Someone
-   with MCP/dashboard access to ParityBenchmark needs to confirm these
-   before this is production-ready — see PR discussion.
+4. **Verified 2026-08-17** (once the Supabase connector was reconnected with
+   ParityBenchmark authorized): `001_create_sandbox_api_keys.sql` is applied,
+   `api_keys` matches PAR-130's schema exactly, RLS is genuinely active
+   (`rowsecurity=true`), and the 5-test suite passes against real rows.
+   `pg_policies` is empty for this table by design (service-role-only access
+   — anon/authenticated get deny-all) — confirm with Weever this is the
+   intended permanent posture before adding policies. Full detail on PAR-132.
 
-**On the migration-apply mechanism** (PAR-142, "CI-apply-on-merge"): that
-ticket is still Backlog/unbuilt — there is no CI workflow in this repo that
-applies `*.sql` migrations on merge, for either backend or this service.
-The only mechanism that actually exists is the boot-time self-healing
-migrator backend/ already uses (re-runs every `IF NOT EXISTS`-guarded file
-on cold start); `app/db/migrator.py` mirrors that exactly, scoped to this
-service's own `migrations/` dir and its own `SANDBOX_DATABASE_URL`. This
-means the migration is applied by the service's own startup, not by a
-human or agent running SQL by hand against the dashboard — but it is not
-the CI-gated mechanism PAR-142 envisions, because that doesn't exist yet.
-Worth raising back on PAR-142 itself.
+**On the migration-apply mechanism** (PAR-164): this service's boot-time
+migrator (`app/db/migrator.py`) was removed 2026-08-17, mirroring PAR-164's
+fix on the main backend — it had the identical hang risk (`psycopg2.connect()`
+with no `connect_timeout`, called in `lifespan()` before the app served
+traffic; on the main backend this produced an indefinite hang against
+Supabase's IPv6-only direct-connection host under Cloud Run's IPv4-only
+egress, killed by the health check before anything logged).
+
+**Unlike the main backend, PAR-142's CI-apply-on-merge gate
+(`.github/workflows/apply-backend-migrations.yml`) does not cover this
+service** — it only applies `backend/migrations/**.sql` to `parity-staging`.
+Migration 001 was applied by hand this session (`apply_migration` against
+`vksrelnjoejzqkiwqano`), not via any automated path. There is currently no
+automated way to apply a future `migrations/*.sql` file in this directory —
+that gap needs its own ticket (extend the PAR-142 workflow to this service's
+migrations dir + `SANDBOX_DATABASE_URL`, or accept manual apply as the
+permanent process) before adding a second migration file here.
 
 ## Env vars
 
@@ -94,7 +99,6 @@ Worth raising back on PAR-142 itself.
 |---|---|
 | `SANDBOX_SUPABASE_URL` | ParitySandbox project URL — mapped onto the shared `SUPABASE_URL` inside this process only (`app/config.py`), so `v1.integrations.auth`/`v1.db.supabase_client` can be reused unmodified from `backend/` without touching that shared code or the main backend's own `SUPABASE_URL`. |
 | `SANDBOX_SUPABASE_SERVICE_ROLE_KEY` | Same mapping, onto `SUPABASE_SERVICE_ROLE_KEY`. |
-| `SANDBOX_DATABASE_URL` | Direct Postgres connection string for `app/db/migrator.py` (distinct from backend's `DATABASE_URL` on purpose). |
 
 ## Local dev
 

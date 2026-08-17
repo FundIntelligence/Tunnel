@@ -9,7 +9,6 @@ scoping: POST /v1/classify.
 """
 import logging
 
-from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -18,7 +17,6 @@ from pydantic import BaseModel, Field
 
 from . import backend_path  # noqa: F401  (import order matters: sys.path must be patched first)
 from .config import bootstrap_sandbox_supabase_env
-from .db.migrator import run_pending_migrations
 from .usage import find_active_key_row, increment_usage_or_none
 from v1.core.classifier import classify_with_reason
 from v1.integrations.auth import require_scoped_api_key
@@ -31,17 +29,10 @@ _SCOPE = "sandbox-classify"
 bootstrap_sandbox_supabase_env()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    run_pending_migrations()
-    yield
-
-
 app = FastAPI(
     title="Parity Classify Sandbox",
     description="Isolated external sandbox: POST /v1/classify only.",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 
