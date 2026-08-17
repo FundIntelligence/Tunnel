@@ -27,7 +27,12 @@
 -- the shape app/usage.py's `rows[0] if rows else None` already expects.
 -- No caller code changes needed; only the function's return-type
 -- declaration changes. Function body is otherwise identical to 027's.
-create or replace function increment_api_key_usage(p_key_id uuid)
+-- CREATE OR REPLACE cannot change a function's return type (Postgres
+-- error 42P13: "cannot change return type of existing function") -- the
+-- old `returns public.api_keys` declaration must be dropped first.
+drop function if exists increment_api_key_usage(uuid);
+
+create function increment_api_key_usage(p_key_id uuid)
 returns setof public.api_keys
 language sql
 set search_path = public

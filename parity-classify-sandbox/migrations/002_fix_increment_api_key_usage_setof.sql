@@ -14,7 +14,15 @@
 -- `returns setof public.api_keys` makes a zero-row match return a
 -- genuinely empty result set, matching what the existing Python caller
 -- already expects. No caller code changes needed.
-create or replace function increment_api_key_usage(p_key_id uuid)
+-- CREATE OR REPLACE cannot change a function's return type (Postgres
+-- error 42P13: "cannot change return type of existing function") -- the
+-- old `returns public.api_keys` declaration must be dropped first.
+-- (Applied live against vksrelnjoejzqkiwqano via this exact drop+create
+-- shape after CREATE OR REPLACE hit that error -- keeping the file in
+-- sync with what actually ran.)
+drop function if exists increment_api_key_usage(uuid);
+
+create function increment_api_key_usage(p_key_id uuid)
 returns setof public.api_keys
 language sql
 set search_path = public
