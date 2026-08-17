@@ -120,14 +120,18 @@ class IngestionService:
         }
         self.documents_repo.create_document(document)
 
-        # Persist rows (abs_amount_cents is already computed by the parser —
-        # NOT a DB-generated column despite the old assumption here; popping
-        # it left every transaction's abs_amount_cents permanently NULL,
-        # silently zeroing outflow composition and loan activity totals
-        # platform-wide. See migration backfilling existing NULL rows.)
+        # Persist rows. abs_amount_cents is GENERATED ALWAYS ... STORED on
+        # prod (supabase/migrations/002_pds_v1.sql, 003_pds_v1_prefixed.sql)
+        # — Postgres rejects any explicit value for it (PAR-160). It is a
+        # plain writable column on staging, which is what PR #61 verified
+        # against; that verification didn't hold on prod. Popping it here
+        # does NOT reintroduce PR #61's NULL-abs_amount_cents display bug —
+        # snapshot_html_renderer.py already derives abs from
+        # signed_amount_cents when the stored value is NULL.
         for r in rows:
             r["document_id"] = document_id
             r["deal_id"] = deal_id
+            r.pop("abs_amount_cents", None)
 
         db_insert_start = time.perf_counter()
         logger.info("[DB INSERT] Rows to insert: %d", len(rows))
@@ -242,6 +246,7 @@ class IngestionService:
             for r in rows:
                 r["document_id"] = document_id
                 r["deal_id"] = deal_id
+                r.pop("abs_amount_cents", None)
 
             stage = STAGE_DB_INSERT_START
             logger.info("[INGEST] stage=%s rows=%d", stage, len(rows))
