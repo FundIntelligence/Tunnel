@@ -5,7 +5,7 @@ from ..config import SCHEMA_VERSION, CONFIG_VERSION
 from ..parsing.common import canonical_hash
 from .transfer_matcher import match_transfers
 from .entities import build_entities
-from .classifier import classify
+from .classifier import classify_with_reason, compute_relative_large_positive_threshold_cents
 from .anomaly_detector import annotate_anomalies
 from .metrics_engine import compute_metrics
 from .confidence_engine import compute_override_penalty_bp, finalize_confidence
@@ -29,9 +29,17 @@ def run_pipeline(
     entities, txn_entity_map, entities_hash = build_entities(deal_id, txs)
 
     # Step 3: classify
+    # PAR-89: compute the per-deal relative large-positive threshold once
+    # (not per transaction) — see compute_relative_large_positive_threshold_cents
+    # for the method and fallback conditions.
+    large_positive_threshold_cents, median_txn_abs_cents = compute_relative_large_positive_threshold_cents(txs)
     txn_entity_records = []
     for tx in txs:
-        role = classify(tx)
+        role, role_reason = classify_with_reason(
+            tx,
+            large_positive_threshold_cents=large_positive_threshold_cents,
+            median_txn_abs_cents=median_txn_abs_cents,
+        )
         tx["role"] = role
         txn_entity_records.append(
             {
@@ -40,6 +48,7 @@ def run_pipeline(
                 "entity_id": txn_entity_map[tx["txn_id"]],
                 "role": role,
                 "role_version": "v1_rules",
+                "role_reason": role_reason,
             }
         )
 
@@ -76,11 +85,13 @@ def run_pipeline(
         "missing_month_penalty_bp": metrics["missing_month_penalty_bp"],
         "override_penalty_bp": override_penalty_bp,
         "reconciliation_status": metrics["reconciliation_status"],
+        "reconciliation_state": metrics["reconciliation_state"],
         "reconciliation_pct_bp": metrics["reconciliation_bp"],
         "base_confidence_bp": metrics["base_confidence_bp"],
         "final_confidence_bp": confidence["final_confidence_bp"],
         "tier": confidence["tier"],
         "tier_capped": confidence["tier_capped"],
+        "coverage_tier": confidence["coverage_tier"],
         "raw_transaction_hash": canonical_hash(sorted(txs, key=lambda t: t["txn_id"])),
         "transfer_links_hash": transfer_links_hash,
         "entities_hash": entities_hash,

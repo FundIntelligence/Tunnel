@@ -507,12 +507,23 @@ def _extract_metadata(pdf) -> Dict[str, Any]:
     if financial_year_end is None:
         financial_year_end = _date(financial_year, 12, 31)
 
+    # Currency: the cover page rarely states it — audited financial statements
+    # typically declare it in a later accounting-policy note ("Basis of
+    # preparation") or an explicit currency note, not on page 1. Fall through to
+    # the rest of the document, page by page, stopping at the first hit.
+    currency = detect_currency(raw_text)
+    if currency is None:
+        for page in pdf.pages[1:]:
+            currency = detect_currency(page.extract_text() or "")
+            if currency:
+                break
+
     return {
         "company_name": company_name,
         "financial_year": financial_year,
         "financial_year_start": _date(financial_year, 1, 1).isoformat(),
         "financial_year_end": financial_year_end.isoformat(),
-        "currency": detect_currency(raw_text),
+        "currency": currency,
         "auditor_name": None,
     }
 
@@ -853,7 +864,26 @@ def extract_audited_financials_from_ocr(pdf_path: str) -> Dict[str, Any]:
         "extraction_method": "tesseract_ocr",
     }
 
-    result["extraction_confidence"] = _calculate_confidence(result)
+    try:
+        result["extraction_confidence"] = _calculate_confidence(result)
+    except TypeError as exc:
+        # _calculate_confidence assumes that if a field key is present, its
+        # value is a real number — true for the coordinate path (required
+        # fields are validated before this is ever called), not true here:
+        # OCR always sets every key, with None on a failed regex match. A
+        # missing match (e.g. "profit before tax" / "tax expense" not found
+        # in the OCR text) reaches an arithmetic check on None and raises.
+        # Fail the same way total OCR failure already does above, rather
+        # than letting this surface as an unhandled crash.
+        logger.error(
+            "[OCR] Confidence calculation failed — required fields not found "
+            "in OCR text (%s)", exc,
+        )
+        return {
+            "extraction_method": "tesseract_ocr",
+            "extraction_confidence": Decimal("0"),
+            "sha256_hash": _sha256({}),
+        }
     result["sha256_hash"] = _sha256(result)
 
     logger.info(

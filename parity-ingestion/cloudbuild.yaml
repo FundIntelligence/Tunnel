@@ -1,0 +1,23 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/parity-ingestion', '.']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/parity-ingestion']
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - parity-ingestion
+      - --image=gcr.io/$PROJECT_ID/parity-ingestion
+      - --region=us-central1
+      - --platform=managed
+      - --memory=2Gi
+      - --cpu=2
+      - --allow-unauthenticated
+      - --timeout=600
+      - --concurrency=10
+      - --min-instances=0
+      - --max-instances=3

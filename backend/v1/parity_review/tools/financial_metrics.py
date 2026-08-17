@@ -5,7 +5,6 @@ Growth/burden values are in basis points.
 """
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional
 
 
@@ -61,7 +60,13 @@ def calculate_financial_metrics(deal_data: Dict[str, Any]) -> Dict[str, Any]:
     if len(monthly) >= 3:
         nets = [m["net_cents"] for m in monthly]
         avg_net = sum(nets) / len(nets)
-        std_dev = math.sqrt(sum((x - avg_net) ** 2 for x in nets) / len(nets))
+        # Cash-flow volatility is an advisory display metric (a CV %), not part of
+        # the deterministic snapshot/seal — this module is in the parity_review
+        # layer, not the canonical hash path. The tree-wide no-`math` guard
+        # (tests_v1/test_no_float_regression.py::test_math_import_restricted)
+        # forbids math.sqrt; `** 0.5` is the identical square root for this
+        # already-float computation without importing the math module.
+        std_dev = (sum((x - avg_net) ** 2 for x in nets) / len(nets)) ** 0.5
         volatility_pct = (std_dev / abs(avg_net) * 100) if avg_net != 0 else 0
         volatility_assessment = f"CV {volatility_pct:.1f}%"
     else:

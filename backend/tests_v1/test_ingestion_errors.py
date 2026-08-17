@@ -64,7 +64,7 @@ class TestIngestionErrors(unittest.TestCase):
         self.assertEqual(status.json()["status"], "completed", status.json())
 
     def test_b_minimal_valid_pds_fails_schema_validation(self):
-        """Fixture B: canonical PDS format has different schema → SchemaValidationError."""
+        """Fixture B: canonical PDS format has different schema → InvalidSchemaError."""
         deal = self._new_deal()
         content = _read_fixture("minimal_valid_pds.csv")
         resp = self.client.post(
@@ -77,7 +77,10 @@ class TestIngestionErrors(unittest.TestCase):
         self.assertEqual(status.status_code, 200)
         data = status.json()
         self.assertEqual(data["status"], "failed", data)
-        self.assertEqual(data.get("error_type"), "SchemaValidationError", data)
+        # The ingestion path raises InvalidSchemaError (parsing/errors.py) and
+        # reports it verbatim as error_type (ingestion/service.py:331).
+        # SchemaValidationError (errors.py) is a separate class not used here.
+        self.assertEqual(data.get("error_type"), "InvalidSchemaError", data)
         self.assertIn("Missing required", data.get("error_message", ""))
         self.assertIn(data.get("stage"), ("SCHEMA_VALIDATED", "PARSE_START", "PARSE_DONE"))
         self.assertEqual(data.get("next_action"), "fix_csv_header")
@@ -97,7 +100,7 @@ class TestIngestionErrors(unittest.TestCase):
         self.assertEqual(status.json()["status"], "completed", status.json())
 
     def test_d_bad_schema_missing_amount_explicit_error(self):
-        """Fixture D: missing amount column → SchemaValidationError with explicit message."""
+        """Fixture D: missing amount column → InvalidSchemaError with explicit message."""
         deal = self._new_deal()
         content = _read_fixture("bad_schema_missing_amount.csv")
         resp = self.client.post(
@@ -110,7 +113,7 @@ class TestIngestionErrors(unittest.TestCase):
         self.assertEqual(status.status_code, 200)
         data = status.json()
         self.assertEqual(data["status"], "failed", data)
-        self.assertEqual(data.get("error_type"), "SchemaValidationError", data)
+        self.assertEqual(data.get("error_type"), "InvalidSchemaError", data)
         self.assertIn("amount", data.get("error_message", "").lower())
         self.assertIn(data.get("stage"), ("SCHEMA_VALIDATED", "PARSE_DONE", "PARSE_START"))
         self.assertEqual(data.get("next_action"), "fix_csv_header")

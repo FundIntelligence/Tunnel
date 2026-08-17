@@ -2,14 +2,123 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── LIGHT MODE (default) ── */
 :root {
-  --foreground-rgb: 255, 255, 255;
-  --background-rgb: 13, 15, 18;
+  /* Surfaces */
+  --bg:           #F8F6F1;
+  --s1:           #FFFFFF;
+  --s2:           #F1EEE8;
+  --s3:           #EDE9E0;
+  --s4:           #E5E0D6;
+  /* Borders */
+  --b0:           rgba(0,0,0,.03);
+  --b1:           rgba(0,0,0,.08);
+  --b2:           rgba(0,0,0,.13);
+  /* Text */
+  --t0:           #111111;
+  --t1:           #555555;
+  --t2:           #888888;
+  --t3:           #D1D5DB;
+  /* Accent — teal */
+  --accent:       #0D9488;
+  --accent-hover: #0A7068;
+  --teal:         var(--accent);
+  --accent-lt:    var(--accent);
+  --ad:           rgba(13,148,136,.10);
+  --ab:           rgba(13,148,136,.28);
+  /* Semantic — green */
+  --green:        #15803D;
+  --green-d:      rgba(21,128,61,.09);
+  --v:            var(--green);
+  --vd:           var(--green-d);
+  --vb:           rgba(21,128,61,.28);
+  /* Semantic — amber */
+  --amber:        #C8960C;
+  --amber-d:      rgba(200,150,12,.09);
+  --o:            var(--amber);
+  --od:           var(--amber-d);
+  --ob:           rgba(200,150,12,.28);
+  /* Semantic — red */
+  --red:          #DC2626;
+  --red-d:        rgba(220,38,38,.07);
+  --f:            var(--red);
+  --fd:           var(--red-d);
+  --fb:           rgba(220,38,38,.25);
+  /* Fonts (set by PAR-29, keep them) */
+  --font-sans:    'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono:    'IBM Plex Mono', 'Courier New', monospace;
+  /* Radius */
+  --r:            5px;
+  --rm:           7px;
+  /* Parity mark — exact brand-kit values, never derive from --t0/--accent
+     (those drift for body-text contrast; the mark must stay pixel-precise). */
+  --mark-ink:     #080C18;
+  --mark-teal:    #0D9488;
+}
+
+/* ── DARK MODE ── */
+.dark {
+  /* Surfaces */
+  --bg:           #080C18;
+  --s1:           #0D1220;
+  --s2:           #111827;
+  --s3:           #1A2035;
+  --s4:           #1F2940;
+  /* Borders */
+  --b0:           rgba(255,255,255,.03);
+  --b1:           rgba(255,255,255,.07);
+  --b2:           rgba(255,255,255,.12);
+  /* Text */
+  --t0:           #F9FAFB;
+  --t1:           #9CA3AF;
+  --t2:           #4B5563;
+  --t3:           #1F2937;
+  /* Accent — teal */
+  --accent:       #14B8A6;
+  --accent-hover: #0D9488;
+  --teal:         var(--accent);
+  --accent-lt:    var(--accent);
+  --ad:           rgba(20,184,166,.10);
+  --ab:           rgba(20,184,166,.25);
+  /* Semantic — green */
+  --green:        #10B981;
+  --green-d:      rgba(16,185,129,.12);
+  --v:            var(--green);
+  --vd:           var(--green-d);
+  --vb:           rgba(16,185,129,.25);
+  /* Semantic — amber */
+  --amber:        #F59E0B;
+  --amber-d:      rgba(245,158,11,.12);
+  --o:            var(--amber);
+  --od:           var(--amber-d);
+  --ob:           rgba(245,158,11,.25);
+  /* Semantic — red */
+  --red:          #EF4444;
+  --red-d:        rgba(239,68,68,.09);
+  --f:            var(--red);
+  --fd:           var(--red-d);
+  --fb:           rgba(239,68,68,.25);
+  /* Parity mark — exact brand-kit dark-background values. */
+  --mark-ink:     #F9FAFB;
+  --mark-teal:    #14B8A6;
 }
 
 body {
-  color: rgb(var(--foreground-rgb));
-  background: rgb(var(--background-rgb));
+  font-family: var(--font-sans, 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif);
+  -webkit-font-smoothing: antialiased;
+  color: var(--t0);
+  background: var(--bg);
+}
+
+*, *::before, *::after {
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+svg, img, canvas, video {
+  transition: none;
 }
 
 @layer utilities {
@@ -19,19 +128,42 @@ body {
 }
 
 @keyframes parity-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
-  50% { box-shadow: 0 0 0 8px rgba(99, 102, 241, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.7); }
+  50% { box-shadow: 0 0 0 8px rgba(20, 184, 166, 0); }
 }
 
 .parity-input-attention {
   animation: parity-pulse 2s ease-in-out infinite;
-  border: 1px solid rgba(99, 102, 241, 0.5) !important;
+  border: 1px solid rgba(20, 184, 166, 0.5) !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
   .parity-input-attention {
     animation: none;
-    border: 2px solid rgba(99, 102, 241, 0.5) !important;
+    border: 2px solid rgba(20, 184, 166, 0.5) !important;
+  }
+}
+
+@keyframes analyst-status-mark {
+  0%, 100% { opacity: 0.55; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+.analyst-status-mark {
+  animation: analyst-status-mark 1.8s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.analyst-status-phrase {
+  transition: opacity 220ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .analyst-status-mark {
+    animation: none;
+  }
+  .analyst-status-phrase {
+    transition: none;
   }
 }
 

@@ -15,19 +15,19 @@ const CHECKLIST = [
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
     <div style={{
-      background: '#0D1220',
-      border: '1px solid #1E2A3A',
+      background: 'var(--s1)',
+      border: '1px solid var(--b1)',
       borderRadius: 8,
       padding: '20px 24px',
     }}>
-      <div style={{ fontSize: 11, color: '#4A5568', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 8 }}>
+      <div style={{ fontSize: 11, color: 'var(--t2)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 8 }}>
         {label}
       </div>
-      <div style={{ fontSize: 28, fontWeight: 700, color: '#E2E8F0', fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1 }}>
+      <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--t0)', fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1 }}>
         {value}
       </div>
       {sub && (
-        <div style={{ fontSize: 11, color: '#4A5568', marginTop: 6 }}>{sub}</div>
+        <div style={{ fontSize: 11, color: 'var(--t2)', marginTop: 6 }}>{sub}</div>
       )}
     </div>
   )
@@ -93,8 +93,8 @@ export default function ExportPage() {
 
   if (loading) {
     return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: '#080C18' }}>
-        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: '#4A5568', letterSpacing: '0.1em' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--bg)' }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: 'var(--t2)', letterSpacing: '0.1em' }}>
           LOADING…
         </div>
       </div>
@@ -104,27 +104,27 @@ export default function ExportPage() {
   if (error || !summary) {
     return (
       <div style={{ padding: 40 }}>
-        <div style={{ color: '#F87171', fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>
+        <div style={{ color: 'var(--red)', fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>
           {error || 'Failed to load export summary'}
         </div>
       </div>
     )
   }
 
-  const tierColor = summary.tier === 'High' ? '#34D399' : summary.tier === 'Medium' ? '#FBBF24' : '#F87171'
+  const tierColor = summary.tier === 'High' ? 'var(--green)' : summary.tier === 'Medium' ? 'var(--amber)' : 'var(--red)'
 
   return (
     <div style={{ padding: '40px 48px', maxWidth: 960, fontFamily: "'IBM Plex Sans', sans-serif" }}>
       {/* Header */}
       <div style={{ marginBottom: 36 }}>
-        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: '#4A5568', letterSpacing: '0.12em', marginBottom: 8 }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: 'var(--t2)', letterSpacing: '0.12em', marginBottom: 8 }}>
           P/ EXPORT &amp; COMPLETION
         </div>
-        <h1 style={{ fontSize: 22, fontWeight: 700, color: '#E2E8F0', margin: 0, letterSpacing: '-0.01em' }}>
+        <h1 style={{ fontSize: 22, fontWeight: 700, color: 'var(--t0)', margin: 0, letterSpacing: '-0.01em' }}>
           {summary.deal_name}
         </h1>
         {summary.company_name && (
-          <div style={{ fontSize: 13, color: '#4A5568', marginTop: 4 }}>{summary.company_name}</div>
+          <div style={{ fontSize: 13, color: 'var(--t2)', marginTop: 4 }}>{summary.company_name}</div>
         )}
       </div>
 
@@ -148,7 +148,7 @@ export default function ExportPage() {
       {/* Confidence tier badge */}
       {summary.has_snapshot && (
         <div style={{
-          background: '#0D1220',
+          background: 'var(--s1)',
           border: `1px solid ${tierColor}33`,
           borderRadius: 8,
           padding: '16px 24px',
@@ -162,7 +162,7 @@ export default function ExportPage() {
             <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: tierColor, letterSpacing: '0.08em' }}>
               {summary.tier.toUpperCase()} CONFIDENCE
             </span>
-            <span style={{ fontSize: 12, color: '#4A5568', marginLeft: 16 }}>
+            <span style={{ fontSize: 12, color: 'var(--t2)', marginLeft: 16 }}>
               Based on transaction coverage and reconciliation analysis
             </span>
           </div>
@@ -171,7 +171,7 @@ export default function ExportPage() {
 
       {/* Downloads */}
       <div style={{ marginBottom: 40 }}>
-        <div style={{ fontSize: 11, color: '#4A5568', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--t2)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 16 }}>
           EXPORTS
         </div>
         <div style={{ display: 'flex', gap: 12 }}>
@@ -180,10 +180,10 @@ export default function ExportPage() {
             disabled={!summary.has_snapshot || pdfLoading}
             style={{
               padding: '12px 24px',
-              background: summary.has_snapshot ? '#6366F1' : '#1A2235',
+              background: summary.has_snapshot ? 'var(--accent)' : 'var(--s3)',
               border: 'none',
               borderRadius: 6,
-              color: summary.has_snapshot ? '#fff' : '#2D3748',
+              color: summary.has_snapshot ? '#fff' : 'var(--b1)',
               fontSize: 13,
               fontFamily: "'IBM Plex Sans', sans-serif",
               cursor: summary.has_snapshot ? 'pointer' : 'not-allowed',
@@ -201,9 +201,9 @@ export default function ExportPage() {
             style={{
               padding: '12px 24px',
               background: 'transparent',
-              border: `1px solid ${summary.total_transactions > 0 ? '#6366F1' : '#1E2A3A'}`,
+              border: `1px solid ${summary.total_transactions > 0 ? 'var(--accent)' : 'var(--b1)'}`,
               borderRadius: 6,
-              color: summary.total_transactions > 0 ? '#A5B4FC' : '#2D3748',
+              color: summary.total_transactions > 0 ? 'var(--accent)' : 'var(--b1)',
               fontSize: 13,
               fontFamily: "'IBM Plex Sans', sans-serif",
               cursor: summary.total_transactions > 0 ? 'pointer' : 'not-allowed',
@@ -217,7 +217,7 @@ export default function ExportPage() {
           </button>
         </div>
         {!summary.has_snapshot && (
-          <div style={{ fontSize: 12, color: '#4A5568', marginTop: 8 }}>
+          <div style={{ fontSize: 12, color: 'var(--t2)', marginTop: 8 }}>
             Run the export from the Upload page to generate a PDF snapshot.
           </div>
         )}
@@ -225,12 +225,12 @@ export default function ExportPage() {
 
       {/* Checklist */}
       <div>
-        <div style={{ fontSize: 11, color: '#4A5568', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--t2)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace", marginBottom: 16 }}>
           COMPLETION CHECKLIST
         </div>
         <div style={{
-          background: '#0D1220',
-          border: '1px solid #1E2A3A',
+          background: 'var(--s1)',
+          border: '1px solid var(--b1)',
           borderRadius: 8,
           overflow: 'hidden',
         }}>
@@ -251,8 +251,8 @@ export default function ExportPage() {
                   width: 18,
                   height: 18,
                   borderRadius: 4,
-                  border: done ? 'none' : '1px solid #2D3748',
-                  background: done ? '#34D399' : 'transparent',
+                  border: done ? 'none' : '1px solid var(--b1)',
+                  background: done ? 'var(--green)' : 'transparent',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -264,11 +264,11 @@ export default function ExportPage() {
                     </svg>
                   )}
                 </div>
-                <span style={{ fontSize: 13, color: done ? '#94A3B8' : '#4A5568' }}>
+                <span style={{ fontSize: 13, color: done ? 'var(--t1)' : 'var(--t2)' }}>
                   {item.label}
                 </span>
                 {done && (
-                  <span style={{ marginLeft: 'auto', fontSize: 11, color: '#34D399', fontFamily: "'IBM Plex Mono', monospace" }}>
+                  <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--green)', fontFamily: "'IBM Plex Mono', monospace" }}>
                     DONE
                   </span>
                 )}

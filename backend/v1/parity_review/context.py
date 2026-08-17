@@ -250,7 +250,7 @@ def _tag_transactions(
     }
     tagged = []
     for t in canonical.get("transactions", []):
-        tid = str(t.get("txn_id") or t.get("id") or "")
+        tid = str(t.get("id") or t.get("txn_id") or "")
         eid = entity_id_map.get(tid, "")
         tagged.append({
             **t,
@@ -274,7 +274,7 @@ def _compute_entity_breakdown(
     txn_amount: Dict[str, int] = {}
     for t in canonical.get("transactions", []):
         amt = int(t.get("signed_amount_cents", 0))
-        for key in ("txn_id", "id"):
+        for key in ("id", "txn_id"):
             tid = str(t.get(key) or "")
             if tid:
                 txn_amount[tid] = amt

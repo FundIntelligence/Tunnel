@@ -2,10 +2,53 @@ name: Deploy admin dashboard
 on:
   push:
     branches:
-      - admin
+      - paritystaging
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      # Same reasoning as deploy-staging.yml: pre-setting these skips the
+      # CLI's auto-link flow, which in a monorepo checkout derives a
+      # composite service name Vercel rejects outright.
+      VERCEL_ORG_ID: team_XB5VRCY5Aw7WZHX6VmCoJQ1d
+      VERCEL_PROJECT_ID: prj_Bc3VKhNYUKYSlYmfvPQOilt1ZWuY
     steps:
-      - name: Trigger Vercel admin deploy
-        run: curl -X POST "https://api.vercel.com/v1/integrations/deploy/prj_Bc3VKhNYUKYSlYmfvPQOilt1ZWuY/thjCutwumZ"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # PAR-144: this workflow used to only trigger on push to the `admin`
+      # branch (stale — real work has landed on paritystaging for months)
+      # via a bare deploy-hook curl. The Vercel project's own Production
+      # Branch setting was *also* still "admin" (confirmed via the Vercel
+      # API), so every paritystaging merge only ever built as a Preview —
+      # parity-admin-three.vercel.app sat ~7 days stale across PR #126-129
+      # despite each merge passing CI cleanly.
+      #
+      # `vercel deploy --prod` + `vercel promote` (same pattern already
+      # proven in deploy-staging.yml for the sibling project) forces a
+      # real production deployment and alias update on every push,
+      # independent of the project's Production Branch setting — so this
+      # is correct even before/without that dashboard setting being fixed.
+      - name: Install Vercel CLI
+        run: npm install -g vercel@52.0.0
+      - name: Deploy to Vercel production (admin project)
+        run: |
+          set -euo pipefail
+          DEPLOY_URL="$(vercel deploy --prod --yes --token=${{ secrets.VERCEL_TOKEN }})"
+          echo "Deployed: $DEPLOY_URL"
+          # Unlike parity-sme-staging (deploy-staging.yml), this project already
+          # has autoAssignCustomDomains enabled, so `vercel deploy --prod` alone
+          # already aliases parity-admin-three.vercel.app to the new deployment —
+          # confirmed live (PAR-146). `vercel promote` here is only a safety net
+          # in case that ever changes, so a 409 "already the current production
+          # deployment" is expected and not a real failure; only a different
+          # error should fail the job.
+          set +e
+          PROMOTE_OUTPUT="$(vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }} 2>&1)"
+          PROMOTE_EXIT=$?
+          set -e
+          echo "$PROMOTE_OUTPUT"
+          if [ "$PROMOTE_EXIT" -ne 0 ] && ! echo "$PROMOTE_OUTPUT" | grep -q "already the current production deployment"; then
+            exit "$PROMOTE_EXIT"
+          fi

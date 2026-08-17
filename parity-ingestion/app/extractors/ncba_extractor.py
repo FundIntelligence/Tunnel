@@ -4,17 +4,22 @@ NCBA Bank Kenya PDF statement extractor.
 Supports common layouts:
 - Date | Description/Narrative | Debit | Credit | Balance
 - Date | Value Date | Description | Money Out | Money In | Balance
+- Posting Date | Value Date | Bank Reference | Channel Reference |
+  Transaction Type | Transaction Details | Debit Amount | Credit Amount |
+  Running Balance  (ruled table — see _extract_via_table)
 Date formats: DD/MM/YYYY, DD-MM-YYYY, DD Mon YYYY
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import List, Optional
+from decimal import Decimal
+from typing import List, Optional, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 # Date patterns (order matters — try most specific first)
 _DATE_PAT_DDMMYYYY = re.compile(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s")
@@ -26,24 +31,45 @@ MONTH_MAP = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
+# Header signature for the ruled-table NCBA template — confirmed unique
+# against every other supported bank's header text.
+_TABLE_HEADER_REQUIRED = {"POSTING DATE", "CHANNEL REFERENCE"}
 
-def detect_ncba(file_path: str) -> bool:
+# Letterhead/branding text only ever appears in roughly the first ~500
+# characters of page 1 (company name, account number, statement period).
+# Scanning the full statement risked false-positiving whenever a *transaction
+# narration* happened to name another bank as a counterparty (e.g. "FROM NCBA
+# BANK M-PESA..." in a real, unrelated I&M Bank statement) — that text lives
+# well past this point.
+_HEADER_SCAN_CHARS = 500
+
+
+def _normalize_header_cell(c: Optional[str]) -> str:
+    return (c or "").replace("\n", " ").strip().upper()
+
+
+def detect_ncba(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be an NCBA Bank Kenya statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:3]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
-            text_upper = text.upper()
+        with as_document(source) as doc:
+            header_text = doc.pages[0].text[:_HEADER_SCAN_CHARS].upper()
             has_ncba = (
-                "NCBA" in text_upper
-                or "NCBA BANK" in text_upper
-                or "NCBA GROUP" in text_upper
-                or ("NIC" in text_upper and "CBA" in text_upper)
+                "NCBA" in header_text
+                or ("NIC" in header_text and "CBA" in header_text)
             )
-            return bool(has_ncba)
+            if has_ncba:
+                return True
+
+            # Some NCBA templates render the brand as a logo image only —
+            # fingerprint via the unique ruled-table header instead.
+            for page in doc.pages[:2]:
+                for table in page.extract_tables():
+                    if not table:
+                        continue
+                    header = {_normalize_header_cell(c) for c in table[0]}
+                    if _TABLE_HEADER_REQUIRED.issubset(header):
+                        return True
+            return False
     except Exception:
         return False
 
@@ -157,7 +183,70 @@ def _parse_ncba_line(line: str) -> Optional[dict]:
     }
 
 
+def _extract_via_table(file_path: str) -> List[RawTransaction]:
+    """
+    Table-based extraction for the ruled-table NCBA template. Unlike the
+    text-line template below, this one has real ruled borders, so
+    extract_tables() returns clean, already-columned rows directly —
+    extract_text() on this same file produces garbled, wrapped-mid-word
+    output that the regex line parser below can't read.
+
+    Returns [] if no page has a table matching the required header — caller
+    falls back to the text-line path for the older NCBA template.
+    """
+    transactions: List[RawTransaction] = []
+    row_idx = 0
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if not table or len(table) < 2:
+                    continue
+                header = [_normalize_header_cell(c) for c in table[0]]
+                if not _TABLE_HEADER_REQUIRED.issubset(set(header)):
+                    continue
+                idx = {name: i for i, name in enumerate(header)}
+
+                def cell(row: List[Optional[str]], col: str) -> str:
+                    i = idx.get(col)
+                    if i is None or i >= len(row):
+                        return ""
+                    return (row[i] or "").strip()
+
+                for row in table[1:]:
+                    if not row:
+                        continue
+                    iso_date = _parse_ncba_date(cell(row, "POSTING DATE")) or ""
+                    if not iso_date:
+                        continue
+                    desc = re.sub(r"\s+", " ", cell(row, "TRANSACTION DETAILS").replace("\n", " ")).strip()
+                    transactions.append(
+                        RawTransaction(
+                            row_index=row_idx,
+                            date_raw=iso_date,
+                            description=desc,
+                            debit_raw=cell(row, "DEBIT AMOUNT").replace(",", ""),
+                            credit_raw=cell(row, "CREDIT AMOUNT").replace(",", ""),
+                            balance_raw=cell(row, "RUNNING BALANCE").replace(",", ""),
+                            source_file=file_path,
+                            extraction_confidence=1.0,
+                        )
+                    )
+                    row_idx += 1
+    return transactions
+
+
 def extract_ncba_pdf(file_path: str) -> ExtractionResult:
+    table_transactions = _extract_via_table(file_path)
+    if table_transactions:
+        return ExtractionResult(
+            source_file=file_path,
+            extractor_type="ncba_pdf",
+            row_count=len(table_transactions),
+            extraction_status="success",
+            warnings=[],
+            raw_transactions=table_transactions,
+        )
+
     transactions: List[RawTransaction] = []
     warnings: List[WarningItem] = []
     row_idx = 0
@@ -247,6 +336,145 @@ def extract_ncba_pdf(file_path: str) -> ExtractionResult:
     return ExtractionResult(
         source_file=file_path,
         extractor_type="ncba_pdf",
+        row_count=len(transactions),
+        extraction_status="success",
+        warnings=warnings,
+        raw_transactions=transactions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# NCBA "e-Statement Of Account" template (PAR-69) — a third NCBA layout,
+# distinct from both templates above (`Date | Transaction Type and Details |
+# Value Date | Debit | Credit | Balance`, but debit/credit render as a
+# single trailing amount, not two columns). It is routinely
+# password-protected, unlike the other two templates.
+#
+# Direction has no reliable in-text marker: some debit rows carry a "- Dr"
+# suffix in the transaction type (e.g. "Outward Cheque - Dr") but most don't
+# (e.g. "Excise Duty", "AA Loan Repayment" are debits with no marker at
+# all). Direction is instead derived from the running-balance delta — this
+# line's balance vs. the previous one — which is the balance-delta
+# comparison PAR-14 found missing from coop_extractor's Layout C stub,
+# implemented here for real. Verified against a real fixture
+# (NCBA_Jan2024.pdf, GREENFOREST FOODS LIMITED): summing amounts by
+# inferred direction reproduces the statement's own printed "Payments In"
+# (17,760,978.36) and "Payments Out" (18,378,707.22) totals exactly, and the
+# running balance chain lands on the printed "Closing Balance" (813,198.41)
+# to the cent — including through a stretch of negative (overdrawn)
+# balances, which is why the balance/amount regex below allows a leading
+# "-". Cross-checked against a second real fixture too (NCBA - JAN 2025.pdf,
+# same client, different statement, "Go Banking" account variant) with the
+# same exact-to-the-cent reconciliation.
+#
+# The header casing isn't stable across statements — "e-Statement Of
+# Account" (Jan 2024) vs. "e-Statement of Account" (Jan 2025) — so detection
+# below is case-insensitive.
+#
+# SCOPE NOTE: these two functions take `password` directly and open their
+# own `pdfplumber.PDF` — they are deliberately NOT wired into the shared
+# `pdf_document.py` single-parse layer or `router.py`'s auto-detection
+# chain. Where a password comes from at parse time in production
+# (per-document field vs. per-client config vs. something else) is an open
+# design decision tracked separately under PAR-69 and is not decided here;
+# wiring these into the shared plumbing is follow-up work once that
+# decision is made.
+# ---------------------------------------------------------------------------
+
+_ESTATEMENT_LINE_PAT = re.compile(
+    r"^(\d{2}/\d{2}/\d{4})\s+(.*?)\s+\d{2}/\d{2}/\d{4}\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})$"
+)
+_ESTATEMENT_OPENING_PAT = re.compile(r"Opening Balance\s+(-?[\d,]+\.\d{2})")
+
+
+def detect_ncba_estatement(file_path: str, password: Optional[str] = None) -> bool:
+    """Return True if the PDF is the NCBA "e-Statement Of Account" template.
+
+    Opens with `password` directly (this template is routinely
+    password-protected); a wrong/missing password, or any other failure to
+    open, returns False rather than raising — same contract as every other
+    `detect_*` in this module.
+    """
+    try:
+        with pdfplumber.open(file_path, password=password) as pdf:
+            header = (pdf.pages[0].extract_text() or "")[:600]
+            header_upper = header.upper()
+            return (
+                "E-STATEMENT" in header_upper and "OF ACCOUNT" in header_upper
+                and "TRANSACTION TYPE AND DETAILS" in header_upper
+            )
+    except Exception:
+        return False
+
+
+def extract_ncba_estatement_pdf(file_path: str, password: Optional[str] = None) -> ExtractionResult:
+    """Extract the NCBA "e-Statement Of Account" template.
+
+    See the module note above for why direction is derived from the
+    running-balance delta rather than any in-text Dr/Cr marker.
+    """
+    transactions: List[RawTransaction] = []
+    warnings: List[WarningItem] = []
+    row_idx = 0
+    prev_balance: Optional[Decimal] = None
+
+    with pdfplumber.open(file_path, password=password) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+
+            if prev_balance is None:
+                m = _ESTATEMENT_OPENING_PAT.search(text)
+                if m:
+                    prev_balance = Decimal(m.group(1).replace(",", ""))
+
+            for line in text.split("\n"):
+                m = _ESTATEMENT_LINE_PAT.match(line.strip())
+                if not m:
+                    continue
+
+                date_raw, desc, amt_raw, bal_raw = m.groups()
+                amount = Decimal(amt_raw.replace(",", ""))
+                balance = Decimal(bal_raw.replace(",", ""))
+
+                if prev_balance is None:
+                    # No "Opening Balance" line found before the first
+                    # transaction — shouldn't happen on a real statement,
+                    # but flag rather than silently guess a direction.
+                    warnings.append(
+                        WarningItem(
+                            row_index=row_idx,
+                            message=(
+                                "e-statement: no opening balance found before "
+                                "first transaction; direction defaulted to credit"
+                            ),
+                            raw_text=line.strip(),
+                        )
+                    )
+                    is_credit = True
+                else:
+                    is_credit = balance >= prev_balance
+                prev_balance = balance
+
+                iso_date = _parse_ncba_date(date_raw) or ""
+                transactions.append(
+                    RawTransaction(
+                        row_index=row_idx,
+                        date_raw=iso_date,
+                        description=desc.strip(),
+                        debit_raw="" if is_credit else str(amount),
+                        credit_raw=str(amount) if is_credit else "",
+                        balance_raw=str(balance),
+                        source_file=file_path,
+                        extraction_confidence=1.0,
+                    )
+                )
+                row_idx += 1
+
+    return ExtractionResult(
+        source_file=file_path,
+        extractor_type="ncba_estatement_pdf",
         row_count=len(transactions),
         extraction_status="success",
         warnings=warnings,

@@ -217,8 +217,14 @@ class TestLiveSupabaseE2E(unittest.TestCase):
             overrides_applied=overrides,
         )
 
-        # Persist analysis run in Supabase
-        self.sb.table("pds_analysis_runs").insert(run).execute()
+        # Persist analysis run in Supabase. bank_operational_inflow_cents is a
+        # payload-only field (set in the run dict for the API response) and is
+        # deliberately NOT a pds_analysis_runs column — production strips it
+        # before every insert (api.py:890, musa_file_processor.py:135). Mirror
+        # that strip here; inserting the raw run dict would otherwise be rejected
+        # by PostgREST for the unknown column.
+        run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
+        self.sb.table("pds_analysis_runs").insert(run_for_db).execute()
         self.__class__.analysis_run_ids.append(run["id"])
 
         snapshot = export_snapshot(

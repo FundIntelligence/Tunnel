@@ -141,6 +141,10 @@ def compute_metrics(transactions: List[Dict], accrual: Dict) -> Dict:
             "missing_month_count": 0,
             "missing_month_penalty_bp": 0,
             "reconciliation_status": "NOT_RUN",
+            # PAR-47: reconciliation_status collapses several distinct reasons into
+            # "NOT_RUN". reconciliation_state is the same underlying branch,
+            # honestly named — additive, does not change reconciliation_status.
+            "reconciliation_state": "NO_TRANSACTION_DATA",
             "reconciliation_bp": None,
             "base_confidence_bp": 0,
             "base_after_months_bp": 0,
@@ -163,6 +167,11 @@ def compute_metrics(transactions: List[Dict], accrual: Dict) -> Dict:
     missing_month_penalty_bp = min(missing_month_count * 1000, 5000)
 
     recon_status = "NOT_RUN"
+    # PAR-47: reconciliation_state is the same branch logic as recon_status
+    # below, purely reclassified into five honest reasons instead of
+    # collapsing three of them into "NOT_RUN". Additive — recon_status keeps
+    # its exact current values/meaning for existing consumers.
+    recon_state = "PENDING_ACCRUAL_DATA"
     recon_bp = None
     accrual_revenue_cents = accrual.get("accrual_revenue_cents")
     accrual_start = accrual.get("accrual_period_start")
@@ -173,6 +182,7 @@ def compute_metrics(transactions: List[Dict], accrual: Dict) -> Dict:
         start, end = _active_period_dates(transactions)
         if not start or not end:
             recon_status = "NOT_RUN"
+            recon_state = "FAILED_OVERLAP"  # active period undeterminable — can't establish overlap
         else:
             active_start = datetime.strptime(start, "%Y-%m-%d").date()
             active_end = datetime.strptime(end, "%Y-%m-%d").date()
@@ -185,18 +195,22 @@ def compute_metrics(transactions: List[Dict], accrual: Dict) -> Dict:
             accrual_days = (accr_end - accr_start).days + 1
             if accrual_days <= 0:
                 recon_status = "FAILED_OVERLAP"
+                recon_state = "FAILED_OVERLAP"
             else:
                 # 60% threshold in basis points (no float in v1 core)
                 overlap_bp = (overlap_days * 10000 // accrual_days) if accrual_days else 0
                 if overlap_bp < 6000:
                     recon_status = "FAILED_OVERLAP"
+                    recon_state = "FAILED_OVERLAP"
                 else:
                     if bank_operational_inflow_cents <= 0:
                         recon_status = "NOT_RUN"
+                        recon_state = "FAILED_ZERO_INFLOW"
                     else:
                         diff = abs(accrual_revenue_cents - bank_operational_inflow_cents)
                         recon_bp = max(0, 10000 - (diff * 10000 // accrual_revenue_cents))
                         recon_status = "OK"
+                        recon_state = "OK"
 
     base_confidence = coverage_bp if recon_status != "OK" or recon_bp is None else min(coverage_bp, recon_bp)
     base_after_months = max(0, base_confidence - missing_month_penalty_bp)
@@ -208,6 +222,7 @@ def compute_metrics(transactions: List[Dict], accrual: Dict) -> Dict:
         "missing_month_count": missing_month_count,
         "missing_month_penalty_bp": missing_month_penalty_bp,
         "reconciliation_status": recon_status,
+        "reconciliation_state": recon_state,
         "reconciliation_bp": recon_bp,
         "base_confidence_bp": base_confidence,
         "base_after_months_bp": base_after_months,

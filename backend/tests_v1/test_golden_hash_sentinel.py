@@ -47,11 +47,57 @@ GOLDEN_FIXTURE = [
 
 # Expected sha256_hash for GOLDEN_FIXTURE with current SCHEMA_VERSION/CONFIG_VERSION.
 # If pipeline, snapshot_engine, or config changes, this must be updated explicitly.
+#
 # Updated 8 April 2026 — hash changed because snapshot payload now includes
 # reconciliation and reconciliation_summary blocks from the core truth engine
 # (snapshot_engine/build_pds_payload), which deterministically changes canonical JSON.
 # Previous hash: e61407db11e40e7af2d76d593c7084125e4c98b74a7dbb8277bdad52cad5ccbb
-GOLDEN_HASH_EXPECTED = "c227a0add5e5268e9993be4a4449e0989ad0396179ea0b9299acd91f8f8d6b79"
+#
+# Updated 23 June 2026 — c227a0… → f2e98e68… . The sentinel had gone stale: two
+# intentional changes already merged to BOTH main and paritystaging (the canonical
+# hash-path files are byte-identical on both branches) drifted the canonical output
+# without this expected value being refreshed. Bisected and verified — the delta is
+# explained ENTIRELY by these two, nothing else in the canonical pipeline changed,
+# and SCHEMA_VERSION is unchanged (still 1.0.2 — no sealed financial_state regression):
+#   1. 3b76107 (20 May 2026) wired anomaly detection (annotate_anomalies) into
+#      run_pipeline. It mutates each transaction dict in-place, and because the same
+#      raw_transactions list is passed to both run_pipeline and build_pds_payload
+#      (golden test here, AND production api.py:865/906), the "anomalies" key now
+#      appears in the sealed canonical payload:  c227a0… → c029d75b… .
+#   2. 61bd51e (13 May 2026) bumped CONFIG_VERSION 1.0.2 → 1.0.3 (payload field
+#      "config_version"):  c029d75b… → f2e98e68… .
+# Previous hash: c227a0add5e5268e9993be4a4449e0989ad0396179ea0b9299acd91f8f8d6b79
+#
+# ⚠ FLAG for maintainer review (not changed here — out of scope for the test fix):
+# cause #1 means anomaly annotations are now sealed into every snapshot's canonical
+# JSON via an in-place mutation of the caller's transaction list, rather than via a
+# deliberate "include anomalies in the seal" decision in build_pds_payload. It is
+# deterministic (the hash is stable and reproducible), so it is not a determinism
+# bug — but whether anomaly data BELONGS in the immutable seal is a design question
+# worth an explicit call. Touching it would require a SCHEMA_VERSION bump and is not
+# part of this test-fix change.
+#
+# Updated 24 July 2026 — f2e98e68… → 96c74f19… . PAR-89: classifier.py's flat
+# KES 100,000 large-positive-credit fallback replaced with a per-deal relative
+# threshold (median + scaled MAD) plus an absolute ceiling; SCHEMA_VERSION
+# bumped 1.0.2 → 1.0.3 and CONFIG_VERSION 1.0.3 → 1.0.4 in the same change
+# (both intentional — see backend/v1/config.py). Two independent, deliberate
+# causes, both expected to change this hash:
+#   1. run_pipeline now stamps a "role_reason" string onto every
+#      pds_txn_entity_map record (the human-readable flag reason, e.g. "KES
+#      340,000 credit, no keyword match, 4.2x this business's median
+#      transaction size"), which is part of the sealed txn_entity_map in the
+#      canonical payload — same category as cause #1 above (a new field
+#      entering the seal via a genuine, deliberate payload change).
+#   2. CONFIG_VERSION bump (payload field "config_version") — same category
+#      as cause #2 above, and required so already-exported deals actually
+#      get reclassified under the new logic on next export() instead of
+#      short-circuiting to a stale cached snapshot.
+# None of the 5 golden fixture transactions are large enough to hit the
+# large-positive fallback either before or after this change (max is KES 500),
+# so no role changed here — only the new role_reason field and config_version.
+# Previous hash: f2e98e6843e165af0316249add926fd5003e83fa696f60921eac72fb358be9d4
+GOLDEN_HASH_EXPECTED = "96c74f190f58bd86a869e2d0ac18e2f9a991bd63d27d6bdfc4cc3ab2028332ae"
 
 
 class TestGoldenHashSentinel(unittest.TestCase):

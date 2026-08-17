@@ -137,6 +137,7 @@ def build_pds_payload(
     confidence: Dict[str, Any],
     overrides_applied: List[Dict[str, Any]],
     audited_financials: Optional[Dict[str, Any]] = None,
+    recon_section: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sorted_txns = sorted(
         raw_transactions,
@@ -234,6 +235,12 @@ def build_pds_payload(
     }
     if audited_financials is not None:
         payload["audited_financials"] = audited_financials
+    # Presentation-layer reconciliation (loan_activity / account_coverage / cash_position
+    # / tier) sealed into canonical_json so the PDF renders from the hashed snapshot
+    # instead of a live recompute. Added AFTER financial_state_hash so the outcome-only
+    # financial_state_hash is unaffected (only sha256_hash changes for new snapshots).
+    if recon_section is not None:
+        payload["recon_section"] = recon_section
     return payload
 
 

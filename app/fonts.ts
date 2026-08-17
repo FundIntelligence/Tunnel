@@ -1,18 +1,17 @@
-import localFont from 'next/font/local';
-import { Inter } from 'next/font/google';
+import { IBM_Plex_Sans, IBM_Plex_Mono } from 'next/font/google';
 
-// Inter font for body text
-export const inter = Inter({
+// IBM Plex Sans for headings/body
+export const plexSans = IBM_Plex_Sans({
   subsets: ['latin'],
-  variable: '--font-inter',
+  weight: ['400', '600'],
+  variable: '--font-sans',
   display: 'swap',
 });
 
-// Agrandir Narrow for display/headings
-// Place Agrandir-Narrow.otf in /public/fonts/agrandir/
-export const agrandirNarrow = localFont({
-  src: '../public/fonts/agrandir/Agrandir-Narrow.otf',
-  variable: '--font-agrandir-narrow',
+// IBM Plex Mono for values/hashes
+export const plexMono = IBM_Plex_Mono({
+  subsets: ['latin'],
+  weight: ['400', '500'],
+  variable: '--font-mono',
   display: 'swap',
-  fallback: ['Inter', 'system-ui', 'sans-serif'],
 });

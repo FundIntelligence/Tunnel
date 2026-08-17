@@ -2,6 +2,7 @@
 
 import { useParams, usePathname, useRouter } from 'next/navigation'
 import { useAuth } from '@/components/AuthProvider'
+import { ThemeToggle } from '@/components/ThemeToggle'
 
 const NAV_ACTIVE = [
   { label: 'Upload', href: (id: string) => `/v1/deal?deal_id=${id}`, key: 'upload' },
@@ -35,12 +36,12 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
   }
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: '#080C18', color: '#E2E8F0', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--t0)', fontFamily: "'IBM Plex Sans', sans-serif" }}>
       {/* Sidebar */}
       <aside style={{
         width: 220,
-        background: '#0D1220',
-        borderRight: '1px solid #1E2A3A',
+        background: 'var(--s1)',
+        borderRight: '1px solid var(--b1)',
         display: 'flex',
         flexDirection: 'column',
         padding: '24px 0',
@@ -51,18 +52,18 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
         zIndex: 50,
       }}>
         {/* Logo */}
-        <div style={{ padding: '0 20px 24px', borderBottom: '1px solid #1E2A3A' }}>
-          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, color: '#6366F1', letterSpacing: '0.1em', fontWeight: 700 }}>
-            P/ PARITY
+        <div style={{ padding: '0 20px 24px', borderBottom: '1px solid var(--b1)' }}>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, letterSpacing: '0.1em', fontWeight: 700 }}>
+            <span style={{ color: 'var(--accent)' }}>P/</span> <span style={{ color: '#fff' }}>PARITY</span>
           </div>
-          <div style={{ fontSize: 11, color: '#4A5568', marginTop: 2, letterSpacing: '0.08em' }}>
+          <div style={{ fontSize: 11, color: 'var(--t1)', marginTop: 2, letterSpacing: '0.08em' }}>
             INTELLIGENCE INFRASTRUCTURE
           </div>
         </div>
 
         {/* Active nav */}
         <nav style={{ flex: 1, padding: '16px 0' }}>
-          <div style={{ padding: '0 12px 8px', fontSize: 10, color: '#4A5568', letterSpacing: '0.12em', fontWeight: 600 }}>
+          <div style={{ padding: '0 12px 8px', fontSize: 10, color: 'var(--t1)', letterSpacing: '0.12em', fontWeight: 600 }}>
             DEAL WORKFLOW
           </div>
           {NAV_ACTIVE.map((item) => {
@@ -76,10 +77,10 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
                   alignItems: 'center',
                   width: '100%',
                   padding: '10px 20px',
-                  background: active ? 'rgba(99,102,241,0.12)' : 'transparent',
-                  borderLeft: active ? '2px solid #6366F1' : '2px solid transparent',
+                  background: active ? 'rgba(20,184,166,0.12)' : 'transparent',
+                  borderLeft: active ? '2px solid var(--accent)' : '2px solid transparent',
                   border: 'none',
-                  color: active ? '#A5B4FC' : '#64748B',
+                  color: active ? 'var(--accent)' : 'var(--t1)',
                   fontSize: 13,
                   fontFamily: "'IBM Plex Sans', sans-serif",
                   cursor: 'pointer',
@@ -93,7 +94,7 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
             )
           })}
 
-          <div style={{ padding: '16px 12px 8px', fontSize: 10, color: '#2D3748', letterSpacing: '0.12em', fontWeight: 600, marginTop: 8 }}>
+          <div style={{ padding: '16px 12px 8px', fontSize: 10, color: 'var(--t2)', letterSpacing: '0.12em', fontWeight: 600, marginTop: 8 }}>
             COMING SOON
           </div>
           {NAV_FUTURE.map((label) => (
@@ -101,7 +102,7 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
               key={label}
               style={{
                 padding: '10px 20px',
-                color: '#2D3748',
+                color: 'var(--t2)',
                 fontSize: 13,
                 letterSpacing: '0.01em',
                 borderLeft: '2px solid transparent',
@@ -111,7 +112,7 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
               }}
             >
               {label}
-              <span style={{ fontSize: 9, background: '#1A2235', color: '#374151', padding: '1px 5px', borderRadius: 3, letterSpacing: '0.05em' }}>
+              <span style={{ fontSize: 9, background: 'var(--s3)', color: 'var(--t2)', padding: '1px 5px', borderRadius: 3, letterSpacing: '0.05em' }}>
                 SOON
               </span>
             </div>
@@ -119,30 +120,31 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
         </nav>
 
         {/* User chip + sign out */}
-        <div style={{ padding: '16px 20px', borderTop: '1px solid #1E2A3A' }}>
+        <div style={{ padding: '16px 20px', borderTop: '1px solid var(--b1)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
             <div style={{
               width: 30,
               height: 30,
               borderRadius: '50%',
-              background: 'rgba(99,102,241,0.2)',
-              border: '1px solid rgba(99,102,241,0.4)',
+              background: 'rgba(20,184,166,0.2)',
+              border: '1px solid rgba(20,184,166,0.4)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               fontSize: 11,
               fontWeight: 700,
-              color: '#A5B4FC',
+              color: 'var(--accent)',
               fontFamily: "'IBM Plex Mono', monospace",
               flexShrink: 0,
             }}>
               {initials}
             </div>
-            <div style={{ overflow: 'hidden' }}>
-              <div style={{ fontSize: 12, color: '#94A3B8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ overflow: 'hidden', flex: 1 }}>
+              <div style={{ fontSize: 12, color: 'var(--t1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {email || 'analyst'}
               </div>
             </div>
+            <ThemeToggle />
           </div>
           <button
             onClick={handleSignOut}
@@ -150,9 +152,9 @@ export default function DealLayout({ children }: { children: React.ReactNode }) 
               width: '100%',
               padding: '7px 0',
               background: 'transparent',
-              border: '1px solid #1E2A3A',
+              border: '1px solid var(--b1)',
               borderRadius: 4,
-              color: '#4A5568',
+              color: 'var(--t1)',
               fontSize: 12,
               fontFamily: "'IBM Plex Sans', sans-serif",
               cursor: 'pointer',

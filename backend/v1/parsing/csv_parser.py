@@ -37,7 +37,9 @@ def parse_csv(file_bytes: bytes, document_id: str, deal_currency: str) -> Tuple[
         amount_val = lowered.get("amount")
         desc_val = lowered.get("description")
         direction_val = lowered.get("direction")
-        account_val = lowered.get("account_id") or lowered.get("account") or "default"
+        # Prefer a real account column; otherwise fall back to the document id
+        # (not "default") so transfer detection can pair inter-account flows — PAR-30.
+        account_val = lowered.get("account_id") or lowered.get("account") or str(document_id)
 
         if desc_val in (None, ""):
             raise InvalidSchemaError(f"Description missing at row {idx}")

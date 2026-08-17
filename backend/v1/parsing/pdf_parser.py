@@ -81,7 +81,10 @@ def parse_pdf(file_bytes: bytes, document_id: str, deal_currency: str) -> Tuple[
                     "raw_descriptor": str(desc_val),
                     "parsed_descriptor": str(desc_val).strip(),
                     "normalized_descriptor": normalize_descriptor(desc_val),
-                    "account_id": "default",
+                    # account_id must differ per source document so transfer
+                    # detection (match_transfers) can pair inter-account flows.
+                    # Was hardcoded "default" — see PAR-30.
+                    "account_id": str(document_id),
                 }
                 row_obj["txn_id"] = compute_txn_id(row_obj, document_id)
                 rows.append(row_obj)

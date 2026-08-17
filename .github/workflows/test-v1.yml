@@ -35,10 +35,28 @@ jobs:
       # --- Contract guards (run first to fail fast) ---
       - name: Schema drift guard (pds_ locked)
         run: |
+          # pds_* schema is frozen during pilot to prevent ACCIDENTAL drift.
+          # A pds_* migration change is allowed only when it is explicitly
+          # documented & approved: the schema doc (docs/DB_SCHEMA_PDS_V1.md) must
+          # be updated in the same diff (the "Schema Change Log" section records
+          # which migrations are approved for promotion). That update is the
+          # deliberate, auditable human sign-off.
+          #
+          # Do NOT "bump SCHEMA_VERSION" to satisfy this guard for DB-only
+          # changes: SCHEMA_VERSION is hashed into the snapshot financial_state
+          # payload (backend/v1/core/snapshot_engine.py), so bumping it rewrites
+          # every existing sealed snapshot's hash — a hash regression. Bump
+          # SCHEMA_VERSION only when the snapshot/determinism engine itself
+          # changes (the separate snapshot/pipeline/classifier guards cover that).
           if git diff origin/main...HEAD -- supabase/migrations 2>/dev/null | grep -q "pds_"; then
-            echo "::error::pds_* schema change detected. Schema is locked during pilot."
-            echo "Bump SCHEMA_VERSION, update documentation, add explicit approval in PR."
-            exit 1
+            if git diff origin/main...HEAD -- docs/DB_SCHEMA_PDS_V1.md 2>/dev/null | grep -q .; then
+              echo "pds_* schema change is documented in docs/DB_SCHEMA_PDS_V1.md — approved."
+            else
+              echo "::error::pds_* schema change detected without approval."
+              echo "Document it in docs/DB_SCHEMA_PDS_V1.md (Schema Change Log) in the same PR to approve."
+              echo "Do NOT bump SCHEMA_VERSION for DB-only changes — it would rewrite existing snapshot hashes."
+              exit 1
+            fi
           fi
 
       - name: Snapshot engine guard

@@ -233,7 +233,8 @@ def extract_kcb_online_rows(
                         "raw_descriptor": description,
                         "parsed_descriptor": description.strip(),
                         "normalized_descriptor": desc_norm,
-                        "account_id": "default",
+                        # Per-document account_id enables transfer detection — see PAR-30.
+                        "account_id": str(document_id),
                         "txn_id": txn_id,
                     })
     finally:

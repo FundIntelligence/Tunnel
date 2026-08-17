@@ -1,5 +1,6 @@
 import re
-from typing import Dict, Optional, Tuple
+import statistics
+from typing import Dict, List, Optional, Tuple
 
 # ── ONTOLOGY v2.0 ─────────────────────────────────────────────────────────────
 # Every keyword group maps to a specific role.
@@ -138,8 +139,34 @@ _PESALINK_INFLOW_KEYWORDS = frozenset({
     "pesalink", "pesa link"
 })
 
-# Named counterparty threshold — positive amounts above this get needs_review
+# Named counterparty threshold — positive amounts above this get needs_review.
+# Flat fallback used when a per-deal relative threshold can't be computed (see
+# compute_relative_large_positive_threshold_cents below, PAR-89).
 _LARGE_POSITIVE_THRESHOLD_CENTS = 10_000_000  # KES 100,000
+
+# PAR-89 — below this many transactions, a per-deal median/MAD is noise, not
+# signal; fall back to the flat threshold instead of trusting a statistic
+# computed on a handful of rows.
+_MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD = 30
+
+# Modified z-score cutoff (Iglewicz & Hoaglin, 1993) — a standard, citable
+# starting point for robust outlier detection; not tuned against this
+# dataset. 3.5 is the commonly-used default cutoff in that method, divided by
+# 0.6745 (the constant that scales MAD to be comparable to a standard
+# deviation under normality — same source as the cutoff). This module's money
+# path may not contain float constants (test_no_float_regression.py), so
+# 3.5 / 0.6745 is expressed as its exact reduced integer ratio 7000/1349
+# (≈ 5.19) instead of a float literal:
+#   threshold = median + (mad * _MODIFIED_Z_SCORE_MULTIPLIER_NUM)
+#               // _MODIFIED_Z_SCORE_MULTIPLIER_DEN
+_MODIFIED_Z_SCORE_MULTIPLIER_NUM = 7000
+_MODIFIED_Z_SCORE_MULTIPLIER_DEN = 1349
+
+# Absolute ceiling (PAR-89 #3): independent of any business's own transaction
+# pattern, a single credit at or above this size should never silently
+# auto-classify — always needs_review. This bounds the *relative* threshold
+# (min() below); it does not touch keyword-matched paths at all.
+_ABSOLUTE_CEILING_CENTS = 500_000_000  # KES 5,000,000
 
 # Foreign currency codes for conversion detection
 _FX_CURRENCY_CODES = frozenset({"EUR", "USD", "GBP", "CHF", "JPY", "CNY", "AED", "ZAR"})
@@ -167,6 +194,53 @@ def _classify_currency_conversion(desc_upper: str) -> bool:
         return True
 
     return False
+
+def _format_kes(cents: int) -> str:
+    return f"KES {cents / 100:,.0f}"
+
+
+def compute_relative_large_positive_threshold_cents(all_txns: List[Dict]) -> Tuple[int, Optional[int]]:
+    """
+    PAR-89: a per-deal "this credit is unusually large FOR THIS BUSINESS"
+    threshold, replacing a flat KES 100,000 cutoff that flagged every large
+    transaction for a high-revenue business (whose routine transactions are
+    all large) while letting a same-sized outlier slip through untouched for
+    a small, low-volume one.
+
+    This is a heuristic upgrade, not a precision-tuned model (see PAR-89) —
+    a defensible starting point, not a solved formula:
+      - Method: modified z-score via median + scaled MAD (Iglewicz & Hoaglin,
+        1993), a standard robust-outlier technique — robust because the
+        median/MAD aren't themselves dragged around by the outliers being
+        measured, unlike a mean+stdev approach.
+      - threshold = median + (mad * _MODIFIED_Z_SCORE_MULTIPLIER_NUM)
+        // _MODIFIED_Z_SCORE_MULTIPLIER_DEN ≈ median + 5.19 * MAD.
+      - The absolute ceiling (_ABSOLUTE_CEILING_CENTS) is applied separately
+        by the caller (classify_with_reason) — this function only computes
+        the relative number.
+
+    Falls back to the flat _LARGE_POSITIVE_THRESHOLD_CENTS (signalled by
+    returning median=None) when:
+      - the deal has fewer than _MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD
+        transactions — a median/MAD computed on a handful of rows is noise,
+        not signal; or
+      - MAD is 0 (e.g. most transactions are near-identical in size) — the
+        modified z-score is degenerate in that case, not merely small.
+
+    Returns (threshold_cents, median_abs_cents_or_None). median is None
+    whenever the flat fallback was used, so callers know not to build a
+    "Nx median" reason string from it.
+    """
+    amounts = [abs(int(t.get("signed_amount_cents", 0))) for t in all_txns if t.get("signed_amount_cents")]
+    if len(amounts) < _MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD:
+        return _LARGE_POSITIVE_THRESHOLD_CENTS, None
+    median = int(statistics.median(amounts))
+    mad = int(statistics.median([abs(a - median) for a in amounts]))
+    if mad == 0:
+        return _LARGE_POSITIVE_THRESHOLD_CENTS, None
+    threshold = median + (mad * _MODIFIED_Z_SCORE_MULTIPLIER_NUM) // _MODIFIED_Z_SCORE_MULTIPLIER_DEN
+    return threshold, median
+
 
 DEBIT_ONLY_ROLES = {
     "bank_charge", "loan_repayment", "tax_payment", "supplier_payment",
@@ -367,16 +441,30 @@ def _keyword_classify(descriptor: str, amount_cents: int) -> Optional[Tuple[str,
     return None
 
 
-def classify(txn: Dict) -> str:
+def classify(
+    txn: Dict,
+    *,
+    large_positive_threshold_cents: Optional[int] = None,
+    median_txn_abs_cents: Optional[int] = None,
+) -> str:
     """
     Deterministic, rule-based classification. Returns role string only.
     Use classify_with_reason() to get the full (role, reason) tuple.
     """
-    role, _ = classify_with_reason(txn)
+    role, _ = classify_with_reason(
+        txn,
+        large_positive_threshold_cents=large_positive_threshold_cents,
+        median_txn_abs_cents=median_txn_abs_cents,
+    )
     return role
 
 
-def classify_with_reason(txn: Dict) -> Tuple[str, str]:
+def classify_with_reason(
+    txn: Dict,
+    *,
+    large_positive_threshold_cents: Optional[int] = None,
+    median_txn_abs_cents: Optional[int] = None,
+) -> Tuple[str, str]:
     """
     Deterministic, rule-based classification with audit trail.
     Returns (role, classification_reason) tuple.
@@ -386,6 +474,14 @@ def classify_with_reason(txn: Dict) -> Tuple[str, str]:
     2. Keyword match on normalized_descriptor
     3. Large positive fallback -> needs_review
     4. Sign-based fallback
+
+    large_positive_threshold_cents / median_txn_abs_cents (PAR-89): the
+    per-deal relative statistic from compute_relative_large_positive_threshold_cents(),
+    computed once per deal by the caller (see pipeline.py) and passed through
+    for every transaction in that deal. Both default to None — matching
+    pre-PAR-89 behavior (the flat KES 100,000 threshold, no median context) —
+    for callers that classify a single transaction with no deal context, e.g.
+    unit tests.
     """
     if txn.get("is_transfer"):
         return ("transfer", "is_transfer:flag")
@@ -397,8 +493,30 @@ def classify_with_reason(txn: Dict) -> Tuple[str, str]:
     if result is not None:
         role, reason = result
     elif amt > 0:
-        if amt >= _LARGE_POSITIVE_THRESHOLD_CENTS:
-            role, reason = "needs_review", f"fallback:large_positive_no_keyword_match:amount_{amt}"
+        threshold = (
+            large_positive_threshold_cents
+            if large_positive_threshold_cents is not None
+            else _LARGE_POSITIVE_THRESHOLD_CENTS
+        )
+        # Absolute ceiling (PAR-89 #3) — kept separate from the relative
+        # logic: no business's own transaction pattern can push the
+        # effective needs_review trigger above this hard cap.
+        effective_threshold = min(threshold, _ABSOLUTE_CEILING_CENTS)
+        if amt >= effective_threshold:
+            if effective_threshold == _ABSOLUTE_CEILING_CENTS and effective_threshold < threshold:
+                detail = f"exceeds the {_format_kes(_ABSOLUTE_CEILING_CENTS)} hard cap"
+            elif median_txn_abs_cents:
+                ratio = amt / median_txn_abs_cents
+                detail = f"{ratio:.1f}x this business's median transaction size"
+            else:
+                detail = (
+                    f"exceeds flat {_format_kes(_LARGE_POSITIVE_THRESHOLD_CENTS)} threshold "
+                    "(insufficient transaction history for a per-deal statistic)"
+                )
+            role, reason = (
+                "needs_review",
+                f"fallback:large_positive_no_keyword_match:{_format_kes(amt)} credit, no keyword match, {detail}",
+            )
         else:
             role, reason = "revenue_operational", "fallback:positive_amount"
     elif amt < 0:

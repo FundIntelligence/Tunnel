@@ -4,17 +4,21 @@ All money fields: integer cents.  All ratios: integer basis points.
 Snapshot only on explicit POST /v1/deals/{deal_id}/export.
 """
 
-import base64
 import csv
 import io
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Request, BackgroundTasks, Body
 from fastapi.responses import StreamingResponse, HTMLResponse
+from jose import jwt as _jose_jwt
+from jose.exceptions import JWTError as _JoseJWTError
 from pypdf import PdfWriter
 
 from .utils.pdf_merge import validate_pdf_count
@@ -198,6 +202,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         AnalysisRunsRepo, SnapshotsRepo,
         EnrichmentsRepo, ClassificationOverridesRepo, CustomFlagsRepo,
         AccountCoverageRepo, OverrideLogRepo, IntelligenceLogRepo,
+        ExportPersistenceRepo,
     )
     return {
         "deals": DealsRepo(),
@@ -211,6 +216,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         "intelligence_log": IntelligenceLogRepo(),
         "runs": AnalysisRunsRepo(),
         "snapshots": SnapshotsRepo(),
+        "export_persistence": ExportPersistenceRepo(),
         "enrichments": EnrichmentsRepo(),
         "cls_overrides": ClassificationOverridesRepo(),
         "custom_flags": CustomFlagsRepo(),
@@ -222,21 +228,117 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
 # Deals
 # ===================================================================
 
+# ---------------------------------------------------------------------------
+# Supabase JWT verification (asymmetric ES256 via the project's public JWKS).
+#
+# This project uses Supabase's asymmetric JWT signing keys: the current signing
+# key is ECC P-256 (ES256), and the public key is published at the project's
+# JWKS endpoint. We verify the signature against that public key — there is no
+# shared secret to configure. The JWKS is derived from SUPABASE_URL (already in
+# the environment) and cached with a short TTL; on an unknown `kid` (key
+# rotation) we refetch once before rejecting.
+#
+# The legacy HS256 shared secret is intentionally NOT supported: with a 1-hour
+# access-token expiry and the last HS256 rotation months ago, no live user token
+# is signed with it.
+# ---------------------------------------------------------------------------
+
+_SUPABASE_JWT_ALGORITHMS = ["ES256"]
+_SUPABASE_JWT_AUDIENCE = "authenticated"
+_JWKS_TTL_SECONDS = 600
+
+_jwks_cache: Dict[str, Any] = {"keys": None, "fetched_at": 0.0}
+_jwks_lock = threading.Lock()
+
+
+def _supabase_jwks_url() -> Optional[str]:
+    base = os.getenv("SUPABASE_URL")
+    if not base:
+        return None
+    return base.rstrip("/") + "/auth/v1/.well-known/jwks.json"
+
+
+def _get_jwks(force_refresh: bool = False) -> Optional[dict]:
+    """Return the project JWKS, cached for _JWKS_TTL_SECONDS.
+
+    On fetch failure, falls back to a previously cached copy if available so a
+    transient network blip does not reject every legitimate token.
+    """
+    url = _supabase_jwks_url()
+    if not url:
+        logger.error("[auth] SUPABASE_URL not configured; cannot verify JWTs")
+        return None
+
+    now = time.time()
+    with _jwks_lock:
+        cached = _jwks_cache["keys"]
+        fresh = cached is not None and (now - _jwks_cache["fetched_at"]) < _JWKS_TTL_SECONDS
+        if fresh and not force_refresh:
+            return cached
+        try:
+            resp = httpx.get(url, timeout=5.0)
+            resp.raise_for_status()
+            jwks = resp.json()
+        except Exception:
+            logger.warning("[auth] failed to fetch JWKS from %s; using cached copy if any", url)
+            return cached
+        _jwks_cache["keys"] = jwks
+        _jwks_cache["fetched_at"] = now
+        return jwks
+
+
+def _verify_with_jwks(token: str, kid: Optional[str], jwks: dict) -> Optional[dict]:
+    """Verify the token against the JWK matching `kid`; return claims or None."""
+    keys = (jwks or {}).get("keys") or []
+    key = next((k for k in keys if k.get("kid") == kid), None)
+    if key is None:
+        return None
+    try:
+        return _jose_jwt.decode(
+            token,
+            key,
+            algorithms=_SUPABASE_JWT_ALGORITHMS,
+            audience=_SUPABASE_JWT_AUDIENCE,
+        )
+    except _JoseJWTError:
+        return None
+
+
 def _extract_user_id_from_request(request: Request) -> Optional[str]:
-    """Decode the Supabase JWT from Authorization header to get the user sub."""
+    """Verify the Supabase JWT signature (ES256 via JWKS) and return the verified sub.
+
+    Centralized so every attribution path (confirmed_by, removed_by, override-log
+    authorship, parity-chat session key, ...) inherits the same signature, expiry,
+    and audience check rather than trusting a base64-decoded-but-unverified payload.
+    A forged or expired token now returns None (rejected) instead of a spoofed sub.
+    """
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
     token = auth_header[7:]
+
+    # Read the (untrusted) header only to select the signing key by `kid`.
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        padding = "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
-        return payload.get("sub")
-    except Exception:
+        header = _jose_jwt.get_unverified_header(token)
+    except _JoseJWTError:
         return None
+    kid = header.get("kid")
+
+    jwks = _get_jwks()
+    if not jwks:
+        # Fail closed: no keys means we cannot verify, so we trust nothing.
+        return None
+
+    claims = _verify_with_jwks(token, kid, jwks)
+    if claims is None:
+        # Possibly a rotated signing key the cache hasn't seen yet — refetch once.
+        refreshed = _get_jwks(force_refresh=True)
+        if refreshed is not None and refreshed is not jwks:
+            claims = _verify_with_jwks(token, kid, refreshed)
+    if claims is None:
+        return None
+
+    return claims.get("sub")
 
 
 @router.post("/deals")
@@ -667,6 +769,15 @@ _VALID_OVERRIDE_ROLES = frozenset({
     "needs_review", "other",
 })
 
+# PAR-52 draft taxonomy — may be refined later. "other" requires reason_note.
+_VALID_OVERRIDE_REASON_CATEGORIES = frozenset({
+    "misclassified_rule_matching",
+    "ambiguous_narrative",
+    "known_exception",
+    "duplicate_reversal",
+    "other",
+})
+
 
 @router.get("/deals/{deal_id}/transactions/needs-review")
 def get_needs_review_transactions(request: Request, deal_id: str):
@@ -676,16 +787,23 @@ def get_needs_review_transactions(request: Request, deal_id: str):
     if not deal:
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
-    all_maps = list(repos["txn_map"].list_by_deal(deal_id))
-    nr_maps = [m for m in all_maps if (m.get("role") or "").lower() == "needs_review"]
+    # Filter role='needs_review' in the DB query — this used to fetch every
+    # txn_map/raw_transaction/entity row for the whole deal (thousands of rows,
+    # several paginated round-trips) just to pick out a handful flagged rows.
+    # That made this endpoint take 9-13s on deals with a couple thousand
+    # transactions. Only fetch the rows actually referenced by the flagged maps.
+    nr_maps = list(repos["txn_map"].list_needs_review_by_deal(deal_id))
 
     if not nr_maps:
         return {"transactions": [], "total": 0}
 
-    all_txns = list(repos["raw"].list_by_deal(deal_id))
+    txn_ids = [str(m.get("txn_id") or "") for m in nr_maps]
+    entity_ids = [m.get("entity_id") for m in nr_maps]
+
+    all_txns = repos["raw"].select_in("id", txn_ids)
     txn_by_id = {str(t.get("id")): t for t in all_txns if t.get("id")}
 
-    all_entities = list(repos["entities"].list_by_deal(deal_id))
+    all_entities = repos["entities"].select_in("entity_id", entity_ids)
     entity_name_by_id = {e.get("entity_id"): e.get("display_name") or "" for e in all_entities}
 
     results = []
@@ -702,6 +820,12 @@ def get_needs_review_transactions(request: Request, deal_id: str):
             "signed_amount_cents": int(tx.get("signed_amount_cents") or 0),
             "entity_name": entity_name_by_id.get(m.get("entity_id") or "", ""),
             "current_role": "needs_review",
+            # PAR-89: human-readable reason the classifier flagged this row (e.g.
+            # "KES 340,000 credit, no keyword match, 4.2x this business's median
+            # transaction size"). Field name matches ReviewQueue.tsx's existing
+            # (previously always-empty) flag_reason rendering — see components/
+            # ReviewQueue.tsx:374-375. Absent on rows classified before this change.
+            "flag_reason": m.get("role_reason") or "",
         })
 
     results.sort(key=lambda r: r["txn_date"])
@@ -715,10 +839,17 @@ def resolve_transaction(
     row_id: str = Form(...),
     new_role: str = Form(...),
     analyst_initials: str = Form(...),
+    reason_category: str = Form(...),
+    reason_note: str = Form(""),
 ):
     """Override a single needs_review transaction with an analyst-assigned role."""
     if new_role not in _VALID_OVERRIDE_ROLES:
         _error("BAD_REQUEST", f"Invalid role '{new_role}'. Must be one of the valid classifier roles.")
+    if reason_category not in _VALID_OVERRIDE_REASON_CATEGORIES:
+        _error("BAD_REQUEST", f"Invalid reason_category '{reason_category}'.")
+    reason_note = reason_note.strip()
+    if reason_category == "other" and not reason_note:
+        _error("BAD_REQUEST", "reason_note is required when reason_category is 'other'.")
 
     repos = _repos(request)
     deal = repos["deals"].get_deal(deal_id)
@@ -726,16 +857,16 @@ def resolve_transaction(
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     # Fetch the txn-entity map row to get original role and entity
-    all_maps = repos["txn_map"].list_by_deal(deal_id)
-    txn_map_row = next((m for m in all_maps if str(m.get("txn_id")) == row_id), None)
+    # PAR-96: point lookup instead of list_by_deal(deal_id) + Python scan —
+    # this used to be a full-deal fetch just to find one row by id.
+    txn_map_row = repos["txn_map"].get_by_deal_and_txn(deal_id, row_id)
     if not txn_map_row:
         _error("NOT_FOUND", f"Transaction mapping {row_id} not found for deal {deal_id}")
 
     original_role = txn_map_row.get("role") or "needs_review"
 
-    # Fetch the raw transaction for its SHA256 hash
-    all_txns = repos["raw"].list_by_deal(deal_id)
-    tx_row = next((t for t in all_txns if str(t.get("id")) == row_id), None)
+    # Fetch the raw transaction for its SHA256 hash (point lookup, same reasoning)
+    tx_row = repos["raw"].get_by_deal_and_id(deal_id, row_id)
     txn_hash = tx_row.get("txn_id") or "" if tx_row else ""
 
     user_id = _extract_user_id_from_request(request)
@@ -749,6 +880,8 @@ def resolve_transaction(
         "original_role": original_role,
         "override_role": new_role,
         "analyst_initials": analyst_initials.strip()[:3].upper(),
+        "reason_category": reason_category,
+        "reason_note": reason_note or None,
     }
     if user_id:
         log_entry["user_id"] = user_id
@@ -759,12 +892,10 @@ def resolve_transaction(
     if hasattr(repos["txn_map"], "update_role"):
         repos["txn_map"].update_role(row_id, new_role)
 
-    # Count remaining needs_review for this deal
-    remaining = sum(
-        1 for m in repos["txn_map"].list_by_deal(deal_id)
-        if (m.get("role") or "").lower() == "needs_review"
-        and str(m.get("txn_id")) != row_id
-    )
+    # Count remaining needs_review for this deal — DB-side COUNT (PAR-96),
+    # not a third full-deal fetch. Same semantics as before: role == 'needs_review'
+    # excluding the row just resolved above.
+    remaining = repos["txn_map"].count_needs_review_excluding(deal_id, row_id)
 
     return {"success": True, "remaining_count": remaining}
 
@@ -829,7 +960,17 @@ def export(request: Request, deal_id: str, force: bool = False):
     # Skipped when force=True to rebuild the snapshot unconditionally.
     latest_snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
     latest_doc_at = repos["documents"].get_latest_update_at(deal_id)
-    latest_override_at = repos["overrides"].get_latest_update_at(deal_id) or ""
+    # PAR-111: pds_overrides (entity-level overrides, fed into run_pipeline()) and
+    # pds_override_log (per-transaction Review Queue resolutions, overlaid onto
+    # run_pipeline()'s output per PAR-77) are both real, both still-live tables
+    # that can change what export() produces — this check was only ever reading
+    # the former, so a fresh resolve_transaction() call never invalidated the
+    # short-circuit and export() could silently keep serving a pre-resolution
+    # snapshot. Take the max of both.
+    latest_override_at = max(
+        repos["overrides"].get_latest_update_at(deal_id) or "",
+        (repos["override_log"].get_latest_update_at(deal_id) if repos.get("override_log") else "") or "",
+    )
     snap_created_at = (latest_snapshot or {}).get("created_at") or ""
     snap_config_version = (latest_snapshot or {}).get("config_version")
     if not force and (
@@ -879,25 +1020,78 @@ def export(request: Request, deal_id: str, force: bool = False):
         if text_tid in txn_id_to_uuid:
             rec["txn_id"] = txn_id_to_uuid[text_tid]
 
+    # PAR-77: run_pipeline reclassifies every transaction from scratch on each
+    # export, which would otherwise silently discard a Review Queue analyst's
+    # resolution the next time a genuine re-export runs. Overlay the latest
+    # resolution per transaction from the append-only pds_override_log
+    # (keyed by txn_uuid, which is the raw transaction's stable id — never
+    # regenerated by export/reclassification, unlike the hash-based txn_id
+    # run_pipeline works with internally) onto the freshly-classified rows,
+    # in-memory, before anything is deleted or persisted. Permanent until a
+    # future resolution contradicts it — a human resolution reflects context
+    # the classifier doesn't have and should not be silently reconsidered by
+    # an automated run.
+    if repos.get("override_log"):
+        override_entries = list(repos["override_log"].list_by_deal(deal_id))
+        latest_override_role_by_txn_uuid: Dict[str, str] = {}
+        for entry in sorted(override_entries, key=lambda e: e.get("created_at") or ""):
+            latest_override_role_by_txn_uuid[str(entry["txn_uuid"])] = entry["override_role"]
+        for rec in txn_map:
+            override_role = latest_override_role_by_txn_uuid.get(str(rec["txn_id"]))
+            if override_role:
+                rec["role"] = override_role
+                rec["role_version"] = "manual_override"
+
     for lnk in links:
         if lnk.get("id") is None:
             del lnk["id"]
 
-    repos["txn_map"].delete_eq("deal_id", deal_id)
-    repos["links"].delete_eq("deal_id", deal_id)
-    repos["entities"].delete_eq("deal_id", deal_id)
-
-    run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
-    repos["runs"].insert_run(run_for_db)
-    repos["links"].insert_batch(links)
-    repos["entities"].upsert_entities(entities)
-    repos["txn_map"].upsert_mappings(txn_map)
+    # PAR-95: delete+reinsert of pds_txn_entity_map/links/entities/run now
+    # happens inside a single Postgres function call (export_persist_deal_state,
+    # migration 026), not four separate PostgREST calls — Postgres wraps one
+    # function call in one transaction, so a failure partway through rolls
+    # back the deletes too. pds_txn_entity_map (and links/entities) for this
+    # deal are never observably empty to a concurrent reader. The critical
+    # log below is now a genuine last-resort: it only fires if the RPC call
+    # itself fails to reach/complete on the DB (network error, etc.), in
+    # which case Postgres has already rolled back and the deal's prior state
+    # is intact — this is not the PAR-93 data-integrity gap anymore, just a
+    # loud record that an export attempt failed.
+    try:
+        run_for_db = {k: v for k, v in run.items() if k != "bank_operational_inflow_cents"}
+        repos["export_persistence"].persist_deal_state(
+            deal_id=deal_id,
+            run=run_for_db,
+            links=links,
+            entities=entities,
+            txn_map=txn_map,
+        )
+    except Exception:
+        logger.critical(
+            "[EXPORT] deal=%s export_persist_deal_state RPC failed — Postgres has rolled back "
+            "the whole delete+reinsert as one transaction, so pds_txn_entity_map/links/entities "
+            "for this deal still hold their prior state, not an empty one. Export must be retried.",
+            deal_id,
+            exc_info=True,
+        )
+        raise
 
     stage = "SNAPSHOT_BUILD_DONE"
     logger.info("[EXPORT] stage=%s", stage)
     from .db.supabase_repositories import AuditedFinancialsRepo
     af_rows = AuditedFinancialsRepo().get_by_deal_id(deal_id)
     audited_financials = af_rows[0] if af_rows else None
+    # Precompute the presentation reconciliation section (loan_activity / account_coverage
+    # / cash_position / tier) so it can be SEALED into the snapshot below. The PDF renderer
+    # reads this from canonical_json instead of recomputing live at render time, which was
+    # the source of snapshot-vs-PDF inconsistencies (sealed coverage=null while PDF showed a
+    # live %). Non-fatal: legacy snapshots without this key fall back to a live recompute.
+    recon_section = None
+    try:
+        from .analysis.snapshot_generator import generate_reconciliation_section
+        recon_section = generate_reconciliation_section(deal_id)
+    except Exception as exc:
+        logger.warning("[EXPORT] recon_section precompute failed (non-fatal): %s", exc)
     payload = build_pds_payload(
         schema_version=run["schema_version"],
         config_version=run["config_version"],
@@ -922,6 +1116,7 @@ def export(request: Request, deal_id: str, force: bool = False):
         },
         overrides_applied=overrides,
         audited_financials=audited_financials,
+        recon_section=recon_section,
     )
     snapshot = export_snapshot(
         snapshot_repo=repos["snapshots"],
@@ -964,14 +1159,21 @@ def export(request: Request, deal_id: str, force: bool = False):
     except Exception as exc:
         logger.warning("[EXPORT] account_coverage persist failed (non-fatal): %s", exc)
 
-    # Auto-trigger full fiscal-year reconciliation when audited financials exist
-    if audited_financials:
+    # Auto-trigger full fiscal-year reconciliation when audited financials exist.
+    # Reuse the recon_section already computed (and sealed into the snapshot) above.
+    if audited_financials and recon_section is not None:
         try:
-            from .analysis.snapshot_generator import generate_reconciliation_section
-            recon = generate_reconciliation_section(deal_id)
+            recon = recon_section
             recon_tier = recon.get("tier", "LOW_CONFIDENCE")
             cash_status = (recon.get("cash_position") or {}).get("status")
-            recon_status_val = "OK" if recon_tier in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE") else "LOW"
+            # reconciliation_status is a DB enum (OK / NOT_RUN / FAILED_OVERLAP). Reaching
+            # this block means reconciliation ran and was sealed into the snapshot, so the
+            # status is OK regardless of confidence tier. The HIGH/MEDIUM/LOW/CRITICAL tier
+            # is conveyed separately via the snapshot recon_section badge and the
+            # reconciliation_pct_bp written below — writing the tier name ("LOW") here
+            # raised "invalid input value for enum reconciliation_status_enum" and silently
+            # blocked the recon report on every incomplete-coverage deal.
+            recon_status_val = "OK"
             cash_variance_bp = None
             if cash_status == "EXACT_MATCH":
                 cash_variance_bp = 10000
@@ -1154,8 +1356,15 @@ def get_snapshot_pdf(request: Request, deal_id: str):
         "sha256_hash":          snapshot.get("sha256_hash"),
         "financial_state_hash": snapshot.get("financial_state_hash"),
     }
-    account_coverage = repos["account_coverage"].list_by_deal(deal_id)
-    pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, account_coverage=account_coverage)
+    # Legacy ReportLab path retired — route through the single snapshot renderer
+    # (snapshot_html_renderer + weasyprint), same engine as GET /deals/{id}/report.
+    # Account coverage now renders inside the HTML snapshot itself.
+    #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
+    #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, account_coverage=account_coverage)
+    from .analysis.snapshot_html_renderer import render_snapshot_html
+    import weasyprint
+    html = render_snapshot_html(deal_id)
+    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     filename = f"parity_snapshot_{deal_id}.pdf"
     return StreamingResponse(
         iter([pdf_bytes]),
@@ -1204,8 +1413,17 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
         "financial_state_hash": snapshot.get("financial_state_hash"),
     }
 
-    account_coverage = repos["account_coverage"].list_by_deal(deal_id)
-    pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, enrichment, account_coverage=account_coverage)
+    # Legacy ReportLab path retired — route through the single snapshot renderer
+    # (snapshot_html_renderer + weasyprint), same engine as GET /deals/{id}/report.
+    # NOTE: the HTML renderer does not yet carry Section B (analyst enrichment);
+    # this endpoint now returns the base sealed snapshot. Section B parity is a
+    # follow-up before pdf_generator.py can be deleted.
+    #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
+    #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, enrichment, account_coverage=account_coverage)
+    from .analysis.snapshot_html_renderer import render_snapshot_html
+    import weasyprint
+    html = render_snapshot_html(deal_id)
+    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     suffix = "_enriched" if enrichment else ""
     filename = f"parity_{deal_id}{suffix}.pdf"
     return StreamingResponse(
@@ -1636,7 +1854,11 @@ def log_intelligence_entry(request: Request, deal_id: str, entry_id: str):
 # Parity Review — Suggestions Engine
 # ===================================================================
 
-from .analytics import loan_drawdowns as _loan_drawdowns, monthly_cashflow as _monthly_cashflow  # noqa: E402
+from .analytics import (  # noqa: E402
+    loan_drawdowns as _loan_drawdowns,
+    monthly_cashflow as _monthly_cashflow,
+    credit_scoring_inputs as _credit_scoring_inputs,
+)
 from .suggestions import generate_suggestions  # noqa: E402
 
 
@@ -1724,6 +1946,47 @@ def get_monthly_cashflow(request: Request, deal_id: str):
     return {"monthly_cashflow": rows, "count": len(rows)}
 
 
+@router.get("/deals/{deal_id}/analytics/credit-scoring-inputs")
+def get_credit_scoring_inputs(request: Request, deal_id: str):
+    """
+    Deal-level Credit Scoring Inputs (the 7 core metrics + payroll/KRA signals),
+    computed from classifier role in the latest snapshot — works uniformly for
+    single-document and batch-uploaded deals, unlike the per-document analytics
+    computed during ingestion.
+    """
+    repos = _repos(request)
+    if not repos["deals"].get_deal(deal_id):
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
+    if not snapshot:
+        _error("NOT_FOUND", "No snapshot found. Run export first.")
+
+    import json
+    from .core.snapshot_engine import decompress_canonical_json_if_needed
+
+    data = json.loads(decompress_canonical_json_if_needed(snapshot["canonical_json"]))
+    transactions = data.get("transactions", [])
+    txn_entity_map = data.get("txn_entity_map", [])
+
+    role_lookup = {str(m.get("txn_id") or ""): m.get("role", "") for m in txn_entity_map}
+
+    tagged = []
+    for t in transactions:
+        txn_id = str(t.get("id") or t.get("txn_id") or "")
+        role = role_lookup.get(txn_id, "")
+        txn_date = str(t.get("txn_date", ""))
+        if not txn_date:
+            continue
+        tagged.append({
+            "role": role,
+            "amount_cents": int(t.get("signed_amount_cents", 0)),
+            "txn_date": txn_date,
+            "txn_id": txn_id,
+        })
+
+    return _credit_scoring_inputs(tagged)
+
+
 @router.get("/deals/{deal_id}/review/suggestions")
 def get_review_suggestions(request: Request, deal_id: str):
     """Returns Parity Review suggestion cards for a deal. Called when analyst opens Parity Review."""
@@ -1795,17 +2058,31 @@ async def upload_audited_financials(
     """
     Upload an audited or management financial statements file for a deal.
 
-    Accepts PDF (native or scanned), CSV, and Excel formats.  Sends the file
-    to parity-ingestion for extraction, then stores the structured data in
-    pds_audited_financials.  Idempotent: re-uploading the same financial year
-    overwrites the previous record.
+    Accepts PDF (native or scanned), CSV, and Excel formats.  Extracts via
+    Claude (native PDF/vision input — see
+    Tunnel/docs/AUDITED_FINANCIALS_EXTRACTION_INVESTIGATION.md sections 8-11),
+    then stores the structured data in pds_audited_financials.  Idempotent:
+    re-uploading the same financial year overwrites the previous record.
 
     ``declaration_type`` must be ``'audited'`` (default) or ``'management'``.
     """
+    import hashlib
+
     from .db.supabase_repositories import AuditedFinancialsRepo
-    from .parsing.audited_financials_client import (
-        extract_audited_financials_via_ingestion,
-        AuditedFinancialsExtractionError,
+
+    # OLD EXTRACTOR — retained for reference and rollback.
+    # No longer called from the ingestion hot path as of 2026-06-22
+    # (feat/wire-claude-extractor-ingestion). Do not remove until Phase 4
+    # (full permanence) is complete. See AUDITED_FINANCIALS_EXTRACTION_INVESTIGATION.md
+    # section 8 for why the Claude-based extractor replaced this path.
+    # from .parsing.audited_financials_client import (
+    #     extract_audited_financials_via_ingestion,
+    #     AuditedFinancialsExtractionError,
+    # )
+    from .parsing.audited_financials_claude_extractor import (
+        extract_audited_financials_claude,
+        ClaudeExtractionError,
+        ClaudeRateLimitError,
     )
 
     if declaration_type not in ("audited", "management"):
@@ -1830,35 +2107,134 @@ async def upload_audited_financials(
     file_bytes = await file.read()
 
     try:
-        data = extract_audited_financials_via_ingestion(file_bytes, filename)
-    except AuditedFinancialsExtractionError as exc:
+        data = extract_audited_financials_claude(file_bytes, filename)
+    except ClaudeRateLimitError as exc:
+        # Transient: the extraction service is rate-limited, not the document.
+        # Distinct status so the UI can prompt a retry instead of telling the
+        # analyst the file is unreadable. Must precede ClaudeExtractionError
+        # (ClaudeRateLimitError is a subclass).
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "EXTRACTION_RATE_LIMITED",
+                "detail": (
+                    "The extraction service is busy right now. "
+                    "Please retry this upload in a moment."
+                ),
+            },
+        ) from exc
+    except ClaudeExtractionError as exc:
         raise HTTPException(
             status_code=422,
             detail={"status": "PARSE_FAILED", "detail": str(exc)},
         ) from exc
 
-    # Attach deal FK and declaration_type; exclude non-column keys
+    # pds_audited_financials.financial_year/_start/_end are NOT NULL with no
+    # default (migration 014_pds_audited_financials.sql). The old coordinate
+    # extractor guaranteed these via its own required-field ValueError gate
+    # before ever returning; the Claude extractor has no such gate (it's
+    # explicitly told to return null rather than guess) — so a document Claude
+    # can't date must fail the same clean PARSE_FAILED way, not hit the DB's
+    # NOT NULL constraint as an unhandled 500.
+    if not data.get("financial_year") or not data.get("financial_year_start") or not data.get("financial_year_end"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "PARSE_FAILED",
+                "detail": "Could not determine the financial year for this document.",
+            },
+        )
+
+    af_repo = AuditedFinancialsRepo()
+
+    # Permanence guard: never silently overwrite a record a human has already
+    # confirmed (confirmed_at IS NOT NULL). The upsert below is keyed on
+    # (deal_id, financial_year), so without this check a re-upload — including an
+    # accidental duplicate — would clobber confirmed figures that may already
+    # drive a sealed snapshot. Replacing a confirmed record must be deliberate:
+    # the analyst removes the existing record first. (Full SHA-seal immutability
+    # is a separate piece; this is the interim guard.)
+    financial_year = data.get("financial_year")
+    if financial_year is not None:
+        existing = af_repo.get_by_deal_year(deal_id, int(financial_year))
+        if existing and existing.get("confirmed_at"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "CONFIRMED_RECORD_EXISTS",
+                    "financial_year": int(financial_year),
+                    "detail": (
+                        "A confirmed record exists for this financial year. "
+                        "To replace it, explicitly remove the existing record first."
+                    ),
+                },
+            )
+
+    # The Claude extractor reports no per-field confidence score by design
+    # (AUDITED_FINANCIALS_EXTRACTION_INVESTIGATION.md section 9.1: "no
+    # confidence score"). Leave the column null rather than fabricate a
+    # number or fall back to a misleading literal 0 — the frontend already
+    # renders null as "manual" (app/v1/deal/page.tsx:1324); the human-confirm
+    # gate (confirmed_at) still forces review regardless of this label.
+    _raw_confidence = data.get("extraction_confidence")
+    extraction_confidence = int(_raw_confidence) if _raw_confidence is not None else None
+
+    # pds_audited_financials.sha256_hash has no reader anywhere in the
+    # codebase (grepped) other than this write — it's a content fingerprint,
+    # not the protected canonical/financial_state_hash. The Claude extractor
+    # doesn't compute one, so reproduce the legacy extractor's exact formula
+    # (parity-ingestion/app/extractors/audited_financials_extractor.py:612-618)
+    # here rather than inside the new module, which stays standalone per its
+    # own docstring.
+    _hash_key = (
+        f"{data.get('company_name')}|{data.get('financial_year')}|"
+        f"{data.get('turnover_cents')}|{data.get('profit_after_tax_cents')}|"
+        f"{data.get('cash_and_equivalents_cents')}"
+    )
+    sha256_hash = hashlib.sha256(_hash_key.encode()).hexdigest()
+
+    # Attach deal FK and declaration_type; exclude non-column keys.
+    # currency has a NOT NULL DEFAULT 'KES' (migration 014) — if Claude found
+    # no currency marker anywhere (returns null, by design — never guesses),
+    # omit the key so the column default applies instead of explicitly
+    # writing NULL into a NOT NULL column.
     row = {
         "deal_id": deal_id,
         "declaration_type": declaration_type,
         **{
             k: v
             for k, v in data.items()
-            if k not in ("sha256_hash", "extraction_method")
+            if k not in ("sha256_hash", "extraction_method", "extraction_confidence", "_usage")
+            and not (k == "currency" and v is None)
         },
-        "extraction_confidence": int(data.get("extraction_confidence") or 0),
-        "sha256_hash": data.get("sha256_hash"),
+        "extraction_confidence": extraction_confidence,
+        "sha256_hash": sha256_hash,
+        # pds_audited_financials.extraction_method DEFAULTs to
+        # 'pdfplumber_coordinate' (migration era when that was the only path).
+        # Write the real method so Claude-extracted rows aren't mislabeled as
+        # the legacy extractor — the column default would otherwise silently
+        # claim pdfplumber provenance for every Claude extraction.
+        "extraction_method": data.get("extraction_method") or "claude_sonnet_4_6",
+        # A fresh extraction always overwrites any prior human confirmation —
+        # the Documents-tab navigation gate re-blocks until explicitly re-saved.
+        "confirmed_at": None,
+        # Re-activate the (deal, FY) row if it had been soft-removed: the upsert
+        # below is keyed on (deal_id, financial_year), so without clearing these
+        # the re-uploaded record would stay filtered out as removed. (The 409
+        # guard above already skips removed rows, so a re-upload reaching here is
+        # the deliberate "remove then re-upload" replacement workflow.)
+        "removed_at": None,
+        "removed_reason": None,
+        "removed_by": None,
     }
 
-    af_repo = AuditedFinancialsRepo()
     saved = af_repo.upsert(row)
 
-    _conf = int(data.get("extraction_confidence") or 0)
     logger.info(
-        "[API] Saved audited financials deal_id=%s FY=%s confidence=%d%% type=%s",
+        "[API] Saved audited financials deal_id=%s FY=%s confidence=%s type=%s",
         deal_id,
         data.get("financial_year"),
-        _conf,
+        extraction_confidence,
         declaration_type,
     )
 
@@ -1869,7 +2245,7 @@ async def upload_audited_financials(
         "financial_year": data.get("financial_year"),
         "financial_year_start": data.get("financial_year_start"),
         "financial_year_end": data.get("financial_year_end"),
-        "extraction_confidence": int(data.get("extraction_confidence") or 0),
+        "extraction_confidence": extraction_confidence,
         "declaration_type": declaration_type,
         "turnover_cents": data.get("turnover_cents"),
         "profit_after_tax_cents": data.get("profit_after_tax_cents"),
@@ -1890,7 +2266,11 @@ def get_audited_financials(request: Request, deal_id: str):
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     af_repo = AuditedFinancialsRepo()
-    records = af_repo.get_by_deal_id(deal_id)
+    try:
+        records = af_repo.get_by_deal_id(deal_id)
+    except Exception as exc:
+        logger.exception("[AUDITED_FINANCIALS] DB read failed for deal=%s", deal_id)
+        _error("SERVICE_UNAVAILABLE", "Unable to retrieve audited financials at this time", details={"message": str(exc)})
     records.sort(key=lambda r: r.get("financial_year") or 0, reverse=True)
     return {"deal_id": deal_id, "records": records}
 
@@ -1908,6 +2288,94 @@ def patch_audited_financials(request: Request, deal_id: str, financial_year: int
     """
     Manually update / fill in audited financials fields for a given fiscal year.
     Accepts a partial dict of the patchable fields. Creates the record if it doesn't exist.
+
+    This is the only endpoint the "Save financial details" action calls, so a
+    successful PATCH here is by definition an explicit human confirmation —
+    confirmed_at is always stamped server-side, never trusted from the client.
+    """
+    from .db.supabase_repositories import AuditedFinancialsRepo, AfConfirmLogRepo
+
+    repos = _repos(request)
+    if not repos["deals"].get_deal(deal_id):
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+
+    # A successful PATCH is, by definition, an explicit human confirmation. The
+    # confirm gate's promise is "a human approved this number", so we must record
+    # WHO. Reject a confirm we cannot attribute rather than assert an anonymous
+    # human action — the UI always sends a JWT, so a missing user means something
+    # is wrong, and an unattributable confirmation is exactly the gap this closes.
+    confirmed_by = _extract_user_id_from_request(request)
+    if not confirmed_by:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": "CONFIRM_AUTH_REQUIRED",
+                "detail": "Confirming financial details requires an authenticated user.",
+            },
+        )
+
+    patch = {k: v for k, v in body.items() if k in _PATCHABLE_AF_FIELDS}
+    if not patch:
+        _error("BAD_REQUEST", f"No patchable fields provided. Allowed: {sorted(_PATCHABLE_AF_FIELDS)}")
+
+    confirmed_at = datetime.now(timezone.utc).isoformat()
+    af_repo = AuditedFinancialsRepo()
+    row = {
+        "deal_id": deal_id,
+        "financial_year": financial_year,
+        **patch,
+        "confirmed_at": confirmed_at,
+        "confirmed_by": confirmed_by,
+    }
+    saved = af_repo.upsert(row)
+
+    # Durable, append-only attribution: one audit row per confirmation event.
+    # A log-write failure must not 500 the user's save — confirmed_by is already
+    # persisted on the AF row (primary attribution); the log is the per-event
+    # trail. Surface failures in logs rather than rolling back the confirmation.
+    try:
+        AfConfirmLogRepo().insert_log({
+            "deal_id": deal_id,
+            "financial_year": financial_year,
+            "confirmed_by": confirmed_by,
+            "confirmed_at": confirmed_at,
+            "source": saved.get("id"),
+        })
+    except Exception:
+        logger.exception(
+            "[API] confirm-log write failed deal_id=%s FY=%s by=%s",
+            deal_id, financial_year, confirmed_by,
+        )
+
+    return saved
+
+
+@router.delete("/deals/{deal_id}/audited-financials/{financial_year}")
+def remove_audited_financials(
+    request: Request,
+    deal_id: str,
+    financial_year: int,
+    supersede: bool = False,
+    body: dict = Body(default=None),
+):
+    """
+    Soft-remove a wrongly-uploaded audited-financials record from a deal's queue.
+
+    Tiered, mirroring the 409 upload guard (upload_audited_financials):
+      • Unconfirmed record (confirmed_at IS NULL) — removed freely; nothing
+        downstream depends on it yet.
+      • Confirmed record (confirmed_at IS NOT NULL) — protected. Blocked with
+        409 CONFIRMED_RECORD_LOCKED unless `?supersede=true` AND a non-empty
+        reason is supplied, in which case it is removed as an attributed
+        supersede. This is the path the upload guard's "remove the existing
+        record first" message points analysts to.
+
+    Soft-delete only: removed_at / removed_reason / removed_by are stamped
+    server-side; the row is retained for audit and filtered out of every read
+    (see AuditedFinancialsRepo.get_by_deal_*). The removal's attribution lives on
+    these columns, NOT in pds_override_log — that log is transaction-classification
+    shaped and is read by override-count / snapshot-basis logic (see override_log
+    usage in this module), so AF removals must not be written there.
     """
     from .db.supabase_repositories import AuditedFinancialsRepo
 
@@ -1915,18 +2383,80 @@ def patch_audited_financials(request: Request, deal_id: str, financial_year: int
     if not repos["deals"].get_deal(deal_id):
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
-    patch = {k: v for k, v in body.items() if k in _PATCHABLE_AF_FIELDS}
-    if not patch:
-        _error("BAD_REQUEST", f"No patchable fields provided. Allowed: {sorted(_PATCHABLE_AF_FIELDS)}")
-
     af_repo = AuditedFinancialsRepo()
-    row = {
+    existing = af_repo.get_by_deal_year(deal_id, int(financial_year))
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "RECORD_NOT_FOUND",
+                "financial_year": int(financial_year),
+                "detail": "No active audited-financials record for this financial year.",
+            },
+        )
+
+    reason = body.get("reason") if isinstance(body, dict) else None
+    reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+
+    is_confirmed = existing.get("confirmed_at") is not None
+    if is_confirmed:
+        # Removing a confirmed record must be deliberate and attributed.
+        if not supersede:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "CONFIRMED_RECORD_LOCKED",
+                    "financial_year": int(financial_year),
+                    "detail": (
+                        "This financial year is confirmed. Removing it requires an "
+                        "explicit supersede with a reason."
+                    ),
+                },
+            )
+        if not reason:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "SUPERSEDE_REASON_REQUIRED",
+                    "financial_year": int(financial_year),
+                    "detail": "A reason is required to supersede a confirmed record.",
+                },
+            )
+
+    removed_by = _extract_user_id_from_request(request)
+    removed = af_repo.soft_delete(
+        deal_id,
+        int(financial_year),
+        removed_at=datetime.now(timezone.utc).isoformat(),
+        removed_reason=reason,
+        removed_by=removed_by,
+    )
+    if not removed:
+        # Lost a race with a concurrent removal / re-upload.
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "RECORD_NOT_FOUND",
+                "financial_year": int(financial_year),
+                "detail": "No active record to remove.",
+            },
+        )
+
+    logger.info(
+        "[API] Removed audited financials deal_id=%s FY=%s superseded=%s by=%s reason=%r",
+        deal_id,
+        financial_year,
+        bool(is_confirmed),
+        removed_by or "unknown",
+        reason,
+    )
+
+    return {
+        "status": "REMOVED",
         "deal_id": deal_id,
-        "financial_year": financial_year,
-        **patch,
+        "financial_year": int(financial_year),
+        "superseded": bool(is_confirmed),
     }
-    saved = af_repo.upsert(row)
-    return saved
 
 
 @router.post("/api/request-parser")

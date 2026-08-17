@@ -29,6 +29,13 @@ class TestNoLegacyRoutes(unittest.TestCase):
                 continue
             if path.startswith("/docs") or path == "/openapi.json" or path.startswith("/redoc"):
                 continue
+            # /api/musa is the Musa Ventures partner integration namespace — an
+            # intentional external-facing webhook API (musa_api.py, prefix
+            # "/api/musa", included in main.py), with its own api_keys auth. It is
+            # deliberately not under /v1; moving it would break the partner's
+            # webhook URLs. Excluded here like /health and /docs.
+            if path.startswith("/api/musa"):
+                continue
             self.assertTrue(
                 path.startswith("/v1"),
                 f"Legacy route detected: {path}. All routes must be under /v1.",

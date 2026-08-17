@@ -1,0 +1,35 @@
+[
+  {
+    "file": "buildex_financials_2025.pdf",
+    "input_tokens": 48930,
+    "output_tokens": 997,
+    "cost_usd": 0.1617,
+    "output_json": "/Users/mbakswatu/Desktop/ParitySME/Tunnel/backend/scripts/validate_claude_audited_extraction_output/buildex_financials_2025.json"
+  },
+  {
+    "file": "Kenlink Management Account Dec 2025.pdf",
+    "error": "Claude API call failed for 'Kenlink Management Account Dec 2025.pdf': Error code: 429 - {'type': 'error', 'error': {'type': 'rate_limit_error', 'message': \"This request would exceed your organization's rate limit of 30,000 input tokens per minute (org: 9bd67329-45a8-490c-996a-dcdeed4ac8a9, model: claude-sonnet-4-6). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Reduce the prompt length or the maximum tokens requested, or try again later. View your current limits at https://console.anthropic.com/settings/limits. To raise this limit, purchase credits to advance to the next usage tier at https://console.anthropic.com/settings/billing.\"}, 'request_id': 'req_011CcGxg76d9iSf8syYpX78U'}"
+  },
+  {
+    "file": "Tawi Fresh 2024 Audited Financial Statements.pdf",
+    "input_tokens": 29646,
+    "output_tokens": 735,
+    "cost_usd": 0.1,
+    "output_json": "/Users/mbakswatu/Desktop/ParitySME/Tunnel/backend/scripts/validate_claude_audited_extraction_output/Tawi Fresh 2024 Audited Financial Statements.json"
+  },
+  {
+    "file": "Paragon Feeds Ltd Financials 2026 (2).pdf",
+    "error": "Claude response for 'Paragon Feeds Ltd Financials 2026 (2).pdf' was not valid JSON: Expecting value: line 1 column 1 (char 0)\nRaw response: Here is the extracted JSON:\n\n```json\n{\n  \"company_name\": \"Paragon Feeds Limited\",\n  \"financial_year\": 2026,\n  \"financial_year_start\": \"2025-04-01\",\n  \"financial_year_end\": \"2026-03-31\",\n  \"currency\": \"KES\",\n  \"auditor_name\": \"Leon Williams & Associates\",\n\n  \"turnover_cents\": 23498098700,\n  \"other_income_cents\": null,\n  \"cost_of_sales_cents\": 19172467800,\n  \"operating_costs_cents\": 1967816000,\n  \"administrative_costs_cents\": 1124859200,\n  \"staff_costs_cents\": 443676200,\n  \"finance_costs_cents\": 130339200,\n  \"depreciation_expense_cents\": 203148000,\n  \"other_expenses_cents\": null,\n  \"profit_before_tax_cents\": 2357814900,\n  \"tax_expense_cents\": 707344500,\n  \"profit_after_tax_cents\": 1650470400,\n\n  \"property_plant_equipment_cents\": 4647434700,\n  \"intangible_assets_cents\": null,\n  \"investments_cents\": null,\n  \"inventory_cents\": 3326828400,\n  \"trade_receivables_cents\": 3135965200,\n  \"other_receivables_cents\": 18150000,\n  \"prepayments_cents\": null,\n  \"cash_and_equivalents_cents\": 358680800,\n  \"total_assets_cents\": 11241029100,\n  \"trade_payables_cents\": 88655300,\n  \"tax_payable_cents\": 707344500,\n  \"short_term_loans_cents\": null,\n  \"long_term_loans_cents\": 1337752600,\n  \"other_payables_cents\": 10000000,\n  \"other_noncurrent_liabilities_cents\": null,\n  \"total_liabilities_cents\": 1343526300,\n  \"share_capital_cents\": 10000000,\n  \"retained_earnings_cents\": 9543276500,\n  \"other_reserves_cents\": 350000000,\n  \"equity_cents\": 11241029100,\n  \"total_equity_and_liabilities_cents\": 11241029100,\n\n  \"operating_cashflow_cents\": -135492400,\n  \"investing_cashflow_cents\": -1303747200,\n  \"financing_cashflow_cents\": 1256774000,\n  \"cash_at_start_cents\": 541146500,\n  \"cash_at_end_cents\": 358680900,\n\n  \"cash_breakdown\": {\n    \"Bank Account\": 98152300,\n    \"Cash in Hand\": 260528500\n  },\n\n  \"loan_breakdown\": [\n    {\n      \"name\": \"K.I.E Loan\",\n      \"reference\": null,\n      \"type\": \"Hire Purchase Loan\",\n      \"amount_cents\": 1094219400\n    },\n    {\n      \"name\": \"I & M Loan\",\n      \"reference\": null,"
+  },
+  {
+    "file": "Maharaji Audited Accounts.pdf",
+    "error": "Claude API call failed for 'Maharaji Audited Accounts.pdf': Error code: 429 - {'type': 'error', 'error': {'type': 'rate_limit_error', 'message': \"This request would exceed your organization's rate limit of 30,000 input tokens per minute (org: 9bd67329-45a8-490c-996a-dcdeed4ac8a9, model: claude-sonnet-4-6). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Reduce the prompt length or the maximum tokens requested, or try again later. View your current limits at https://console.anthropic.com/settings/limits. To raise this limit, purchase credits to advance to the next usage tier at https://console.anthropic.com/settings/billing.\"}, 'request_id': 'req_011CcGxrF8qwvKWJasgcERwe'}"
+  },
+  {
+    "file": "Tres Beau Ltd Audited Accounts.pdf",
+    "input_tokens": 31219,
+    "output_tokens": 656,
+    "cost_usd": 0.1035,
+    "output_json": "/Users/mbakswatu/Desktop/ParitySME/Tunnel/backend/scripts/validate_claude_audited_extraction_output/Tres Beau Ltd Audited Accounts.json"
+  }
+]

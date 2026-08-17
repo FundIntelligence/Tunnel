@@ -38,6 +38,24 @@ class TestMetadata:
     def test_currency(self, result):
         assert result["currency"] == "KES"
 
+    def test_currency_not_sourced_from_cover_page_alone(self):
+        """
+        Regression guard: the Buildex cover page (page 1) carries no currency
+        marker at all — "KShs" only appears in the accounting-policy note
+        (page 13) and the explicit currency note (page 24). If metadata
+        extraction ever goes back to scanning page 1 only, this must fail
+        loudly instead of silently returning currency=None.
+        """
+        import pdfplumber
+        from app.extractors.currency_detector import detect as detect_currency
+
+        with pdfplumber.open(FIXTURE_PATH) as pdf:
+            page_1_text = pdf.pages[0].extract_text() or ""
+            assert detect_currency(page_1_text) is None, (
+                "Test fixture assumption changed: page 1 now contains a "
+                "currency marker. Re-check this regression guard still makes sense."
+            )
+
     def test_financial_year_end(self, result):
         assert result["financial_year_end"] == "2025-12-31"
 

@@ -38,7 +38,7 @@ _ISO_CODES = {
 # Priority 3: local symbols and abbreviations → definitive ISO code
 # Order matters: more specific patterns before shorter ones
 _SYMBOLS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'\bKSh\b|\bKsh\b|\bK\.Sh\b'), 'KES'),
+    (re.compile(r'\bKShs?\b|\bKshs?\b|\bK\.Shs?\b'), 'KES'),
     (re.compile(r'\bUShs\b|\bU\.Shs\b|\bUsh\b'), 'UGX'),
     (re.compile(r'\bRFw\b|\bFRw\b|\bFrw\b|\bRWF\b'), 'RWF'),
     (re.compile(r'GH[₵¢]|\bGH[Cc]\b'), 'GHS'),

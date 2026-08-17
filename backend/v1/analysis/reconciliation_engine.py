@@ -15,10 +15,37 @@ the result boundary.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Request-scoped read cache. The five reconciliation sub-calculations each
+# independently re-fetch the same audited-financials row and the same
+# fiscal-year transaction set (revenue/expenses/loans all pull the identical
+# windowed transactions, ~12 paginated round-trips apiece). Within a single
+# generate_reconciliation_section() run those reads are deterministic, so we
+# memoize them in a ContextVar the orchestrator sets up and tears down. This is
+# a pure read cache — it changes no reconciliation math, only how many times the
+# same rows are fetched. ContextVar (not a module global) keeps it per-execution
+# and avoids cross-request staleness.
+_recon_read_cache: contextvars.ContextVar[Optional[Dict[Any, Any]]] = (
+    contextvars.ContextVar("_recon_read_cache", default=None)
+)
+
+
+def _cache_get(key: Any) -> Any:
+    cache = _recon_read_cache.get()
+    if cache is None:
+        return None
+    return cache.get(key)
+
+
+def _cache_put(key: Any, value: Any) -> None:
+    cache = _recon_read_cache.get()
+    if cache is not None:
+        cache[key] = value
 
 # Tolerance below which variance is "EXACT_MATCH" (KES 10 = 1000 cents)
 _EXACT_MATCH_CENTS = 1_000
@@ -42,6 +69,21 @@ _REVENUE_ROLES = {
 # Roles excluded from expense outflows (transfers between own accounts)
 _INTERNAL_TRANSFER_ROLES = {"transfer", "internal_transfer"}
 
+# Outflow roles that are NOT operating expenses and must be excluded from the
+# expense reconciliation. Without this, the expense calc deny-listed only the
+# transfer roles above and summed EVERY other outflow, which:
+#   - double-counted loan_repayment (it has its own loan reconciliation below)
+#   - counted reversal_debit, whose mirror reversal_credit is NOT counted as
+#     revenue, so the pair did not net out
+#   - counted needs_review (unclassified) outflows as confirmed expenses
+# This asymmetry (revenue allow-listed, expenses deny-listed) inflated
+# "Expenses Observed" above "Revenue Observed". — PAR-30
+_NON_EXPENSE_OUTFLOW_ROLES = (
+    _INTERNAL_TRANSFER_ROLES
+    | _LOAN_OUTFLOW_ROLES
+    | {"reversal_debit", "needs_review"}
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -57,6 +99,11 @@ def _get_audited_financials(deal_id: str) -> Dict[str, Any]:
     Return the most recent audited financials row for this deal.
     Raises ValueError if not found.
     """
+    cache_key = ("audited_financials", deal_id)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     sb = _get_supabase()
     res = (
         sb.table("pds_audited_financials")
@@ -71,6 +118,7 @@ def _get_audited_financials(deal_id: str) -> Dict[str, Any]:
             f"No audited financials found for deal {deal_id}. "
             "Upload audited statements before running reconciliation."
         )
+    _cache_put(cache_key, res.data[0])
     return res.data[0]
 
 
@@ -85,6 +133,11 @@ def _get_fiscal_year_transactions(
     Returns a list of dicts with keys: txn_date, signed_amount_cents, role,
     document_id, account_id, balance_cents (may be None).
     """
+    cache_key = ("fiscal_year_txns", deal_id, fiscal_start, fiscal_end)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     sb = _get_supabase()
 
     # Paginate raw transactions in fiscal window
@@ -108,6 +161,7 @@ def _get_fiscal_year_transactions(
         offset += PAGE
 
     if not txn_rows:
+        _cache_put(cache_key, [])
         return []
 
     # Build txn_id → role map from pds_txn_entity_map.
@@ -129,9 +183,15 @@ def _get_fiscal_year_transactions(
             break
         em_offset += PAGE
 
+    # pds_txn_entity_map.txn_id is the raw-transaction PRIMARY KEY (pds_raw_transactions.id,
+    # a uuid), NOT the pds_raw_transactions.txn_id business key (text). Looking up by the
+    # business key never matched, so every role resolved to "" — which silently zeroed the
+    # role-based reconciliations (Revenue Observed = 0, Loan Observed = 0) and over-counted
+    # Expenses (its filter passes empty roles, so internal transfers were summed as outflows).
     for row in txn_rows:
-        row["role"] = role_map.get(row.get("txn_id", ""), "")
+        row["role"] = role_map.get(row.get("id", ""), "")
 
+    _cache_put(cache_key, txn_rows)
     return txn_rows
 
 
@@ -356,6 +416,11 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
     fiscal_start: str = af["financial_year_start"]
     fiscal_end: str = af["financial_year_end"]
 
+    # Granular cost sub-categories — retained for the gap-explanation narrative
+    # only, NOT summed as the reconciliation input. Summing them mis-states the
+    # comparison whenever the document's expense breakdown does not partition
+    # cleanly into exactly these five fields (an expense line with no matching
+    # field is dropped; a line that maps to two is double-counted).
     cost_fields = [
         "cost_of_sales_cents",
         "operating_costs_cents",
@@ -363,9 +428,18 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
         "staff_costs_cents",
         "finance_costs_cents",
     ]
-    declared_expenses_cents = sum(
-        int(af.get(f) or 0) for f in cost_fields
-    )
+
+    # Authoritative reconciliation input: the income statement's OWN stated
+    # total-expenses figure, transcribed verbatim by the extractor. Fall back to
+    # summing the granular sub-categories only when no stated total is present
+    # (legacy pdfplumber extractor, or rows written before migration 018).
+    stated_total = af.get("total_expenses_cents")
+    if stated_total is not None:
+        declared_expenses_cents = int(stated_total)
+        declared_expenses_source = "stated_total"
+    else:
+        declared_expenses_cents = sum(int(af.get(f) or 0) for f in cost_fields)
+        declared_expenses_source = "subcategory_sum"
 
     txns = _get_fiscal_year_transactions(deal_id, fiscal_start, fiscal_end)
 
@@ -373,7 +447,7 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
         abs(r["signed_amount_cents"])
         for r in txns
         if r["signed_amount_cents"] < 0
-        and r.get("role") not in _INTERNAL_TRANSFER_ROLES
+        and r.get("role") not in _NON_EXPENSE_OUTFLOW_ROLES
     )
 
     gap_cents = declared_expenses_cents - bank_outflow_cents
@@ -387,6 +461,7 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
         "fiscal_period": f"{fiscal_start} to {fiscal_end}",
         "bank_outflows_kes": round(bank_outflow_cents / 100, 2),
         "declared_expenses_kes": round(declared_expenses_cents / 100, 2),
+        "declared_expenses_source": declared_expenses_source,
         "gap_kes": round(gap_cents / 100, 2),
         "gap_pct": gap_pct,
         "explanation": (

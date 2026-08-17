@@ -18,13 +18,14 @@ Design notes
 
 import asyncio
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from ..integrations.musa_deploy_config import API_BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,7 @@ async def _process_session(session: Dict[str, Any]) -> None:
         logger.info("[MusaWorker] Session completed session=%s", session_id)
 
         if webhook_url:
-            base_url = os.getenv("API_BASE_URL", "https://parity-ingestion.onrender.com")
+            base_url = API_BASE_URL
             await _post_webhook(webhook_url, {
                 "session_id": session_id,
                 "status": "completed",

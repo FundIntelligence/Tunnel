@@ -183,6 +183,15 @@ export async function exportSnapshot(
   return res.json()
 }
 
+/** Read-only check for whether a deal already has an analysis run, without triggering export. */
+export async function getLatestAnalysis(
+  dealId: string
+): Promise<{ analysis_run: AnalysisRun | null }> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/analysis/latest`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function getDocumentTransactions(
   documentId: string
 ): Promise<{ document_id: string; transactions: Array<Record<string, unknown>> }> {
@@ -266,6 +275,51 @@ export interface AuditedFinancialsRecord {
   total_expenses_cents?: number | null
   total_liabilities_cents?: number | null
   extraction_confidence?: number
+  confirmed_at?: string | null
+  removed_at?: string | null
+}
+
+/**
+ * Thrown when an upload is blocked because a human-confirmed record already
+ * exists for the same deal + financial year (HTTP 409). Carries a stable `code`
+ * so the UI can render a named, actionable state instead of a generic failure.
+ */
+export class AuditedFinancialsUploadError extends Error {
+  code: string
+  status: number
+  financialYear?: number | null
+  constructor(
+    message: string,
+    opts: { code: string; status: number; financialYear?: number | null }
+  ) {
+    super(message)
+    this.name = 'AuditedFinancialsUploadError'
+    this.code = opts.code
+    this.status = opts.status
+    this.financialYear = opts.financialYear ?? null
+  }
+}
+
+/**
+ * Thrown when a removal is blocked or under-specified. Codes:
+ *   CONFIRMED_RECORD_LOCKED   (409) — confirmed record, no ?supersede=true
+ *   SUPERSEDE_REASON_REQUIRED (422) — supersede requested without a reason
+ * Carries a stable `code` so the UI can render a named state.
+ */
+export class AuditedFinancialsRemoveError extends Error {
+  code: string
+  status: number
+  financialYear?: number | null
+  constructor(
+    message: string,
+    opts: { code: string; status: number; financialYear?: number | null }
+  ) {
+    super(message)
+    this.name = 'AuditedFinancialsRemoveError'
+    this.code = opts.code
+    this.status = opts.status
+    this.financialYear = opts.financialYear ?? null
+  }
 }
 
 export async function uploadAuditedFinancials(
@@ -280,7 +334,35 @@ export async function uploadAuditedFinancials(
     method: 'POST',
     body: form,
   })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) {
+    const bodyText = await res.text()
+    // FastAPI nests structured detail under { detail: {...} }.
+    let detail: unknown = null
+    try {
+      detail = (JSON.parse(bodyText) as { detail?: unknown }).detail
+    } catch {
+      /* non-JSON body — fall through to raw text */
+    }
+    if (
+      res.status === 409 &&
+      detail &&
+      typeof detail === 'object' &&
+      (detail as { status?: string }).status === 'CONFIRMED_RECORD_EXISTS'
+    ) {
+      const d = detail as { detail?: string; financial_year?: number }
+      throw new AuditedFinancialsUploadError(
+        d.detail || 'A confirmed record exists for this financial year.',
+        { code: 'CONFIRMED_RECORD_EXISTS', status: 409, financialYear: d.financial_year }
+      )
+    }
+    const msg =
+      detail && typeof detail === 'object' && (detail as { detail?: string }).detail
+        ? (detail as { detail: string }).detail
+        : typeof detail === 'string'
+          ? detail
+          : bodyText
+    throw new Error(msg)
+  }
   return res.json()
 }
 
@@ -303,6 +385,55 @@ export async function patchAuditedFinancials(
     body: JSON.stringify(fields),
   })
   if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+/**
+ * Soft-remove an audited-financials record from a deal's queue.
+ * Unconfirmed records remove freely. Confirmed records require
+ * `{ supersede: true, reason }` — the backend returns 409 CONFIRMED_RECORD_LOCKED
+ * otherwise, or 422 SUPERSEDE_REASON_REQUIRED if the reason is missing.
+ */
+export async function removeAuditedFinancials(
+  dealId: string,
+  financialYear: number,
+  opts: { supersede?: boolean; reason?: string } = {}
+): Promise<{ status: string; deal_id: string; financial_year: number; superseded: boolean }> {
+  const qs = opts.supersede ? '?supersede=true' : ''
+  const res = await fetchApi(
+    `${BASE}/deals/${dealId}/audited-financials/${financialYear}${qs}`,
+    {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts.reason ? { reason: opts.reason } : {}),
+    }
+  )
+  if (!res.ok) {
+    const bodyText = await res.text()
+    let detail: unknown = null
+    try {
+      detail = (JSON.parse(bodyText) as { detail?: unknown }).detail
+    } catch {
+      /* non-JSON body — fall through to raw text */
+    }
+    const d =
+      detail && typeof detail === 'object'
+        ? (detail as { status?: string; detail?: string; financial_year?: number })
+        : null
+    if (res.status === 409 && d?.status === 'CONFIRMED_RECORD_LOCKED') {
+      throw new AuditedFinancialsRemoveError(
+        d.detail || 'This financial year is confirmed and is locked against removal.',
+        { code: 'CONFIRMED_RECORD_LOCKED', status: 409, financialYear: d.financial_year }
+      )
+    }
+    if (res.status === 422 && d?.status === 'SUPERSEDE_REASON_REQUIRED') {
+      throw new AuditedFinancialsRemoveError(
+        d.detail || 'A reason is required to supersede a confirmed record.',
+        { code: 'SUPERSEDE_REASON_REQUIRED', status: 422, financialYear: d.financial_year }
+      )
+    }
+    throw new Error(d?.detail || bodyText)
+  }
   return res.json()
 }
 
@@ -542,21 +673,45 @@ export async function getNeedsReviewTransactions(
   return res.json()
 }
 
+export type OverrideReasonCategory =
+  | 'misclassified_rule_matching'
+  | 'ambiguous_narrative'
+  | 'known_exception'
+  | 'duplicate_reversal'
+  | 'other'
+
+// PAR-52 draft taxonomy — may be refined later. 'other' requires a reason note.
+export const OVERRIDE_REASON_OPTIONS: { value: OverrideReasonCategory; label: string }[] = [
+  { value: 'misclassified_rule_matching', label: 'Misclassified by rule-matching' },
+  { value: 'ambiguous_narrative', label: 'Ambiguous narrative' },
+  { value: 'known_exception', label: 'Known exception for this client/deal' },
+  { value: 'duplicate_reversal', label: 'Duplicate/reversal' },
+  { value: 'other', label: 'Other' },
+]
+
 export async function resolveTransaction(
   dealId: string,
   rowId: string,
   newRole: string,
-  analystInitials: string
+  analystInitials: string,
+  reasonCategory: OverrideReasonCategory,
+  reasonNote?: string
 ): Promise<{ success: boolean; remaining_count: number }> {
   const form = new FormData()
   form.append('row_id', rowId)
   form.append('new_role', newRole)
   form.append('analyst_initials', analystInitials)
+  form.append('reason_category', reasonCategory)
+  form.append('reason_note', reasonNote ?? '')
   const res = await fetchApiFormData(`${BASE}/deals/${dealId}/transactions/resolve`, {
     method: 'POST',
     body: form,
   })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) {
+    const err = new Error(await res.text()) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
   return res.json()
 }
 
@@ -612,8 +767,18 @@ export async function getExportSummary(dealId: string): Promise<ExportSummary> {
   return res.json()
 }
 
+export async function getDeal(dealId: string): Promise<{ deal: Deal; analysis_runs: AnalysisRun[]; snapshots: Snapshot[] }> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function downloadSnapshotPdf(dealId: string): Promise<Response> {
   return fetchApi(`${BASE}/deals/${dealId}/snapshot/pdf`)
+}
+
+export async function downloadReport(dealId: string): Promise<Response> {
+  return fetchApi(`${BASE}/deals/${dealId}/report`)
 }
 
 export async function exportTransactionsCsvBlob(dealId: string): Promise<Response> {
@@ -748,6 +913,15 @@ export async function getMonthlyCashflow(dealId: string): Promise<{ monthly_cash
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to load cashflow' }))
     throw new Error(err.detail ?? 'Failed to load cashflow')
+  }
+  return res.json()
+}
+
+export async function getCreditScoringInputs(dealId: string): Promise<Record<string, unknown>> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/analytics/credit-scoring-inputs`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to load credit scoring inputs' }))
+    throw new Error(err.detail ?? 'Failed to load credit scoring inputs')
   }
   return res.json()
 }

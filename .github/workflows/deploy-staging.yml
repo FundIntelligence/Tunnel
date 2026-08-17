@@ -6,6 +6,60 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      # Not secret — same project/org IDs already in the (gitignored)
+      # .vercel/project.json from `vercel link`. Setting them here makes
+      # the CLI treat the project as already linked, which skips the
+      # "Searching for existing projects… Detected services…" auto-link
+      # flow entirely. That flow is the actual bug: with no linked project
+      # in a fresh CI checkout, the CLI auto-detects this repo as a
+      # monorepo (Next.js root + backend/ FastAPI app) and derives a
+      # composite service name containing "---", which Vercel rejects
+      # outright (400, "cannot contain the sequence '---'") — confirmed
+      # on every run of this workflow since it was added (all failed in
+      # ~25s at this exact step). The CLI versions in this range have no
+      # `--name` flag to override the derived name directly; skipping
+      # the auto-link path is the actual fix.
+      VERCEL_ORG_ID: team_XB5VRCY5Aw7WZHX6VmCoJQ1d
+      VERCEL_PROJECT_ID: prj_tFcVwlw0XAJMP0zH8QfmMmG2WLkf
     steps:
-      - name: Trigger Vercel staging deploy
-        run: curl -X POST "https://api.vercel.com/v1/integrations/deploy/prj_tFcVwlw0XAJMP0zH8QfmMmG2WLkf/KQqrFUW0tG"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The deploy-hook curl this replaced created a deployment correctly
+      # classified target=production (productionBranch is "paritystaging"),
+      # but a deploy hook isn't a git-push webhook — it never actually
+      # promoted that build to parity-sme-staging.vercel.app. Builds piled
+      # up as individual "production-target" deployments while the real
+      # alias sat on a build from 2026-06-20 (PR #7) for over a week.
+      # `vercel deploy --prod` does the build AND the promotion in one
+      # deterministic step, same as the manual command that fixed this
+      # once already — now it runs on every push instead of by hand.
+      - name: Install Vercel CLI
+        run: npm install -g vercel@52.0.0
+      # `vercel deploy --prod` builds and creates a production deployment, and
+      # the auto-generated *-mbaks-projects.vercel.app domain follows it. But
+      # the CUSTOM production domain (parity-sme-staging.vercel.app) had stopped
+      # following new production deployments: the project was left in a
+      # pinned / rolled-back state, which disables auto-assignment of production
+      # domains. In that state every --prod deploy still succeeds but the
+      # canonical domain stays frozen on an old build (it sat on a 2026-06-20
+      # build for over a week despite many green production deploys).
+      #
+      # `vercel promote <url>` re-enables auto-assignment AND points all
+      # production domains — including the custom one — at the given deployment.
+      # Running it on every push makes the canonical domain track the latest
+      # build deterministically, instead of depending on auto-assignment state.
+      #
+      # `vercel promote` needs an explicit --scope: unlike `vercel deploy`,
+      # it does not resolve the team from VERCEL_ORG_ID, so without it the
+      # deployment lookup runs under the token's personal scope and fails
+      # with "Deployment belongs to a different team". The scope is the team
+      # slug (mbaks-projects), matching the *-mbaks-projects.vercel.app domains.
+      - name: Deploy to Vercel production (staging project)
+        run: |
+          set -euo pipefail
+          DEPLOY_URL="$(vercel deploy --prod --yes --token=${{ secrets.VERCEL_TOKEN }})"
+          echo "Deployed: $DEPLOY_URL"
+          vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }}

@@ -134,7 +134,7 @@ function OverrideModal({
           <button
             onClick={handleSave}
             disabled={!reason.trim() || role === txn.role}
-            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm font-medium"
+            className="px-4 py-2 bg-teal-500 hover:bg-teal-600 disabled:opacity-40 rounded text-sm font-medium"
           >
             Save override
           </button>
@@ -264,7 +264,7 @@ function AddFlagForm({ onAdd }: { onAdd: (f: CustomFlag) => void }) {
         <button
           onClick={handleAdd}
           disabled={!name.trim() || !thresholdStr}
-          className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded text-sm"
+          className="px-4 py-1.5 bg-teal-500 hover:bg-teal-600 disabled:opacity-40 rounded text-sm"
         >
           Add alert
         </button>
@@ -506,7 +506,7 @@ function ParityReviewContent() {
             <div className="flex gap-4 text-xs text-gray-500 mb-3">
               <span>{filteredTxns.length} of {transactions.length} transactions</span>
               {overrides.length > 0 && (
-                <span className="text-indigo-400">{overrides.length} override{overrides.length !== 1 ? 's' : ''} staged</span>
+                <span className="text-teal-400">{overrides.length} override{overrides.length !== 1 ? 's' : ''} staged</span>
               )}
             </div>
 
@@ -531,7 +531,7 @@ function ParityReviewContent() {
                     return (
                       <tr
                         key={t.id}
-                        className={`border-t border-gray-800 hover:bg-gray-800 cursor-pointer transition-colors ${isOverridden ? 'bg-indigo-950/20' : ''}`}
+                        className={`border-t border-gray-800 hover:bg-gray-800 cursor-pointer transition-colors ${isOverridden ? 'bg-teal-950/20' : ''}`}
                         onClick={() => setModalTxn(t)}
                       >
                         <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{t.txn_date}</td>
@@ -544,7 +544,7 @@ function ParityReviewContent() {
                           {isOverridden ? (
                             <span className="flex items-center gap-1">
                               <span className="line-through text-gray-500 text-xs">{t.role}</span>
-                              <span className="text-indigo-300">{displayRole}</span>
+                              <span className="text-teal-300">{displayRole}</span>
                             </span>
                           ) : (
                             <span className="text-gray-300">{displayRole || '—'}</span>
@@ -585,7 +585,7 @@ function ParityReviewContent() {
                         <span className="text-gray-500">·</span>
                         <span className="line-through text-gray-500">{o.original_role}</span>
                         <span className="text-gray-500">→</span>
-                        <span className="text-indigo-300">{o.override_role}</span>
+                        <span className="text-teal-300">{o.override_role}</span>
                         <span className="text-gray-500 italic truncate flex-1">{o.override_reason}</span>
                       </li>
                     );
@@ -671,7 +671,7 @@ function ParityReviewContent() {
               <button
                 onClick={() => handleSave(true)}
                 disabled={saving}
-                className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded font-medium"
+                className="px-5 py-2 bg-teal-500 hover:bg-teal-600 disabled:opacity-40 rounded font-medium"
               >
                 {saving ? 'Saving…' : 'Finalize for export'}
               </button>

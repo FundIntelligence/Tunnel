@@ -1,0 +1,87 @@
+{
+  "administrative_costs_cents": 947518800,
+  "auditor_name": "FH Consulting LLP",
+  "cash_and_equivalents_cents": 212578100,
+  "cash_at_end_cents": 212578100,
+  "cash_at_start_cents": 588956700,
+  "cash_breakdown": {
+    "Absa": 23539700,
+    "Equity": 155587200,
+    "Equity Bank Account 2": 31000,
+    "KCB": 30312500,
+    "Tende pay": 0,
+    "Zemo": 3107600
+  },
+  "company_name": "Buildex Interiors Company Limited",
+  "cost_of_sales_cents": 32700728500,
+  "currency": "KES",
+  "depreciation_expense_cents": 511942800,
+  "equity_cents": 1994078300,
+  "extraction_method": "claude_sonnet_4_6",
+  "finance_costs_cents": 375461300,
+  "financial_year": 2025,
+  "financial_year_end": "2025-12-31",
+  "financial_year_start": "2025-01-01",
+  "financing_cashflow_cents": 255709200,
+  "intangible_assets_cents": null,
+  "inventory_cents": 2911841500,
+  "investing_cashflow_cents": -1109330000,
+  "investments_cents": 760930000,
+  "loan_breakdown": [
+    {
+      "amount_cents": 450425800,
+      "name": "Asset Finance",
+      "reference": "074FLBC242960001",
+      "type": "Asset Finance"
+    },
+    {
+      "amount_cents": 421759800,
+      "name": "Asset Finance",
+      "reference": "074FLBC241980001",
+      "type": "Asset Finance"
+    },
+    {
+      "amount_cents": 531501100,
+      "name": "Asset Finance",
+      "reference": "074FLBC251700001",
+      "type": "Asset Finance"
+    },
+    {
+      "amount_cents": 270000000,
+      "name": "Normal loan",
+      "reference": "074RF01253440002",
+      "type": "Term Loan"
+    },
+    {
+      "amount_cents": 359030800,
+      "name": "Jiinue Loan",
+      "reference": "0100011413058",
+      "type": "Term Loan"
+    }
+  ],
+  "long_term_loans_cents": 2032717500,
+  "operating_cashflow_cents": 477242200,
+  "operating_costs_cents": 918972200,
+  "other_expenses_cents": null,
+  "other_income_cents": 2210900,
+  "other_noncurrent_liabilities_cents": null,
+  "other_payables_cents": null,
+  "other_receivables_cents": 164738500,
+  "other_reserves_cents": null,
+  "prepayments_cents": null,
+  "profit_after_tax_cents": 544766500,
+  "profit_before_tax_cents": 833018500,
+  "property_plant_equipment_cents": 1438478500,
+  "retained_earnings_cents": 1984078300,
+  "share_capital_cents": 10000000,
+  "short_term_loans_cents": null,
+  "staff_costs_cents": 1430528300,
+  "tax_expense_cents": 288252000,
+  "tax_payable_cents": 288252000,
+  "total_assets_cents": 5887482900,
+  "total_equity_and_liabilities_cents": 4026795800,
+  "total_liabilities_cents": 3893404600,
+  "trade_payables_cents": 1572435100,
+  "trade_receivables_cents": 398916400,
+  "turnover_cents": 37206227700
+}

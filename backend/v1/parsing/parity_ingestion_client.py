@@ -107,7 +107,8 @@ def _parity_result_to_rows(
             "raw_descriptor": desc,
             "parsed_descriptor": desc.strip(),
             "normalized_descriptor": normalize_descriptor(desc),
-            "account_id": "default",
+            # Per-document account_id enables transfer detection — see PAR-30.
+            "account_id": str(document_id),
         }
         row_obj["txn_id"] = compute_txn_id(row_obj, document_id)
         rows.append(row_obj)

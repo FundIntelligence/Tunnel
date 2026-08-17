@@ -42,40 +42,40 @@ export default function NewDealPage() {
 
   if (!authChecked) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: '#080C18' }}>
-        <div className="w-8 h-8 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin" />
+      <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--bg)' }}>
+        <div className="w-8 h-8 rounded-full border-2 border-teal-500 border-t-transparent animate-spin" />
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6" style={{ background: '#080C18' }}>
+    <div className="min-h-screen flex items-center justify-center p-6" style={{ background: 'var(--bg)' }}>
       <div className="w-full max-w-lg">
         {/* Header */}
         <div className="mb-8">
-          <div className="text-xs font-medium tracking-widest uppercase mb-1" style={{ color: '#6366F1', fontFamily: 'IBM Plex Mono, monospace' }}>
+          <div className="text-xs font-medium tracking-widest uppercase mb-1" style={{ color: 'var(--accent)', fontFamily: 'IBM Plex Mono, monospace' }}>
             PARITY
           </div>
-          <h1 className="text-2xl font-bold" style={{ color: '#F1F5F9' }}>New Deal</h1>
-          <p className="text-sm mt-1" style={{ color: '#64748B' }}>
+          <h1 className="text-2xl font-bold" style={{ color: 'var(--t0)' }}>New Deal</h1>
+          <p className="text-sm mt-1" style={{ color: 'var(--t2)' }}>
             Set up a new deal workspace to start uploading statements.
           </p>
         </div>
 
         <div
           className="rounded-xl p-8"
-          style={{ background: '#0D1220', border: '1px solid rgba(99,102,241,0.2)' }}
+          style={{ background: 'var(--s1)', border: '1px solid rgba(20,184,166,0.2)' }}
         >
           {error && (
-            <div className="mb-5 p-3 rounded-lg text-sm" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.35)', color: '#F87171' }}>
+            <div className="mb-5 p-3 rounded-lg text-sm" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.35)', color: 'var(--red)' }}>
               {error}
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <div>
-              <label className="block text-xs font-medium mb-1.5" style={{ color: '#94A3B8' }}>
-                Deal name <span style={{ color: '#EF4444' }}>*</span>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--t1)' }}>
+                Deal name <span style={{ color: 'var(--red)' }}>*</span>
               </label>
               <input
                 type="text"
@@ -84,13 +84,13 @@ export default function NewDealPage() {
                 required
                 placeholder="Q1 2026 Deal Pipeline"
                 className="w-full px-3 py-2.5 rounded-lg text-sm outline-none transition-colors"
-                style={{ background: '#131929', border: '1px solid rgba(99,102,241,0.25)', color: '#F1F5F9' }}
+                style={{ background: 'var(--s2)', border: '1px solid rgba(20,184,166,0.25)', color: 'var(--t0)' }}
               />
             </div>
 
             <div>
-              <label className="block text-xs font-medium mb-1.5" style={{ color: '#94A3B8' }}>
-                Company name <span style={{ color: '#EF4444' }}>*</span>
+              <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--t1)' }}>
+                Company name <span style={{ color: 'var(--red)' }}>*</span>
               </label>
               <input
                 type="text"
@@ -99,7 +99,7 @@ export default function NewDealPage() {
                 required
                 placeholder="Acme Manufacturing Ltd"
                 className="w-full px-3 py-2.5 rounded-lg text-sm outline-none transition-colors"
-                style={{ background: '#131929', border: '1px solid rgba(99,102,241,0.25)', color: '#F1F5F9' }}
+                style={{ background: 'var(--s2)', border: '1px solid rgba(20,184,166,0.25)', color: 'var(--t0)' }}
               />
             </div>
 
@@ -107,7 +107,7 @@ export default function NewDealPage() {
               type="submit"
               disabled={loading}
               className="w-full py-3 rounded-lg font-semibold text-sm transition-opacity mt-2"
-              style={{ background: '#6366F1', color: '#fff', opacity: loading ? 0.7 : 1 }}
+              style={{ background: 'var(--accent)', color: '#fff', opacity: loading ? 0.7 : 1 }}
             >
               {loading ? (
                 <span className="flex items-center justify-center gap-2">

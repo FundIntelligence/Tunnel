@@ -83,31 +83,31 @@ export default function Login() {
   return (
     <div
       className="min-h-screen flex items-center justify-center p-6"
-      style={{ background: '#080C18' }}
+      style={{ background: 'var(--bg)' }}
     >
       <div
         className="w-full max-w-md rounded-xl p-8 space-y-6"
-        style={{ background: '#0D1220', border: '1px solid rgba(99,102,241,0.2)' }}
+        style={{ background: 'var(--s1)', border: '1px solid rgba(20,184,166,0.2)' }}
       >
         {/* Logo */}
         <div className="text-center space-y-1">
-          <div className="text-2xl font-bold tracking-widest" style={{ color: '#F1F5F9', fontFamily: 'IBM Plex Mono, monospace' }}>
+          <div className="text-2xl font-bold tracking-widest" style={{ color: 'var(--t0)', fontFamily: 'IBM Plex Mono, monospace' }}>
             PARITY
           </div>
-          <div className="text-xs tracking-widest uppercase" style={{ color: '#6366F1', fontFamily: 'IBM Plex Sans, sans-serif' }}>
+          <div className="text-xs tracking-widest uppercase" style={{ color: 'var(--accent)', fontFamily: 'IBM Plex Sans, sans-serif' }}>
             Intelligence Infrastructure
           </div>
         </div>
 
         {/* Mode toggle */}
-        <div className="flex rounded-lg overflow-hidden" style={{ border: '1px solid rgba(99,102,241,0.25)' }}>
+        <div className="flex rounded-lg overflow-hidden" style={{ border: '1px solid rgba(20,184,166,0.25)' }}>
           <button
             type="button"
             onClick={() => { setMode('magic'); setError(''); setMessage('') }}
             className="flex-1 py-2 text-sm font-medium transition-colors"
             style={{
-              background: mode === 'magic' ? '#6366F1' : 'transparent',
-              color: mode === 'magic' ? '#fff' : '#94A3B8',
+              background: mode === 'magic' ? 'var(--accent)' : 'transparent',
+              color: mode === 'magic' ? '#fff' : 'var(--t1)',
             }}
           >
             Magic Link
@@ -117,8 +117,8 @@ export default function Login() {
             onClick={() => { setMode('password'); setError(''); setMessage('') }}
             className="flex-1 py-2 text-sm font-medium transition-colors"
             style={{
-              background: mode === 'password' ? '#6366F1' : 'transparent',
-              color: mode === 'password' ? '#fff' : '#94A3B8',
+              background: mode === 'password' ? 'var(--accent)' : 'transparent',
+              color: mode === 'password' ? '#fff' : 'var(--t1)',
             }}
           >
             Password
@@ -127,19 +127,19 @@ export default function Login() {
 
         {/* Error / success */}
         {error && (
-          <div className="p-3 rounded-lg text-sm" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.4)', color: '#F87171' }}>
+          <div className="p-3 rounded-lg text-sm" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.4)', color: 'var(--red)' }}>
             {error}
           </div>
         )}
         {message && (
-          <div className="p-3 rounded-lg text-sm" style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.4)', color: '#A5B4FC' }}>
+          <div className="p-3 rounded-lg text-sm" style={{ background: 'rgba(20,184,166,0.1)', border: '1px solid rgba(20,184,166,0.4)', color: 'var(--accent)' }}>
             {message}
           </div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-xs font-medium mb-1.5" style={{ color: '#94A3B8' }}>
+            <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--t1)' }}>
               Email address
             </label>
             <input
@@ -150,9 +150,9 @@ export default function Login() {
               placeholder="you@example.com"
               className="w-full px-3 py-2.5 rounded-lg text-sm outline-none transition-colors"
               style={{
-                background: '#131929',
-                border: '1px solid rgba(99,102,241,0.25)',
-                color: '#F1F5F9',
+                background: 'var(--s2)',
+                border: '1px solid rgba(20,184,166,0.25)',
+                color: 'var(--t0)',
               }}
             />
           </div>
@@ -160,10 +160,10 @@ export default function Login() {
           {mode === 'password' && !showForgotPassword && (
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label className="text-xs font-medium" style={{ color: '#94A3B8' }}>Password</label>
+                <label className="text-xs font-medium" style={{ color: 'var(--t1)' }}>Password</label>
                 {!isSignUp && (
                   <button type="button" onClick={() => { setShowForgotPassword(true); setError(''); setMessage('') }}
-                    className="text-xs" style={{ color: '#6366F1' }}>
+                    className="text-xs" style={{ color: 'var(--accent)' }}>
                     Forgot password?
                   </button>
                 )}
@@ -176,7 +176,7 @@ export default function Login() {
                 minLength={6}
                 placeholder="••••••••"
                 className="w-full px-3 py-2.5 rounded-lg text-sm outline-none"
-                style={{ background: '#131929', border: '1px solid rgba(99,102,241,0.25)', color: '#F1F5F9' }}
+                style={{ background: 'var(--s2)', border: '1px solid rgba(20,184,166,0.25)', color: 'var(--t0)' }}
               />
             </div>
           )}
@@ -185,7 +185,7 @@ export default function Login() {
             type="submit"
             disabled={loading}
             className="w-full py-2.5 rounded-lg font-semibold text-sm transition-opacity"
-            style={{ background: '#6366F1', color: '#fff', opacity: loading ? 0.7 : 1 }}
+            style={{ background: 'var(--accent)', color: '#fff', opacity: loading ? 0.7 : 1 }}
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
@@ -205,12 +205,12 @@ export default function Login() {
           <div className="text-center">
             {showForgotPassword ? (
               <button type="button" onClick={() => { setShowForgotPassword(false); setError(''); setMessage('') }}
-                className="text-xs" style={{ color: '#64748B' }}>
+                className="text-xs" style={{ color: 'var(--t2)' }}>
                 Back to sign in
               </button>
             ) : (
               <button type="button" onClick={() => { setIsSignUp(!isSignUp); setError(''); setMessage('') }}
-                className="text-xs" style={{ color: '#64748B' }}>
+                className="text-xs" style={{ color: 'var(--t2)' }}>
                 {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
               </button>
             )}

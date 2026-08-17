@@ -148,6 +148,7 @@ test_*.csv
 test_*.json
 !backend/tests/test_*.py
 !backend/tests/*_test.py
+!parity-classify-sandbox/tests/test_*.py
 !backend/tests_v1/test_*.py
 !backend/v1/tests/test_*.py
 !parity-ingestion/tests/test_*.py

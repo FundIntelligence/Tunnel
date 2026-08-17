@@ -11,6 +11,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from .reconciliation_engine import (
+    _recon_read_cache,
     calculate_account_coverage,
     calculate_cash_position_reconciliation,
     calculate_expense_reconciliation,
@@ -34,11 +35,18 @@ def generate_reconciliation_section(deal_id: str) -> Dict[str, Any]:
     """
     logger.info("[RECON] Generating reconciliation section for deal %s", deal_id)
 
-    cash = _safe_call("cash_position", calculate_cash_position_reconciliation, deal_id)
-    revenue = _safe_call("revenue", calculate_revenue_reconciliation, deal_id)
-    expenses = _safe_call("expenses", calculate_expense_reconciliation, deal_id)
-    loans = _safe_call("loan_activity", calculate_loan_activity_reconciliation, deal_id)
-    account_coverage = _safe_call("account_coverage", calculate_account_coverage, deal_id)
+    # Share one read cache across all five sub-calculations so the audited
+    # financials row and the fiscal-year transaction set are each fetched once
+    # per request instead of 4-5 times (the latter is ~12 paginated round-trips).
+    cache_token = _recon_read_cache.set({})
+    try:
+        cash = _safe_call("cash_position", calculate_cash_position_reconciliation, deal_id)
+        revenue = _safe_call("revenue", calculate_revenue_reconciliation, deal_id)
+        expenses = _safe_call("expenses", calculate_expense_reconciliation, deal_id)
+        loans = _safe_call("loan_activity", calculate_loan_activity_reconciliation, deal_id)
+        account_coverage = _safe_call("account_coverage", calculate_account_coverage, deal_id)
+    finally:
+        _recon_read_cache.reset(cache_token)
 
     tier = _compute_tier(cash, loans, account_coverage)
 

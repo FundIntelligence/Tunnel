@@ -1,6 +1,7 @@
 import type { Config } from "tailwindcss";
 
 const config: Config = {
+  darkMode: 'class',
   content: [
     "./pages/**/*.{js,ts,jsx,tsx,mdx}",
     "./components/**/*.{js,ts,jsx,tsx,mdx}",
@@ -9,9 +10,10 @@ const config: Config = {
   theme: {
     extend: {
       fontFamily: {
-        display: ['var(--font-agrandir-narrow)', 'Inter', 'system-ui', 'sans-serif'],
-        body: ['var(--font-inter)', 'Inter', 'system-ui', 'sans-serif'],
-        sans: ['var(--font-inter)', 'Inter', 'system-ui', 'sans-serif'],
+        display: ['IBM Plex Sans', 'var(--font-sans)', 'system-ui', 'sans-serif'],
+        body: ['IBM Plex Sans', 'var(--font-sans)', 'system-ui', 'sans-serif'],
+        sans: ['IBM Plex Sans', 'var(--font-sans)', 'system-ui', 'sans-serif'],
+        mono: ['IBM Plex Mono', 'var(--font-mono)', 'Courier New', 'monospace'],
       },
       colors: {
         base: {
@@ -20,7 +22,14 @@ const config: Config = {
         },
         accent: {
           cyan: '#22d3ee', // Cyber Cyan
-          indigo: '#818cf8', // Cosmic Indigo
+        },
+        teal: {
+          DEFAULT: '#14B8A6',
+          hover: '#0D9488',
+          dark: '#0A7068',
+        },
+        navy: {
+          DEFAULT: '#080C18',
         },
         primary: {
           50: '#f0f9ff',
@@ -42,7 +51,7 @@ const config: Config = {
       },
       boxShadow: {
         'inner-dark': 'inset 0 2px 4px 0 rgba(0, 0, 0, 0.6)',
-        'glow-indigo': '0 0 20px rgba(129, 140, 248, 0.5)',
+        'glow-teal': '0 0 20px rgba(20, 184, 166, 0.5)',
         'glow-cyan': '0 0 20px rgba(34, 211, 238, 0.5)',
       },
       backgroundImage: {

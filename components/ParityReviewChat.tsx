@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback, memo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { askParityReview, getParityChatSession, clearParityChatSession } from '@/lib/v1-api'
+import AnalystStatus from '@/components/AnalystStatus'
 
 // ── Lightweight markdown → HTML ────────────────────────────────────────────
 
@@ -51,10 +53,10 @@ function renderTable(rows: string[]): string {
   const bodyStart = sepIdx >= 0 ? sepIdx + 1 : (headerCells ? 1 : 0)
   const bodyRows = rows.slice(bodyStart).filter(r => !/^\|[\s\-:|]+\|$/.test(r))
 
-  const thStyle = 'padding:5px 10px;border:1px solid #1E2A3A;font-size:11px;font-weight:600;color:#A5B4FC;background:#0F172A;text-align:left;white-space:nowrap'
-  const tdStyle = 'padding:4px 10px;border:1px solid #1E2A3A;font-size:12px;color:#CBD5E1;white-space:nowrap'
+  const thStyle = 'padding:5px 10px;border:1px solid var(--b1);font-size:11px;font-weight:600;color:var(--accent);text-align:left;white-space:nowrap'
+  const tdStyle = 'padding:4px 10px;border:1px solid var(--b1);font-size:12px;color:var(--t1);white-space:nowrap'
 
-  let html = '<table style="border-collapse:collapse;width:100%;margin:8px 0;font-family:\'IBM Plex Mono\',monospace">'
+  let html = '<div style="overflow-x:auto;margin:8px 0"><table style="border-collapse:collapse;width:100%;font-family:\'IBM Plex Mono\',monospace">'
   if (headerCells) {
     html += '<thead><tr>' + headerCells.map(c => `<th style="${thStyle}">${c}</th>`).join('') + '</tr></thead>'
   }
@@ -63,7 +65,7 @@ function renderTable(rows: string[]): string {
     const cells = parseCells(row)
     html += '<tr>' + cells.map(c => `<td style="${tdStyle}">${c}</td>`).join('') + '</tr>'
   }
-  html += '</tbody></table>'
+  html += '</tbody></table></div>'
   return html
 }
 
@@ -72,10 +74,10 @@ function mdToHtml(md: string): string {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   s = convertTables(s)
   return s
-    .replace(/^## (.+)$/gm, '<h3 style="font-size:13px;font-weight:700;margin:12px 0 4px;color:#A5B4FC">$1</h3>')
-    .replace(/^### (.+)$/gm, '<h4 style="font-size:12px;font-weight:700;margin:10px 0 3px;color:#94A3B8">$1</h4>')
-    .replace(/^---$/gm, '<hr style="border:none;border-top:1px solid #1E2A3A;margin:8px 0"/>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#E2E8F0">$1</strong>')
+    .replace(/^## (.+)$/gm, '<h3 style="font-size:13px;font-weight:700;margin:12px 0 4px;color:var(--accent)">$1</h3>')
+    .replace(/^### (.+)$/gm, '<h4 style="font-size:12px;font-weight:700;margin:10px 0 3px;color:var(--t1)">$1</h4>')
+    .replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--b1);margin:8px 0"/>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong style="color:var(--t0)">$1</strong>')
     .replace(/^• (.+)$/gm, '<div style="padding-left:12px;margin:2px 0">· $1</div>')
     .replace(/^- (.+)$/gm, '<div style="padding-left:12px;margin:2px 0">· $1</div>')
     .replace(/[📊💡🏦📈📉⚠️✅❌🔍💰📋🏢📌🔎💼📁📂🗂️📄📃📑🔔🔕]/gu, '')
@@ -86,9 +88,18 @@ function mdToHtml(md: string): string {
 
 type ChatMessage = { role: 'analyst' | 'parity'; text: string; time: string }
 
+type ChatCache = {
+  chatHistory: ChatMessage[]
+  conversationHistory: Array<{ role: string; content: unknown }>
+  proactiveTriggered: boolean
+}
+
+const chatCacheKey = (id: string) => ['parity-chat', id] as const
+
 interface Props {
   dealId: string
   corpusReady: boolean
+  isCheckingAnalysis?: boolean
   txnTotal: number
   statementCount: number
 }
@@ -104,15 +115,76 @@ const SUGGESTION_CHIPS = [
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Props) {
+function ParityReviewChat({ dealId, corpusReady, isCheckingAnalysis, txnTotal, statementCount }: Props) {
+  const queryClient = useQueryClient()
+  const cached = queryClient.getQueryData<ChatCache>(chatCacheKey(dealId))
+
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
-  const [conversationHistory, setConversationHistory] = useState<Array<{ role: string; content: unknown }>>([])
-  const [proactiveTriggered, setProactiveTriggered] = useState(false)
-  const [sessionLoaded, setSessionLoaded] = useState(false)
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(cached?.chatHistory ?? [])
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: string; content: unknown }>>(cached?.conversationHistory ?? [])
+  const [proactiveTriggered, setProactiveTriggered] = useState(cached?.proactiveTriggered ?? false)
+  const [sessionLoaded, setSessionLoaded] = useState(cached != null)
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const prevDealIdRef = useRef(dealId)
+
+  // Persisted analysis state (so reloading the Analysis tab doesn't force re-run)
+  const [localCorpusReady, setLocalCorpusReady] = useState<boolean>(false)
+  const [localTxnTotal, setLocalTxnTotal] = useState<number>(txnTotal)
+  const [localStatementCount, setLocalStatementCount] = useState<number>(statementCount)
+
+  const effectiveCorpusReady = corpusReady || localCorpusReady
+  const effectiveTxnTotal = corpusReady ? txnTotal : localTxnTotal
+  const effectiveStatementCount = corpusReady ? statementCount : localStatementCount
+
+  // Load persisted analysis state on mount
+  useEffect(() => {
+    const key = `parity_analysis_${dealId}`
+    if (typeof window === 'undefined') return
+    try {
+      const raw = localStorage.getItem(key)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (parsed && parsed.ready) {
+          setLocalCorpusReady(true)
+          setLocalTxnTotal(parsed.txnTotal ?? txnTotal)
+          setLocalStatementCount(parsed.statementCount ?? statementCount)
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, [dealId, txnTotal, statementCount])
+
+  // When authoritative corpusReady arrives from server, persist it locally
+  useEffect(() => {
+    const key = `parity_analysis_${dealId}`
+    if (corpusReady) {
+      try {
+        localStorage.setItem(key, JSON.stringify({ ready: true, txnTotal, statementCount }))
+        setLocalCorpusReady(true)
+        setLocalTxnTotal(txnTotal)
+        setLocalStatementCount(statementCount)
+      } catch (e) { /* ignore */ }
+    }
+  }, [corpusReady, dealId, txnTotal, statementCount])
+
+  // Sync chat state to QueryClient cache so it survives full-page navigation
+  useEffect(() => {
+    queryClient.setQueryData(chatCacheKey(dealId), { chatHistory, conversationHistory, proactiveTriggered })
+  }, [dealId, chatHistory, conversationHistory, proactiveTriggered, queryClient])
+
+  // Handle dealId prop change: swap in state for the new deal from cache
+  useEffect(() => {
+    if (prevDealIdRef.current === dealId) return
+    prevDealIdRef.current = dealId
+    const next = queryClient.getQueryData<ChatCache>(chatCacheKey(dealId))
+    setChatHistory(next?.chatHistory ?? [])
+    setConversationHistory(next?.conversationHistory ?? [])
+    setProactiveTriggered(next?.proactiveTriggered ?? false)
+    setSessionLoaded(next != null)
+  }, [dealId, queryClient])
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -123,23 +195,78 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
   useEffect(() => {
     if (!corpusReady || sessionLoaded) return
     setSessionLoaded(true)
+
+    const storageKey = `parity_chat_${dealId}`
+
+    // Try to load cached chat from localStorage first (fast restore when navigating between tabs)
+    let localHistoryLength = 0
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem(storageKey)
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (parsed && Array.isArray(parsed.chatHistory) && parsed.chatHistory.length > 0) {
+            setChatHistory(parsed.chatHistory as ChatMessage[])
+            setConversationHistory(parsed.conversationHistory ?? [])
+            setProactiveTriggered(true) // don't re-trigger proactive since we have history
+            localHistoryLength = parsed.chatHistory.length
+          }
+        }
+      } catch (e) {
+        // ignore localStorage parse errors
+      }
+    }
+
     ;(async () => {
       try {
         const session = await getParityChatSession(dealId)
-        if (session.chat_history && session.chat_history.length > 0) {
+        // The server saves chat_history BEFORE the parity response is appended (it only receives
+        // the request body which doesn't include the answer yet), so local storage is always at
+        // least as up-to-date. Only switch to the server version when it genuinely has more
+        // messages — i.e. when another session (different device/browser) built a longer history.
+        if (session.chat_history && session.chat_history.length > localHistoryLength) {
           setChatHistory(session.chat_history as ChatMessage[])
           setConversationHistory(session.conversation_history)
-          setProactiveTriggered(true)  // don't re-trigger proactive
+          setProactiveTriggered(true)
+          try { if (typeof window !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ chatHistory: session.chat_history, conversationHistory: session.conversation_history })) } catch (e) { /* ignore */ }
+          return
+        }
+        // Server has same or fewer messages — localStorage is more complete, keep it.
+        if (localHistoryLength > 0) {
+          setProactiveTriggered(true)
           return
         }
       } catch {
-        // no session — fall through to proactive
+        // no server session — if we already loaded local data above, keep it; otherwise fall through to proactive
+        if (localHistoryLength > 0) {
+          setProactiveTriggered(true)
+          return
+        }
       }
-      // No existing session — trigger proactive analysis
+
+      // No history anywhere — trigger proactive opening analysis
       setProactiveTriggered(true)
       doAsk('start')
     })()
   }, [corpusReady, sessionLoaded, dealId])
+
+  // Persist chat and conversation history locally so switching tabs (client-side navigation) preserves state
+  useEffect(() => {
+    const storageKey = `parity_chat_${dealId}`
+    if (typeof window === 'undefined') return
+    try {
+      const payload = { chatHistory, conversationHistory }
+      // Only write if there is anything to save
+      if ((chatHistory && chatHistory.length > 0) || (conversationHistory && conversationHistory.length > 0)) {
+        localStorage.setItem(storageKey, JSON.stringify(payload))
+      } else {
+        // remove empty state to avoid stale entries
+        localStorage.removeItem(storageKey)
+      }
+    } catch (e) {
+      // ignore storage errors
+    }
+  }, [dealId, chatHistory, conversationHistory])
 
   const doAsk = useCallback(async (overrideMessage?: string) => {
     const message = overrideMessage || question.trim()
@@ -176,7 +303,9 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
     setConversationHistory([])
     setProactiveTriggered(false)
     setSessionLoaded(false)
-  }, [dealId])
+    queryClient.removeQueries({ queryKey: chatCacheKey(dealId) })
+    try { if (typeof window !== 'undefined') localStorage.removeItem(`parity_chat_${dealId}`) } catch (e) { /* ignore */ }
+  }, [dealId, queryClient])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doAsk() }
@@ -198,32 +327,25 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
 
   return (
     <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
-      <style>{`
-        @keyframes parityDot {
-          0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
-          40% { opacity: 1; transform: scale(1); }
-        }
-      `}</style>
-
       {/* Left: Chat area */}
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, color: '#CBD5E1', letterSpacing: '0.02em' }}>Parity Review</span>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--t1)', letterSpacing: '0.02em' }}>Parity Review</span>
           <span style={{
             fontSize: 9, fontWeight: 700, letterSpacing: '0.12em', padding: '2px 8px', borderRadius: 3,
-            background: corpusReady ? 'rgba(74,222,128,0.12)' : 'rgba(99,102,241,0.12)',
-            color: corpusReady ? '#4ADE80' : '#818CF8',
-            border: `1px solid ${corpusReady ? 'rgba(74,222,128,0.25)' : 'rgba(99,102,241,0.25)'}`,
+            background: effectiveCorpusReady ? 'rgba(74,222,128,0.12)' : 'rgba(20,184,166,0.12)',
+            color: effectiveCorpusReady ? 'var(--green)' : '#818CF8',
+            border: `1px solid ${effectiveCorpusReady ? 'rgba(74,222,128,0.25)' : 'rgba(20,184,166,0.25)'}`,
           }}>
-            {corpusReady ? 'READY' : 'PENDING'}
+            {effectiveCorpusReady ? 'READY' : isCheckingAnalysis ? 'CHECKING' : 'PENDING'}
           </span>
           {chatHistory.length > 0 && (
             <button
               onClick={handleClearChat}
-              style={{ marginLeft: 'auto', fontSize: 10, color: '#4A5568', background: 'transparent', border: '1px solid #1E2A3A', borderRadius: 4, padding: '3px 10px', cursor: 'pointer', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#EF4444'; (e.currentTarget as HTMLElement).style.color = '#F87171'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#1E2A3A'; (e.currentTarget as HTMLElement).style.color = '#4A5568'; }}
+              style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--t2)', background: 'transparent', border: '1px solid var(--b1)', borderRadius: 4, padding: '3px 10px', cursor: 'pointer', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--red)'; (e.currentTarget as HTMLElement).style.color = 'var(--red)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--b1)'; (e.currentTarget as HTMLElement).style.color = 'var(--t2)'; }}
             >
               CLEAR CHAT
             </button>
@@ -231,18 +353,23 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
         </div>
 
         {/* Corpus description card */}
-        {!corpusReady && (
-          <div style={{ background: '#0D1220', border: '1px solid #1E2A3A', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
-            <div style={{ fontSize: 12, color: '#4A5568', lineHeight: 1.6 }}>
+        {!effectiveCorpusReady && isCheckingAnalysis && (
+          <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
+            <AnalystStatus stage="checking" size={16} />
+          </div>
+        )}
+        {!effectiveCorpusReady && !isCheckingAnalysis && (
+          <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
+            <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
               Parity Intelligence is available once analysis completes. Run analysis from the Documents tab to activate.
             </div>
           </div>
         )}
-        {corpusReady && chatHistory.length === 0 && !loading && (
-          <div style={{ background: '#0D1220', border: '1px solid #1E2A3A', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: '#374151', letterSpacing: '0.08em', marginBottom: 6 }}>CORPUS LOADED</div>
-            <div style={{ fontSize: 12, color: '#4A5568', lineHeight: 1.6 }}>
-              {txnTotal > 0 ? `${txnTotal} transactions` : 'Transactions'} across {statementCount || 1} statement{statementCount !== 1 ? 's' : ''} indexed. Ask any question about this borrower&apos;s financial history.
+        {effectiveCorpusReady && chatHistory.length === 0 && !loading && (
+          <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: '14px 18px', marginBottom: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.08em', marginBottom: 6 }}>CORPUS LOADED</div>
+            <div style={{ fontSize: 12, color: 'var(--t2)', lineHeight: 1.6 }}>
+              {effectiveTxnTotal > 0 ? `${effectiveTxnTotal} transactions` : 'Transactions'} across {effectiveStatementCount || 1} statement{effectiveStatementCount !== 1 ? 's' : ''} indexed. Ask any question about this borrower&apos;s financial history.
             </div>
           </div>
         )}
@@ -254,29 +381,29 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
               {chatHistory.map((msg, i) => (
                 <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: msg.role === 'analyst' ? 'flex-end' : 'flex-start' }}>
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ fontSize: 9, fontWeight: 700, color: msg.role === 'analyst' ? '#6366F1' : '#4ADE80', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: msg.role === 'analyst' ? 'var(--accent)' : 'var(--green)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>
                       {msg.role === 'analyst' ? 'ANALYST' : 'PARITY'}
                     </span>
-                    <span style={{ fontSize: 9, color: '#2D3748', fontFamily: "'IBM Plex Mono', monospace" }}>{msg.time}</span>
+                    <span style={{ fontSize: 9, color: 'var(--b1)', fontFamily: "'IBM Plex Mono', monospace" }}>{msg.time}</span>
                   </div>
                   <div style={{
                     maxWidth: '85%', position: 'relative',
-                    background: msg.role === 'analyst' ? 'rgba(99,102,241,0.1)' : '#0D1220',
-                    border: `1px solid ${msg.role === 'analyst' ? 'rgba(99,102,241,0.2)' : '#1E2A3A'}`,
+                    background: msg.role === 'analyst' ? 'rgba(20,184,166,0.1)' : 'var(--s1)',
+                    border: `1px solid ${msg.role === 'analyst' ? 'rgba(20,184,166,0.2)' : 'var(--b1)'}`,
                     borderRadius: msg.role === 'analyst' ? '8px 8px 2px 8px' : '8px 8px 8px 2px',
                     padding: '10px 14px',
                   }}>
                     {msg.role === 'parity' ? (
                       <>
-                        <div style={{ fontSize: 13, color: '#CBD5E1', lineHeight: 1.6, userSelect: 'text' }} dangerouslySetInnerHTML={{ __html: mdToHtml(msg.text) }} />
+                        <div style={{ fontSize: 13, color: 'var(--t1)', lineHeight: 1.6, userSelect: 'text' }} dangerouslySetInnerHTML={{ __html: mdToHtml(msg.text) }} />
                         <button
                           onClick={(e) => { e.stopPropagation(); copyToClipboard(msg.text, i) }}
                           style={{
                             position: 'absolute', top: 6, right: 6, padding: '3px 8px',
-                            background: copiedIdx === i ? 'rgba(74,222,128,0.15)' : 'rgba(99,102,241,0.08)',
-                            border: `1px solid ${copiedIdx === i ? 'rgba(74,222,128,0.3)' : '#1E2A3A'}`,
+                            background: copiedIdx === i ? 'rgba(74,222,128,0.15)' : 'rgba(20,184,166,0.08)',
+                            border: `1px solid ${copiedIdx === i ? 'rgba(74,222,128,0.3)' : 'var(--b1)'}`,
                             borderRadius: 3, fontSize: 9, fontWeight: 600, cursor: 'pointer',
-                            color: copiedIdx === i ? '#4ADE80' : '#4A5568',
+                            color: copiedIdx === i ? 'var(--green)' : 'var(--t2)',
                             fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em',
                           }}
                         >
@@ -284,19 +411,16 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
                         </button>
                       </>
                     ) : (
-                      <p style={{ fontSize: 13, color: '#A5B4FC', lineHeight: 1.6, whiteSpace: 'pre-line', margin: 0, userSelect: 'text' }}>{msg.text}</p>
+                      <p style={{ fontSize: 13, color: 'var(--accent)', lineHeight: 1.6, whiteSpace: 'pre-line', margin: 0, userSelect: 'text' }}>{msg.text}</p>
                     )}
                   </div>
                 </div>
               ))}
               {loading && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
-                  <span style={{ fontSize: 9, fontWeight: 700, color: '#4ADE80', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
-                  <div style={{ background: '#0D1220', border: '1px solid #1E2A3A', borderRadius: '8px 8px 8px 2px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                    {[0, 1, 2].map(n => (
-                      <span key={n} style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ADE80', display: 'inline-block', animation: `parityDot 1.4s ${n * 0.2}s infinite ease-in-out` }} />
-                    ))}
-                    <span style={{ fontSize: 11, color: '#374151', marginLeft: 8, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}>COMPUTING</span>
+                  <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--green)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
+                  <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px' }}>
+                    <AnalystStatus stage="generic" size={16} />
                   </div>
                 </div>
               )}
@@ -304,27 +428,24 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
           )}
           {chatHistory.length === 0 && loading && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
-              <span style={{ fontSize: 9, fontWeight: 700, color: '#4ADE80', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
-              <div style={{ background: '#0D1220', border: '1px solid #1E2A3A', borderRadius: '8px 8px 8px 2px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                {[0, 1, 2].map(n => (
-                  <span key={n} style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ADE80', display: 'inline-block', animation: `parityDot 1.4s ${n * 0.2}s infinite ease-in-out` }} />
-                ))}
-                <span style={{ fontSize: 11, color: '#374151', marginLeft: 8, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em' }}>ANALYZING SNAPSHOT</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--green)', letterSpacing: '0.1em', fontFamily: "'IBM Plex Mono', monospace" }}>PARITY</span>
+              <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: '8px 8px 8px 2px', padding: '10px 14px' }}>
+                <AnalystStatus stage="generic" size={16} />
               </div>
             </div>
           )}
         </div>
 
         {/* Suggestion chips */}
-        {corpusReady && chatHistory.length <= 1 && !loading && (
+        {effectiveCorpusReady && chatHistory.length <= 1 && !loading && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
             {SUGGESTION_CHIPS.map((chip) => (
               <button
                 key={chip}
                 onClick={() => { setQuestion(chip); }}
-                style={{ padding: '5px 12px', background: 'transparent', border: '1px solid #1E2A3A', borderRadius: 20, fontSize: 11, color: '#4A5568', cursor: 'pointer', fontFamily: "'IBM Plex Sans', sans-serif", transition: 'all 0.15s' }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#6366F1'; (e.currentTarget as HTMLElement).style.color = '#A5B4FC'; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#1E2A3A'; (e.currentTarget as HTMLElement).style.color = '#4A5568'; }}
+                style={{ padding: '5px 12px', background: 'transparent', border: '1px solid var(--b1)', borderRadius: 20, fontSize: 11, color: 'var(--t2)', cursor: 'pointer', fontFamily: "'IBM Plex Sans', sans-serif", transition: 'all 0.15s' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent)'; (e.currentTarget as HTMLElement).style.color = 'var(--accent)'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--b1)'; (e.currentTarget as HTMLElement).style.color = 'var(--t2)'; }}
               >
                 {chip}
               </button>
@@ -333,22 +454,28 @@ function ParityReviewChat({ dealId, corpusReady, txnTotal, statementCount }: Pro
         )}
 
         {/* Input */}
-        <div style={{ background: '#0D1220', border: '1px solid #1E2A3A', borderRadius: 8, padding: 14 }}>
+        <div style={{ background: 'var(--s1)', border: '1px solid var(--b1)', borderRadius: 8, padding: 14 }}>
           <textarea
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={corpusReady ? "Ask anything about this borrower's financials..." : 'Run analysis first to enable Parity Review...'}
-            disabled={!corpusReady || loading}
+            placeholder={
+              effectiveCorpusReady
+                ? "Ask anything about this borrower's financials..."
+                : isCheckingAnalysis
+                ? 'Checking analysis status…'
+                : 'Run analysis first to enable Parity Review...'
+            }
+            disabled={!effectiveCorpusReady || loading}
             rows={2}
-            style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: '#CBD5E1', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !corpusReady ? 0.4 : 1 }}
+            style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', padding: 0, fontSize: 13, color: 'var(--t1)', resize: 'none', fontFamily: "'IBM Plex Sans', sans-serif", boxSizing: 'border-box', opacity: !effectiveCorpusReady ? 0.4 : 1 }}
           />
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10, gap: 8, alignItems: 'center' }}>
-            <span style={{ fontSize: 10, color: '#2D3748', fontFamily: "'IBM Plex Mono', monospace" }}>ctrl+enter to send</span>
+            <span style={{ fontSize: 10, color: 'var(--b1)', fontFamily: "'IBM Plex Mono', monospace" }}>ctrl+enter to send</span>
             <button
               onClick={() => void doAsk()}
-              disabled={!corpusReady || loading || !question.trim()}
-              style={{ padding: '7px 16px', background: '#6366F1', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: !corpusReady || loading || !question.trim() ? 'not-allowed' : 'pointer', opacity: !corpusReady || loading || !question.trim() ? 0.4 : 1, fontFamily: "'IBM Plex Sans', sans-serif" }}
+              disabled={!effectiveCorpusReady || loading || !question.trim()}
+              style={{ padding: '7px 16px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 5, fontSize: 12, fontWeight: 600, cursor: !effectiveCorpusReady || loading || !question.trim() ? 'not-allowed' : 'pointer', opacity: !effectiveCorpusReady || loading || !question.trim() ? 0.4 : 1, fontFamily: "'IBM Plex Sans', sans-serif" }}
             >
               {loading ? 'Computing...' : 'Send'}
             </button>

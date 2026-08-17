@@ -9,13 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from v1.parity_review.proactive_analysis import (
-    generate_proactive_analysis,
-    _identify_critical_issues,
-    _identify_key_risks,
-    _identify_strengths,
-    _generate_recommendations,
-)
+from v1.parity_review.proactive_analysis import generate_proactive_analysis
 from v1.parity_review.context import (
     _build_txn_role_map,
     _tag_transactions,
@@ -143,116 +137,71 @@ def deal_data():
 
 
 # ---------------------------------------------------------------------------
-# Tests — generate_proactive_analysis
+# Tests — generate_proactive_analysis (pure computation: figures/counts only)
+#
+# The advisory API (_identify_critical_issues / _identify_key_risks /
+# _identify_strengths / _generate_recommendations) was intentionally removed in
+# the "Parity Review pure computation rewrite" — Parity Review must surface
+# computed data with no interpretation, recommendations, or advisory claims.
+# These tests assert the current data-summary output and guard against any
+# regression back to advisory language.
 # ---------------------------------------------------------------------------
 
 class TestGenerateProactiveAnalysis:
-    def test_full_analysis_contains_key_sections(self, deal_data):
+    def test_contains_data_summary_sections(self, deal_data):
         analysis = generate_proactive_analysis(deal_data)
-        assert "CRITICAL ISSUES" in analysis or "KEY RISKS" in analysis or "STRENGTHS" in analysis
-        assert "FINANCIAL SUMMARY" in analysis
-        assert "What would you like to explore further?" in analysis
+        assert "Snapshot Data Summary" in analysis
+        assert "## DEAL OVERVIEW" in analysis
+        assert "## COMPUTED METRICS" in analysis
+        assert "Ask a question to query the data." in analysis
 
-    def test_markdown_formatted(self, deal_data):
+    def test_markdown_table_formatted(self, deal_data):
         analysis = generate_proactive_analysis(deal_data)
         assert "##" in analysis
-        assert "•" in analysis
+        assert "| Metric | Value |" in analysis
 
     def test_company_name_from_canonical(self, deal_data):
         analysis = generate_proactive_analysis(deal_data)
         assert "Buildex" in analysis
 
-
-# ---------------------------------------------------------------------------
-# Tests — _identify_critical_issues
-# ---------------------------------------------------------------------------
-
-class TestCriticalIssues:
-    def test_revenue_decline_flagged(self, deal_data):
-        from v1.parity_review.tools.financial_metrics import calculate_financial_metrics
-        from v1.parity_review.tools.operational_metrics import calculate_operational_metrics
-        financial = calculate_financial_metrics(deal_data)
-        operational = calculate_operational_metrics(deal_data)
-        issues = _identify_critical_issues(deal_data, financial, operational)
-        assert any("revenue" in i.lower() and "decline" in i.lower() for i in issues)
-
-    def test_weak_dscr_flagged(self):
-        financial = {"dscr": {"value": 1.1}, "revenue_growth": {"value_pct": 5.0},
-                     "burn_rate": {"negative_months": 0, "total_months": 12}}
-        issues = _identify_critical_issues({"tagged": [], "currency": "KES"}, financial, {})
-        assert any("dscr" in i.lower() for i in issues)
-
-    def test_capital_injection_anomaly_flagged(self, deal_data):
-        from v1.parity_review.tools.financial_metrics import calculate_financial_metrics
-        from v1.parity_review.tools.operational_metrics import calculate_operational_metrics
-        financial = calculate_financial_metrics(deal_data)
-        operational = calculate_operational_metrics(deal_data)
-        issues = _identify_critical_issues(deal_data, financial, operational)
-        assert any("peter karanja" in i.lower() for i in issues)
+    def test_company_name_falls_back_when_absent(self):
+        canonical = {**_BUILDEX_CANONICAL}
+        canonical.pop("company_name", None)
+        analysis = generate_proactive_analysis(_build_deal_data(canonical))
+        assert "this deal" in analysis
 
 
-# ---------------------------------------------------------------------------
-# Tests — _identify_key_risks
-# ---------------------------------------------------------------------------
+class TestDealOverviewFigures:
+    def test_transaction_counts_and_totals(self, deal_data):
+        analysis = generate_proactive_analysis(deal_data)
+        # 7 transactions: 3 credits, 4 debits (see _BUILDEX_CANONICAL)
+        assert "| Total transactions | 7 |" in analysis
+        assert "| Credit transactions | 3 |" in analysis
+        assert "| Debit transactions | 4 |" in analysis
+        assert "| Period | 12 months |" in analysis
 
-class TestKeyRisks:
-    def test_customer_concentration(self, deal_data):
-        from v1.parity_review.tools.operational_metrics import calculate_operational_metrics
-        operational = calculate_operational_metrics(deal_data)
-        risks = _identify_key_risks(deal_data, operational)
-        assert any("concentration" in r.lower() for r in risks)
-        assert any("Joyce Mwanziu" in r for r in risks)
+    def test_computed_metrics_present(self, deal_data):
+        analysis = generate_proactive_analysis(deal_data)
+        assert "DSCR" in analysis
+        assert "Revenue growth (H1 vs H2)" in analysis
 
-    def test_sparse_payroll_flagged(self, deal_data):
-        from v1.parity_review.tools.operational_metrics import calculate_operational_metrics
-        operational = calculate_operational_metrics(deal_data)
-        risks = _identify_key_risks(deal_data, operational)
-        assert any("payroll" in r.lower() for r in risks)
-
-
-# ---------------------------------------------------------------------------
-# Tests — _identify_strengths
-# ---------------------------------------------------------------------------
-
-class TestStrengths:
-    def test_strong_dscr_highlighted(self):
-        financial = {"dscr": {"value": 2.5}, "revenue_growth": {"value_pct": 0},
-                     "loan_burden": {"value_pct": 1.0},
-                     "cash_flow_volatility": {"assessment": "Stable (<25%)"}}
-        strengths = _identify_strengths(
-            {"csi": {}, "metrics": {}, "tax_months": 0}, financial, {}
-        )
-        assert any("dscr" in s.lower() and "strong" in s.lower() for s in strengths)
-
-    def test_low_loan_burden_highlighted(self):
-        financial = {"dscr": {"value": None}, "revenue_growth": {"value_pct": 0},
-                     "loan_burden": {"value_pct": 2.0},
-                     "cash_flow_volatility": {"assessment": ""}}
-        strengths = _identify_strengths(
-            {"csi": {}, "metrics": {}, "tax_months": 0}, financial, {}
-        )
-        assert any("loan burden" in s.lower() for s in strengths)
+    def test_top_entities_and_unclassified(self, deal_data):
+        analysis = generate_proactive_analysis(deal_data)
+        assert "## TOP ENTITIES" in analysis
+        assert "Joyce Mwanziu Avia" in analysis          # top revenue source
+        assert "## UNCLASSIFIED TRANSACTIONS" in analysis
+        assert "Peter Karanja" in analysis                # needs_review entity
 
 
-# ---------------------------------------------------------------------------
-# Tests — _generate_recommendations
-# ---------------------------------------------------------------------------
+class TestPureComputationNoAdvisory:
+    """Guards the Parity Review tone rule: no interpretation/advice/recommendations."""
 
-class TestRecommendations:
-    def test_critical_issues_trigger_recommendations(self):
-        issues = ["Revenue declined 51.4% — needs explanation"]
-        recs = _generate_recommendations(issues, [])
-        assert any("critical" in r.lower() for r in recs)
-        assert any("revenue" in r.lower() for r in recs)
-
-    def test_no_issues_positive_guidance(self):
-        recs = _generate_recommendations([], [])
-        assert any("healthy" in r.lower() for r in recs)
-
-    def test_concentration_risk_recommendation(self):
-        risks = ["Joyce represents 68.6% of revenue (HIGH customer concentration)"]
-        recs = _generate_recommendations([], risks)
-        assert any("concentration" in r.lower() for r in recs)
+    def test_no_advisory_language(self, deal_data):
+        analysis = generate_proactive_analysis(deal_data)
+        lowered = analysis.lower()
+        for banned in ("recommend", "you should", "we advise", "critical issue",
+                       "key risk", "strength", "🔴", "⚠️"):
+            assert banned not in lowered, f"advisory language leaked: {banned!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -260,16 +209,13 @@ class TestRecommendations:
 # ---------------------------------------------------------------------------
 
 class TestProactiveIntegration:
-    def test_buildex_analysis_surfaces_key_findings(self, deal_data):
+    def test_buildex_analysis_surfaces_computed_figures(self, deal_data):
         analysis = generate_proactive_analysis(deal_data)
 
-        assert "🔴" in analysis
-        assert "⚠️" in analysis
+        assert "## DEAL OVERVIEW" in analysis
         assert "DSCR" in analysis
-        assert "Revenue" in analysis
-
-        print("\n=== PROACTIVE ANALYSIS OUTPUT ===")
-        print(analysis)
+        assert "Revenue growth (H1 vs H2)" in analysis
+        assert "Buildex" in analysis
 
 
 if __name__ == "__main__":

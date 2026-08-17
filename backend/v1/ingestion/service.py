@@ -120,11 +120,14 @@ class IngestionService:
         }
         self.documents_repo.create_document(document)
 
-        # Persist rows (strip abs_amount_cents — it's a DB generated column)
+        # Persist rows (abs_amount_cents is already computed by the parser —
+        # NOT a DB-generated column despite the old assumption here; popping
+        # it left every transaction's abs_amount_cents permanently NULL,
+        # silently zeroing outflow composition and loan activity totals
+        # platform-wide. See migration backfilling existing NULL rows.)
         for r in rows:
             r["document_id"] = document_id
             r["deal_id"] = deal_id
-            r.pop("abs_amount_cents", None)
 
         db_insert_start = time.perf_counter()
         logger.info("[DB INSERT] Rows to insert: %d", len(rows))
@@ -239,7 +242,6 @@ class IngestionService:
             for r in rows:
                 r["document_id"] = document_id
                 r["deal_id"] = deal_id
-                r.pop("abs_amount_cents", None)
 
             stage = STAGE_DB_INSERT_START
             logger.info("[INGEST] stage=%s rows=%d", stage, len(rows))

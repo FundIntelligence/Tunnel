@@ -95,6 +95,15 @@ class TestP3LocalSymbols:
     def test_k_dot_sh(self):
         assert detect("K.Sh 800") == "KES"
 
+    def test_kshs_plural(self):
+        """Audited financial statements commonly write the abbreviation as
+        'KShs' (trailing s) rather than 'KSh' — e.g. 'Kenya Shillings (KShs)'
+        in an accounting-policy note."""
+        assert detect("presented in Kenya Shillings (KShs)") == "KES"
+
+    def test_kshs_lowercase_plural(self):
+        assert detect("Amounts shown in Kshs '000") == "KES"
+
     def test_ushs(self):
         assert detect("UShs 2,300,000 credit") == "UGX"
 

@@ -29,6 +29,28 @@ SUPABASE_URL=https://your-project-id.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key-here
 
 # ==========================================
+# MUSA INTEGRATION (backend/.env) — REQUIRED, PER ENVIRONMENT
+# ==========================================
+# PAR-59: same backend image is deployed to every environment (staging,
+# prod, ...) unchanged — these two MUST be set to THIS environment's own
+# URLs on each Cloud Run service. There is no correct shared default:
+# if left unset, links sent to Musa (or the internal team-notify) silently
+# point at the wrong environment instead of failing loudly.
+
+# This environment's own backend URL (Cloud Run service URL). Used to
+# build status_url/pdf_url in webhook payloads sent to Musa.
+API_BASE_URL=https://your-backend-service-url
+
+# This environment's own frontend URL. Used only for the internal
+# unparseable-file team-notify POST to /api/request-parser.
+PARITY_FRONTEND_URL=https://your-frontend-url
+
+# Musa-issued webhook target + shared auth token (same value in every
+# environment Musa hasn't changed it for; get from Musa directly).
+MUSA_WEBHOOK_URL=https://musa-provided-webhook-url
+MUSA_WEBHOOK_AUTH_TOKEN=musa-provided-bearer-token
+
+# ==========================================
 # WHERE TO FIND THESE VALUES
 # ==========================================
 #

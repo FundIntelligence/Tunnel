@@ -8,22 +8,19 @@ from __future__ import annotations
 
 import re as _re
 from datetime import datetime
-from typing import List
+from typing import List, Union
 
 import pdfplumber
 
 from app.models import ExtractionResult, RawTransaction, WarningItem
+from app.extractors.pdf_document import NormalizedDocument, as_document
 
 
-def detect_coop(file_path: str) -> bool:
+def detect_coop(source: Union[str, NormalizedDocument]) -> bool:
     """Return True if the PDF appears to be a Co-operative Bank statement."""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            text = ""
-            for page in pdf.pages[:3]:
-                t = page.extract_text()
-                if t:
-                    text += t + " "
+        with as_document(source) as doc:
+            text = doc.text_upto(3)
             text_upper = text.upper()
             has_bank = "CO-OPERATIVE" in text_upper or "COOPERATIVE" in text_upper
             has_stmt = "STATEMENT OF ACCOUNT" in text_upper
