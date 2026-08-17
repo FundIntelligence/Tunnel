@@ -211,7 +211,7 @@ async def _send_webhook(
         "completed_at": completed_at,
     }
     headers = {
-        "Authorization": f"Bearer {webhook_token}",
+        "x-api-key": webhook_token,
         "Content-Type": "application/json",
     }
     try:
