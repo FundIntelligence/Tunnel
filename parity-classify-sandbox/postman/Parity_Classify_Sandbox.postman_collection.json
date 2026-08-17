@@ -1,0 +1,99 @@
+{
+  "info": {
+    "name": "Parity Classify Sandbox",
+    "description": "Try the Parity Classify Sandbox API — a single endpoint (POST /v1/classify) that takes one bank transaction and returns its classified role (e.g. payroll, revenue, transfer) plus a plain-language reason.\n\nBefore you start:\n1. Select the \"Parity Sandbox\" environment (top right).\n2. Get a sandbox API key from the Parity team and paste it into that environment's `sandbox_api_key` variable (leave it blank and every request here will 401 — see the \"Invalid API key\" example to see what that looks like on purpose).\n3. Run any request under \"Example Transactions\" to see a live classification.\n\nEach saved request below is a different kind of transaction, chosen to show the real range of what this endpoint returns — not just one happy path.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Example Transactions",
+      "description": "Three real transaction shapes sent to the same POST /v1/classify endpoint: an obvious payroll payment, an obvious revenue deposit, and a deliberately ambiguous one where the classifier's reasoning is worth reading closely.",
+      "item": [
+        {
+          "name": "Classify — Payroll (clear case)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "x-api-key", "value": "{{sandbox_api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"normalized_descriptor\": \"PAYROLL RUN - JULY SALARIES\",\n  \"signed_amount_cents\": -450000,\n  \"is_transfer\": false,\n  \"large_positive_threshold_cents\": 500000,\n  \"median_txn_abs_cents\": 45000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/classify",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "classify"]
+            },
+            "description": "A large, round, outbound payment described as a payroll run — the clearest possible payroll case. `signed_amount_cents` is negative because money is leaving the account. Expect the response's `role` to come back as payroll with a reason that references the descriptor and the outbound direction."
+          },
+          "response": []
+        },
+        {
+          "name": "Classify — Revenue (clear case)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "x-api-key", "value": "{{sandbox_api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"normalized_descriptor\": \"STRIPE PAYOUT - CUSTOMER INVOICES\",\n  \"signed_amount_cents\": 125000,\n  \"is_transfer\": false,\n  \"large_positive_threshold_cents\": 500000,\n  \"median_txn_abs_cents\": 45000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/classify",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "classify"]
+            },
+            "description": "An inbound payout from a payment processor — the clearest possible revenue case. `signed_amount_cents` is positive because money is arriving. Expect `role` to come back as revenue."
+          },
+          "response": []
+        },
+        {
+          "name": "Classify — Ambiguous (edge case)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "x-api-key", "value": "{{sandbox_api_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"normalized_descriptor\": \"TRANSFER TO OPERATING ACCOUNT\",\n  \"signed_amount_cents\": 300000,\n  \"is_transfer\": true,\n  \"large_positive_threshold_cents\": 500000,\n  \"median_txn_abs_cents\": 45000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/v1/classify",
+              "host": ["{{base_url}}"],
+              "path": ["v1", "classify"]
+            },
+            "description": "An inter-account transfer flagged with `is_transfer: true` but described generically (\"operating account\", not a named counterparty). This is the interesting one to run: it shows how the classifier handles a transaction that isn't obviously payroll or revenue. Read the `classification_reason` in the response closely — it's the whole point of this example."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Invalid API Key (401)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-api-key", "value": "this-is-not-a-real-key" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"normalized_descriptor\": \"PAYROLL RUN - JULY SALARIES\",\n  \"signed_amount_cents\": -450000,\n  \"is_transfer\": false\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/v1/classify",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "classify"]
+        },
+        "description": "Same endpoint, same request shape as the examples above, but with a deliberately bad `x-api-key` (hardcoded here, not the environment variable, so this fails even after you've set a real key). This shows the real 401 behavior a partner sees when their key is missing, wrong, or not yet issued — a clean `{\"detail\": \"Invalid API key\"}`, no stack trace or server detail leaked."
+      },
+      "response": []
+    }
+  ]
+}
