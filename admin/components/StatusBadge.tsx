@@ -14,7 +14,7 @@ function getStatusStyle(status: string): React.CSSProperties {
   if (s === 'completed' || s === 'done' || s === 'active' || s === 'true') {
     return { background: 'var(--green-d)', color: 'var(--green)', borderColor: 'rgba(21,128,61,0.18)' }
   }
-  if (s === 'failed' || s === 'error' || s === 'false') {
+  if (s === 'failed' || s === 'error' || s === 'false' || s === 'revoked') {
     return { background: 'var(--red-d)', color: 'var(--red)', borderColor: 'rgba(220,38,38,0.16)' }
   }
   if (s === 'in_progress' || s === 'inprogress') {

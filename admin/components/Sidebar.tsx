@@ -11,6 +11,7 @@ const navItems = [
   { href: '/musa-sessions', label: 'Musa Sessions' },
   { href: '/deals', label: 'Deal Pipeline' },
   { href: '/api-keys', label: 'API Keys' },
+  { href: '/sandbox-keys', label: 'Sandbox Keys' },
 ]
 
 export function Sidebar() {
