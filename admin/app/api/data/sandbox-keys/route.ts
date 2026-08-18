@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseSandbox } from '@/lib/supabase-sandbox'
+import { getSupabaseSandbox, SUPABASE_ENV } from '@/lib/supabase-sandbox'
 import { requireAdminSession } from '@/lib/require-admin-session'
 import { generateSandboxApiKey, hashSandboxApiKey } from '@/lib/sandbox-key'
+import { envHeaders } from '@/lib/env-header'
 
 const SCOPE = 'sandbox-classify'
 
@@ -15,7 +16,7 @@ export async function GET() {
     .select('id, partner_name, contact_email, calls_used, call_cap, status, created_at')
     .order('created_at', { ascending: false })
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  return NextResponse.json(data)
+  return NextResponse.json(data, { headers: envHeaders(SUPABASE_ENV) })
 }
 
 export async function POST(req: NextRequest) {

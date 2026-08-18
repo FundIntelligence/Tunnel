@@ -3,6 +3,8 @@
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react'
 import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT, refreshedLabel, downloadCSV } from './utils'
 
 interface MusaSession {
@@ -51,6 +53,7 @@ export default function MusaSessionsPage() {
   const loadingRef = useRef(false)
   const [resendingId, setResendingId] = useState<string | null>(null)
   const [resendResult, setResendResult] = useState<{ sessionId: string; message: string; ok: boolean } | null>(null)
+  const [env, setEnv] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     if (loadingRef.current) return
@@ -63,6 +66,7 @@ export default function MusaSessionsPage() {
       }
       const sessions: MusaSession[] = Array.isArray(data) ? data : (data?.sessions ?? [])
       setRows(sessions)
+      setEnv(res.headers.get(ENV_HEADER))
       setError(null)
       setLastFetched(new Date().toISOString())
     } catch (err) {
@@ -141,6 +145,7 @@ export default function MusaSessionsPage() {
           subtitle={loading ? 'Loading…' : `${rows.length} sessions (last 100)`}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {env === 'prod' && <EnvBadge env="prod" />}
           {lastFetched && (
             <span style={{ fontSize: 12, color: 'var(--t3)', fontFamily: "'IBM Plex Mono', monospace" }}>
               {refreshedLabel(lastFetched)}

@@ -1,6 +1,7 @@
-import { getSupabase } from '@/lib/supabase'
+import { getSupabase, SUPABASE_ENV } from '@/lib/supabase'
 import { requireAdminSession } from '@/lib/require-admin-session'
 import { signParserRequestPaths } from '@/lib/parser-requests-signed-urls'
+import { envHeaders } from '@/lib/env-header'
 import { NextRequest, NextResponse } from 'next/server'
 
 // `parser_requests` ("auto" — Musa/GBFund failure paths, backend/v1/api.py:2355
@@ -42,7 +43,7 @@ export async function GET() {
     signParserRequestPaths(supabase, manualResult.data ?? []),
   ])
 
-  return NextResponse.json({ auto, manual })
+  return NextResponse.json({ auto, manual }, { headers: envHeaders(SUPABASE_ENV) })
 }
 
 export async function PATCH(request: NextRequest) {

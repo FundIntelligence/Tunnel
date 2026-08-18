@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { DataTable, Column } from '@/components/DataTable'
 import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT } from './utils'
 
 interface SandboxKey {
@@ -46,11 +48,13 @@ export default function SandboxKeysPage() {
   const [formError, setFormError] = useState<string | null>(null)
   const [revealedKey, setRevealedKey] = useState<{ rawKey: string; partnerName: string } | null>(null)
   const [copied, setCopied] = useState(false)
+  const [env, setEnv] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     const res = await fetch('/api/data/sandbox-keys')
     const data = await res.json()
     setRows(Array.isArray(data) ? data : [])
+    setEnv(res.headers.get(ENV_HEADER))
     setLoading(false)
   }, [])
 
@@ -147,10 +151,15 @@ export default function SandboxKeysPage() {
 
   return (
     <div style={{ padding: '40px' }}>
-      <PageHeader
-        title="Sandbox Keys"
-        subtitle={loading ? 'Loading…' : `${rows.length} keys — scope: sandbox-classify`}
-      />
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+        <PageHeader
+          title="Sandbox Keys"
+          subtitle={loading ? 'Loading…' : `${rows.length} keys — scope: sandbox-classify`}
+        />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4 }}>
+          {env === 'sandbox' && <EnvBadge env="sandbox" />}
+        </div>
+      </div>
 
       {revealedKey && (
         <div
