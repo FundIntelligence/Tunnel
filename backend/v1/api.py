@@ -4,6 +4,7 @@ All money fields: integer cents.  All ratios: integer basis points.
 Snapshot only on explicit POST /v1/deals/{deal_id}/export.
 """
 
+import concurrent.futures
 import csv
 import io
 import json
@@ -163,6 +164,7 @@ _ERROR_CODES = {
     "UNAUTHORIZED": 401,
     "INTERNAL": 500,
     "SERVICE_UNAVAILABLE": 503,
+    "PDF_GENERATION_TIMEOUT": 503,
 }
 
 
@@ -177,6 +179,29 @@ def _error(code: str, message: str, *, status: int = 0, next_action: Optional[st
             "details": details or {},
         },
     )
+
+
+# WeasyPrint has no built-in timeout and scales poorly on deals with large
+# transaction counts; run it on a bounded worker so a slow render fails the
+# request instead of hanging it indefinitely (PAR-160 follow-up).
+_PDF_RENDER_TIMEOUT_S = 45
+_pdf_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="pdf-render")
+
+
+def _render_html_to_pdf(html: str, deal_id: str) -> bytes:
+    import weasyprint
+
+    future = _pdf_executor.submit(lambda: weasyprint.HTML(string=html).write_pdf())
+    try:
+        return future.result(timeout=_PDF_RENDER_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        _error(
+            "PDF_GENERATION_TIMEOUT",
+            f"PDF generation for deal {deal_id} took longer than {_PDF_RENDER_TIMEOUT_S}s, "
+            "likely due to a large transaction count. Use GET /v1/deals/{deal_id}/snapshot/html "
+            "for the same report in a browser, or GET /v1/deals/{deal_id}/transactions for the raw data.",
+            next_action="Use /snapshot/html or /transactions instead of /snapshot/pdf",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1388,9 +1413,8 @@ def get_snapshot_pdf(request: Request, deal_id: str, _auth: None = Depends(_requ
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     filename = f"parity_snapshot_{deal_id}.pdf"
     return StreamingResponse(
         iter([pdf_bytes]),
@@ -1447,9 +1471,8 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, enrichment, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     suffix = "_enriched" if enrichment else ""
     filename = f"parity_{deal_id}{suffix}.pdf"
     return StreamingResponse(
@@ -1462,10 +1485,9 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
 @router.get("/deals/{deal_id}/report")
 def get_deal_report(request: Request, deal_id: str):
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     from fastapi.responses import Response
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
