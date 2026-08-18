@@ -8,7 +8,9 @@ import csv
 import io
 import json
 import logging
+import multiprocessing
 import os
+import queue as _queue_module
 import threading
 import time
 import uuid
@@ -163,6 +165,7 @@ _ERROR_CODES = {
     "UNAUTHORIZED": 401,
     "INTERNAL": 500,
     "SERVICE_UNAVAILABLE": 503,
+    "PDF_GENERATION_TIMEOUT": 503,
 }
 
 
@@ -177,6 +180,57 @@ def _error(code: str, message: str, *, status: int = 0, next_action: Optional[st
             "details": details or {},
         },
     )
+
+
+# WeasyPrint's write_pdf() is synchronous C-extension work with no
+# cooperative cancellation point. A thread-based timeout (e.g.
+# ThreadPoolExecutor.submit + future.result(timeout=...)) cannot actually
+# stop it — future.result() only stops *waiting*; the worker thread keeps
+# rendering to completion in the background, permanently tying up a pool
+# slot for every deal slow enough to time out. Running the render in a real
+# OS process lets us SIGKILL it on timeout instead (PAR-183).
+_PDF_RENDER_TIMEOUT_S = 45
+_PDF_KILL_GRACE_S = 5
+_pdf_mp_ctx = multiprocessing.get_context("fork")
+
+
+def _pdf_render_worker(html: str, result_queue: "multiprocessing.Queue") -> None:
+    import weasyprint
+    try:
+        pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+        result_queue.put(("ok", pdf_bytes))
+    except Exception as exc:  # noqa: BLE001 — report render failures to the parent, don't crash silently
+        result_queue.put(("error", repr(exc)))
+
+
+def _render_html_to_pdf(html: str, deal_id: str) -> bytes:
+    """Render HTML to PDF bytes, hard-killing the render after _PDF_RENDER_TIMEOUT_S."""
+    result_queue = _pdf_mp_ctx.Queue()
+    proc = _pdf_mp_ctx.Process(target=_pdf_render_worker, args=(html, result_queue), daemon=True)
+    proc.start()
+    try:
+        # Actively drain the queue while waiting so a large PDF can't fill the
+        # underlying pipe and deadlock the child before it ever exits.
+        status, payload = result_queue.get(timeout=_PDF_RENDER_TIMEOUT_S)
+    except _queue_module.Empty:
+        proc.terminate()
+        proc.join(_PDF_KILL_GRACE_S)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        _error(
+            "PDF_GENERATION_TIMEOUT",
+            f"PDF generation for deal {deal_id} took longer than {_PDF_RENDER_TIMEOUT_S}s, "
+            "likely due to a large transaction count. Use GET /v1/deals/{deal_id}/snapshot/html "
+            "for the same report in a browser, or GET /v1/deals/{deal_id}/transactions for the raw data.",
+            next_action="Use /snapshot/html or /transactions instead of /snapshot/pdf",
+        )
+    else:
+        proc.join()
+
+    if status == "error":
+        _error("INTERNAL", f"PDF generation failed for deal {deal_id}: {payload}")
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1388,9 +1442,8 @@ def get_snapshot_pdf(request: Request, deal_id: str, _auth: None = Depends(_requ
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     filename = f"parity_snapshot_{deal_id}.pdf"
     return StreamingResponse(
         iter([pdf_bytes]),
@@ -1447,9 +1500,8 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, enrichment, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     suffix = "_enriched" if enrichment else ""
     filename = f"parity_{deal_id}{suffix}.pdf"
     return StreamingResponse(
@@ -1462,10 +1514,9 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
 @router.get("/deals/{deal_id}/report")
 def get_deal_report(request: Request, deal_id: str):
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     from fastapi.responses import Response
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

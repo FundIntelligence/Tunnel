@@ -26,5 +26,8 @@ COPY . .
 # Cloud Run expects PORT env
 ENV PORT=8080
 
-# Start server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Cloud Run's LB terminates TLS and forwards from an internal (non-loopback)
+# address, so uvicorn needs --proxy-headers + --forwarded-allow-ips to trust
+# its X-Forwarded-Proto header — otherwise request.base_url resolves to
+# http:// even though the client connected over https:// (PAR-183).
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips=*"]
