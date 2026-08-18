@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import httpx
+from fastapi import HTTPException
 
 from ..db.supabase_client import get_supabase
 from ..db.supabase_repositories import (
@@ -185,12 +186,19 @@ async def _send_webhook(
     error_message: Optional[str] = None,
     created_at: Optional[str] = None,
     completed_at: Optional[str] = None,
+    is_retry: bool = False,
+    resend_count: int = 0,
 ) -> None:
     """
     POST the unified SessionResponse payload to Musa's webhook endpoint.
 
     Payload shape is IDENTICAL to GET /status response so Musa can use
-    the same deserialisation logic for both polling and push.
+    the same deserialisation logic for both polling and push, plus two
+    extra fields (PAR-174): is_retry / resend_count. Every call from
+    process_musa_session leaves is_retry at its False default — only a
+    manual admin resend (resend_webhook_for_session, below) passes True —
+    so Musa can unambiguously tell an original delivery from a replay and
+    never mistake a resend for a second, distinct event.
     """
     webhook_url = os.getenv("MUSA_WEBHOOK_URL")
     webhook_token = os.getenv("MUSA_WEBHOOK_AUTH_TOKEN")
@@ -211,24 +219,132 @@ async def _send_webhook(
         "error_message": error_message,
         "created_at": created_at,
         "completed_at": completed_at,
+        "is_retry": is_retry,
+        "resend_count": resend_count,
     }
     headers = {
         "x-api-key": webhook_token,
         "Content-Type": "application/json",
     }
+    status_code: Optional[int] = None
+    delivery_error: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(webhook_url, json=payload, headers=headers)
+        status_code = resp.status_code
         if resp.status_code == 200:
             logger.info("[MUSA] Webhook delivered session=%s", session_id)
         else:
+            delivery_error = f"non-200 status {resp.status_code}: {resp.text[:200]}"
             logger.error(
                 "[MUSA] Webhook non-200 session=%s status=%d body=%s",
                 session_id, resp.status_code, resp.text[:200],
             )
     except Exception as exc:
         # Never raise — Musa has status polling as fallback
+        delivery_error = str(exc)[:500]
         logger.error("[MUSA] Webhook exception session=%s: %s", session_id, exc)
+
+    # PAR-174: persist the outcome of this attempt so the admin UI can show
+    # *why* a webhook needs resending instead of only a log line no one
+    # sees. Best-effort — a failure here must not affect Musa's delivery
+    # (already sent above) or bubble up past this function.
+    try:
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        update_fields = {
+            "webhook_last_status_code": status_code,
+            "webhook_last_attempted_at": attempted_at,
+            "webhook_last_error": delivery_error,
+        }
+        if status_code == 200:
+            update_fields["webhook_delivered_at"] = attempted_at
+        if is_retry:
+            update_fields["webhook_resend_count"] = resend_count
+        get_supabase().table("musa_sessions").update(update_fields).eq(
+            "session_id", session_id
+        ).execute()
+    except Exception:
+        logger.exception(
+            "[MUSA] Failed to persist webhook delivery status session=%s", session_id
+        )
+
+
+async def resend_webhook_for_session(session_id: str, base_url: Optional[str] = None) -> dict:
+    """
+    Manually re-deliver the webhook for an already-completed Musa session
+    (PAR-174 Phase 1 — admin-triggered only; no automatic retry/backoff
+    logic here, that's explicitly out of scope for this phase).
+
+    Resending a session whose webhook already succeeded is allowed, not
+    blocked. An admin choosing to resend is inherently a deliberate,
+    infrequent action (e.g. Musa reports losing the original payload), and
+    the is_retry/resend_count fields on the payload make every resend
+    unambiguously a replay on Musa's side regardless of the prior outcome
+    — that's what makes it safe to allow rather than a case to guard
+    against by blocking it. A session that never finished processing
+    (status="processing") IS blocked, since there is nothing coherent to
+    resend yet.
+    """
+    supabase = get_supabase()
+    result = (
+        supabase.table("musa_sessions")
+        .select("*")
+        .eq("session_id", session_id)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = rows[0]
+    status = session["status"]
+    if status == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="Session is still processing — nothing to resend yet",
+        )
+
+    resolved_base_url = base_url or API_BASE_URL
+    status_url = f"{resolved_base_url}/api/musa/sessions/{session_id}/status"
+
+    deal_id = session.get("deal_id")
+    pdf_url = None
+    if status == "complete" and deal_id:
+        pdf_url = f"{API_BASE_URL}/v1/deals/{deal_id}/snapshot/pdf"
+
+    resend_count = int(session.get("webhook_resend_count") or 0) + 1
+
+    await _send_webhook(
+        session_id=session_id,
+        venture_name=session["venture_name"],
+        venture_country=session.get("venture_country", ""),
+        status=status,
+        status_url=status_url,
+        pdf_url=pdf_url,
+        error_message=session.get("error_message"),
+        created_at=session.get("created_at"),
+        completed_at=session.get("completed_at"),
+        is_retry=True,
+        resend_count=resend_count,
+    )
+
+    refreshed = (
+        supabase.table("musa_sessions")
+        .select("webhook_last_status_code, webhook_delivered_at, webhook_resend_count")
+        .eq("session_id", session_id)
+        .execute()
+    )
+    refreshed_rows = refreshed.data or []
+    refreshed_row = refreshed_rows[0] if refreshed_rows else {}
+
+    return {
+        "session_id": session_id,
+        "status": status,
+        "is_retry": True,
+        "resend_count": refreshed_row.get("webhook_resend_count", resend_count),
+        "webhook_status_code": refreshed_row.get("webhook_last_status_code"),
+        "webhook_delivered": refreshed_row.get("webhook_delivered_at") is not None,
+    }
 
 
 def _persist_failed_sample(
