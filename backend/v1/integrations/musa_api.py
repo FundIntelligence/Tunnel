@@ -29,16 +29,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header, Request
 from pydantic import BaseModel
 
 from ..db.supabase_client import get_supabase
 from ..db.supabase_repositories import DealsRepo, SnapshotsRepo
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
-from .auth import require_musa_api_key
+from .auth import require_musa_api_key, validate_scoped_api_key
 from .currency_utils import country_to_currency
 from .musa_deploy_config import API_BASE_URL
-from .musa_file_processor import process_musa_session
+from .musa_file_processor import process_musa_session, resend_webhook_for_session
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,36 @@ def _build_session_response(
         created_at=_to_iso(session_data.get("created_at")) or "",
         completed_at=_to_iso(session_data.get("completed_at"))
     )
+
+
+def _require_admin_access(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+) -> None:
+    """
+    Admin-only gate for the manual webhook-resend action (PAR-174).
+
+    Deliberately narrower than api.py's _require_snapshot_access: a Musa
+    partner key does NOT satisfy this. Musa should not be able to
+    self-trigger resends of its own webhooks — only the admin panel's
+    server-side proxy key (key_type="admin") or an authenticated internal
+    user (Supabase JWT) can.
+    """
+    if x_api_key and validate_scoped_api_key(x_api_key, "admin"):
+        return
+    from ..api import _extract_user_id_from_request
+    if _extract_user_id_from_request(request):
+        return
+    raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+class ResendWebhookResponse(BaseModel):
+    session_id: str
+    status: str
+    is_retry: bool
+    resend_count: int
+    webhook_status_code: Optional[int] = None
+    webhook_delivered: bool
 
 
 # ============================================================================
@@ -312,3 +342,26 @@ def get_session_results(
         deal_id,
         base_url=str(request.base_url).rstrip("/"),
     )
+
+
+@router.post(
+    "/admin/sessions/{session_id}/resend-webhook",
+    response_model=ResendWebhookResponse,
+)
+async def admin_resend_webhook(
+    request: Request,
+    session_id: str,
+    _: None = Depends(_require_admin_access),
+) -> ResendWebhookResponse:
+    """
+    PAR-174 Phase 1: admin-triggered manual resend of a completed session's
+    webhook. Reuses musa_file_processor._send_webhook's actual delivery
+    logic via resend_webhook_for_session — this route only authenticates
+    and looks up base_url; all the resend semantics (idempotency payload
+    fields, which sessions are eligible) live there.
+    """
+    result = await resend_webhook_for_session(
+        session_id=session_id,
+        base_url=str(request.base_url).rstrip("/"),
+    )
+    return ResendWebhookResponse(**result)

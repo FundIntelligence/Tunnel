@@ -1176,3 +1176,254 @@ class TestShapeParity:
             f"Shape mismatch — POST has {post_keys - get_keys} extra, "
             f"GET has {get_keys - post_keys} extra"
         )
+
+
+# ===========================================================================
+# 8. Admin webhook resend (PAR-174 Phase 1)
+# ===========================================================================
+
+class TestAdminResendWebhookAuth:
+    """POST /api/musa/admin/sessions/{id}/resend-webhook auth gate."""
+
+    def test_no_credentials_returns_401(self, client):
+        resp = client.post("/api/musa/admin/sessions/some-sid/resend-webhook")
+        assert resp.status_code == 401
+
+    def test_musa_partner_key_is_rejected(self, client, monkeypatch):
+        # A valid Musa key must NOT satisfy the admin gate — Musa should not
+        # be able to self-trigger resends of its own webhooks.
+        monkeypatch.setattr("v1.integrations.auth.validate_api_key", lambda k, p: True)
+        monkeypatch.setattr("v1.integrations.musa_api.validate_scoped_api_key", lambda k, t: False)
+        resp = client.post(
+            "/api/musa/admin/sessions/some-sid/resend-webhook",
+            headers=VALID_HEADERS,
+        )
+        assert resp.status_code == 401
+
+    def test_admin_scoped_key_is_accepted(self, client, monkeypatch):
+        monkeypatch.setattr("v1.integrations.musa_api.validate_scoped_api_key", lambda k, t: t == "admin")
+
+        async def _fake_resend(session_id, base_url=None):
+            return {
+                "session_id": session_id,
+                "status": "complete",
+                "is_retry": True,
+                "resend_count": 1,
+                "webhook_status_code": 200,
+                "webhook_delivered": True,
+            }
+
+        monkeypatch.setattr("v1.integrations.musa_api.resend_webhook_for_session", _fake_resend)
+        resp = client.post(
+            "/api/musa/admin/sessions/some-sid/resend-webhook",
+            headers={"x-api-key": "admin-key"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_retry"] is True
+        assert body["resend_count"] == 1
+
+
+class TestResendWebhookForSession:
+    """Unit tests for musa_file_processor.resend_webhook_for_session."""
+
+    def _mock_supabase_for(self, session_row: Dict[str, Any], refreshed_row: Optional[Dict[str, Any]] = None):
+        mock_sb = MagicMock()
+        select_mock = mock_sb.table.return_value.select.return_value.eq.return_value.execute
+        # First select = session lookup, second select (post-send) = refreshed delivery columns.
+        select_mock.side_effect = [
+            MagicMock(data=[session_row]),
+            MagicMock(data=[refreshed_row or {}]),
+        ]
+        return mock_sb
+
+    def test_404_when_session_not_found(self, monkeypatch):
+        import asyncio
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with pytest.raises(Exception) as exc_info:
+            asyncio.run(resend_webhook_for_session("missing-sid"))
+        assert getattr(exc_info.value, "status_code", None) == 404
+
+    def test_409_when_session_still_processing(self, monkeypatch):
+        import asyncio
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-1", status="processing")
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[row])
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with pytest.raises(Exception) as exc_info:
+            asyncio.run(resend_webhook_for_session("sid-1"))
+        assert getattr(exc_info.value, "status_code", None) == 409
+
+    def test_completed_session_resend_marks_is_retry_and_increments_count(self, monkeypatch):
+        """A COMPLETE session with no prior resends → resend_count goes to 1,
+        and _send_webhook is called with is_retry=True."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-2", status="complete", deal_id="deal-2")
+        row["webhook_resend_count"] = 0
+        mock_sb = self._mock_supabase_for(
+            row,
+            refreshed_row={
+                "webhook_last_status_code": 200,
+                "webhook_delivered_at": "2026-01-01T00:00:00+00:00",
+                "webhook_resend_count": 1,
+            },
+        )
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        result = asyncio.run(resend_webhook_for_session("sid-2", base_url="https://api.example.com"))
+
+        assert fake_send.called
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["is_retry"] is True
+        assert call_kwargs["resend_count"] == 1
+
+        assert result["is_retry"] is True
+        assert result["resend_count"] == 1
+        assert result["webhook_delivered"] is True
+
+    def test_already_delivered_session_can_still_be_resent(self, monkeypatch):
+        """Decision (PAR-174): resending a session whose webhook already
+        succeeded is ALLOWED, not blocked — the is_retry/resend_count
+        fields make it safe on Musa's side, and an admin explicitly
+        choosing to resend is a deliberate action."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-3", status="complete", deal_id="deal-3")
+        row["webhook_resend_count"] = 2
+        row["webhook_delivered_at"] = "2026-01-01T00:00:00+00:00"  # already delivered once
+        mock_sb = self._mock_supabase_for(
+            row,
+            refreshed_row={
+                "webhook_last_status_code": 200,
+                "webhook_delivered_at": "2026-01-02T00:00:00+00:00",
+                "webhook_resend_count": 3,
+            },
+        )
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        result = asyncio.run(resend_webhook_for_session("sid-3"))
+
+        assert result["resend_count"] == 3  # continues counting from prior resends
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["is_retry"] is True
+        assert call_kwargs["resend_count"] == 3
+
+    def test_failed_session_resends_failed_status_without_pdf_url(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-4", status="failed", deal_id="deal-4", error_message="boom")
+        row["webhook_resend_count"] = 0
+        mock_sb = self._mock_supabase_for(row, refreshed_row={"webhook_resend_count": 1})
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        asyncio.run(resend_webhook_for_session("sid-4"))
+
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["status"] == "failed"
+        assert call_kwargs["pdf_url"] is None
+        assert call_kwargs["error_message"] == "boom"
+
+
+class TestSendWebhookIdempotencyFieldsAndPersistence:
+    def test_payload_includes_is_retry_and_resend_count(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=200)
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = mock_post
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sb = MagicMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id="sid-retry",
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="complete",
+                status_url="https://parity.io/status",
+                pdf_url="https://parity.io/pdf",
+                is_retry=True,
+                resend_count=2,
+            ))
+
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args.args[1]
+        assert payload["is_retry"] is True
+        assert payload["resend_count"] == 2
+
+        # Persistence: original-send calls (is_retry=False) must NOT touch
+        # webhook_resend_count; this retry call must.
+        update_call = mock_sb.table.return_value.update.call_args
+        update_fields = update_call.args[0]
+        assert update_fields["webhook_last_status_code"] == 200
+        assert update_fields["webhook_resend_count"] == 2
+        assert "webhook_delivered_at" in update_fields  # 200 → delivered timestamp set
+
+    def test_original_send_does_not_touch_resend_count(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=500, text="server error")
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = mock_post
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sb = MagicMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id="sid-original",
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="failed",
+                status_url="https://parity.io/status",
+                error_message="boom",
+            ))
+
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args.args[1]
+        assert payload["is_retry"] is False
+        assert payload["resend_count"] == 0
+
+        update_fields = mock_sb.table.return_value.update.call_args.args[0]
+        assert "webhook_resend_count" not in update_fields
+        assert update_fields["webhook_last_status_code"] == 500
+        assert "webhook_delivered_at" not in update_fields  # non-200 → not delivered

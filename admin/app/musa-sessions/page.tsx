@@ -16,6 +16,22 @@ interface MusaSession {
   completed_at: string | null
   document_urls: unknown
   error_message: string | null
+  webhook_last_status_code: number | null
+  webhook_last_attempted_at: string | null
+  webhook_last_error: string | null
+  webhook_delivered_at: string | null
+  webhook_resend_count: number
+}
+
+function webhookDeliveryLabel(row: MusaSession): { text: string; color: string } {
+  if (!row.webhook_last_attempted_at) {
+    return { text: 'Not sent yet', color: 'var(--t3)' }
+  }
+  if (row.webhook_delivered_at) {
+    return { text: 'Delivered', color: 'var(--green)' }
+  }
+  const code = row.webhook_last_status_code
+  return { text: code ? `Failed (${code})` : 'Failed', color: 'var(--red)' }
 }
 
 function documentUrlList(document_urls: unknown): string[] {
@@ -33,6 +49,8 @@ export default function MusaSessionsPage() {
   const [error, setError] = useState<string | null>(null)
   const [, setTick] = useState(0)
   const loadingRef = useRef(false)
+  const [resendingId, setResendingId] = useState<string | null>(null)
+  const [resendResult, setResendResult] = useState<{ sessionId: string; message: string; ok: boolean } | null>(null)
 
   const load = useCallback(async () => {
     if (loadingRef.current) return
@@ -56,6 +74,31 @@ export default function MusaSessionsPage() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  const handleResend = async (sessionId: string) => {
+    setResendingId(sessionId)
+    setResendResult(null)
+    try {
+      const res = await fetch(`/api/data/musa-sessions/${encodeURIComponent(sessionId)}/resend-webhook`, {
+        method: 'POST',
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        setResendResult({ sessionId, ok: false, message: data?.error ?? `Resend failed (${res.status})` })
+        return
+      }
+      setResendResult({
+        sessionId,
+        ok: true,
+        message: data?.webhook_delivered
+          ? `Resent — Musa returned ${data.webhook_status_code}`
+          : `Resend attempt ${data?.resend_count ?? '?'} sent — Musa returned ${data?.webhook_status_code ?? 'no response'}`,
+      })
+      await load()
+    } finally {
+      setResendingId(null)
+    }
+  }
 
   useEffect(() => {
     const id = setInterval(load, 60000)
@@ -85,6 +128,7 @@ export default function MusaSessionsPage() {
     { key: 'venture_name', label: 'Venture' },
     { key: 'venture_country', label: 'Country' },
     { key: 'status', label: 'Status' },
+    { key: 'webhook', label: 'Webhook' },
     { key: 'created_at', label: 'Created At' },
     { key: 'error_message', label: 'Error' },
   ]
@@ -219,6 +263,17 @@ export default function MusaSessionsPage() {
                         <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13, color: 'var(--t0)' }}>
                           <StatusBadge status={row.status} />
                         </td>
+                        <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+                          {(() => {
+                            const wh = webhookDeliveryLabel(row)
+                            return (
+                              <span style={{ color: wh.color, fontSize: 12 }}>
+                                {wh.text}
+                                {row.webhook_resend_count > 0 && ` · resent ${row.webhook_resend_count}×`}
+                              </span>
+                            )
+                          })()}
+                        </td>
                         <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13, color: 'var(--t0)' }}>
                           {toEAT(row.created_at)}
                         </td>
@@ -294,6 +349,69 @@ export default function MusaSessionsPage() {
                                     <div style={{ color: 'var(--red)', whiteSpace: 'pre-wrap' }}>{row.error_message}</div>
                                   </>
                                 )}
+
+                                <div style={{ color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: '0.06em' }}>
+                                  WEBHOOK
+                                </div>
+                                <div>
+                                  {(() => {
+                                    const wh = webhookDeliveryLabel(row)
+                                    const isProcessing = row.status === 'processing'
+                                    const isResending = resendingId === row.session_id
+                                    return (
+                                      <>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                          <span style={{ color: wh.color, fontWeight: 500 }}>{wh.text}</span>
+                                          {row.webhook_last_attempted_at && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              last attempt {toEAT(row.webhook_last_attempted_at)}
+                                            </span>
+                                          )}
+                                          {row.webhook_resend_count > 0 && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              · resent {row.webhook_resend_count}×
+                                            </span>
+                                          )}
+                                        </div>
+                                        {row.webhook_last_error && (
+                                          <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 4, whiteSpace: 'pre-wrap' }}>
+                                            {row.webhook_last_error}
+                                          </div>
+                                        )}
+                                        <button
+                                          onClick={() => handleResend(row.session_id)}
+                                          disabled={isProcessing || isResending}
+                                          title={isProcessing ? 'Session is still processing — nothing to resend yet' : undefined}
+                                          style={{
+                                            marginTop: 8,
+                                            border: '1px solid var(--teal)',
+                                            background: 'var(--white)',
+                                            color: 'var(--teal)',
+                                            borderRadius: 6,
+                                            padding: '5px 12px',
+                                            fontFamily: "'IBM Plex Mono', monospace",
+                                            fontSize: 11,
+                                            cursor: isProcessing || isResending ? 'default' : 'pointer',
+                                            opacity: isProcessing || isResending ? 0.5 : 1,
+                                          }}
+                                        >
+                                          {isResending ? 'Resending…' : 'Resend Webhook'}
+                                        </button>
+                                        {resendResult && resendResult.sessionId === row.session_id && (
+                                          <div
+                                            style={{
+                                              marginTop: 6,
+                                              fontSize: 12,
+                                              color: resendResult.ok ? 'var(--green)' : 'var(--red)',
+                                            }}
+                                          >
+                                            {resendResult.message}
+                                          </div>
+                                        )}
+                                      </>
+                                    )
+                                  })()}
+                                </div>
 
                                 {row.deal_id && (
                                   <>
