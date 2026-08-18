@@ -18,8 +18,6 @@ interface MusaSession {
   error_message: string | null
 }
 
-const SNAPSHOT_PDF_BASE = 'https://parity-backend-prod-121148713552.us-central1.run.app/v1/deals'
-
 function documentUrlList(document_urls: unknown): string[] {
   if (!Array.isArray(document_urls)) return []
   return document_urls.map((item) =>
@@ -304,7 +302,7 @@ export default function MusaSessionsPage() {
                                     </div>
                                     <div>
                                       <a
-                                        href={`${SNAPSHOT_PDF_BASE}/${row.deal_id}/snapshot/pdf`}
+                                        href={`/api/data/deals/${row.deal_id}/snapshot-pdf`}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         style={{ color: 'var(--teal)' }}

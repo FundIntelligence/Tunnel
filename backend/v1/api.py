@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Request, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form, Request, BackgroundTasks, Body, Header
 from fastapi.responses import StreamingResponse, HTMLResponse
 from jose import jwt as _jose_jwt
 from jose.exceptions import JWTError as _JoseJWTError
@@ -339,6 +339,32 @@ def _extract_user_id_from_request(request: Request) -> Optional[str]:
         return None
 
     return claims.get("sub")
+
+
+def _require_snapshot_access(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+) -> None:
+    """Gate for routes that expose full deal financials to non-deal-scoped
+    callers (PAR-175). Accepts any ONE of:
+      - a valid Musa partner key (x-api-key, same as musa_api.py's routes)
+      - a valid admin-scoped key (x-api-key, key_type="admin" — the admin
+        panel's server-side proxy, which has no Supabase user session to
+        forward)
+      - an authenticated internal user (Supabase JWT), same verification
+        _extract_user_id_from_request already does for confirm-endpoint
+        attribution, but enforced here as a hard gate rather than optional
+        attribution.
+    x-api-key is optional at the header level (unlike require_musa_api_key)
+    because a JWT-only caller must not be forced to send one.
+    """
+    if x_api_key:
+        from .integrations.auth import validate_api_key, validate_scoped_api_key
+        if validate_api_key(x_api_key, "Musa Ventures") or validate_scoped_api_key(x_api_key, "admin"):
+            return
+    if _extract_user_id_from_request(request):
+        return
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 @router.post("/deals")
@@ -1338,7 +1364,7 @@ def list_deal_transactions(request: Request, deal_id: str):
 
 
 @router.get("/deals/{deal_id}/snapshot/pdf")
-def get_snapshot_pdf(request: Request, deal_id: str):
+def get_snapshot_pdf(request: Request, deal_id: str, _auth: None = Depends(_require_snapshot_access)):
     repos = _repos(request)
     deal = repos["deals"].get_deal(deal_id)
     if not deal:
@@ -1448,7 +1474,13 @@ def get_deal_report(request: Request, deal_id: str):
 
 
 @router.get("/deals/{deal_id}/snapshot/html")
-def get_deal_snapshot_html(deal_id: str, view: str = "observed_recon", partner_name: str | None = None):
+def get_deal_snapshot_html(
+    request: Request,
+    deal_id: str,
+    view: str = "observed_recon",
+    partner_name: str | None = None,
+    _auth: None = Depends(_require_snapshot_access),
+):
     """
     Returns the rendered HTML snapshot for web viewing.
     view: observed_recon (default — branches internally on recon_available) | verify
