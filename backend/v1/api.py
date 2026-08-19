@@ -189,7 +189,15 @@ def _error(code: str, message: str, *, status: int = 0, next_action: Optional[st
 # rendering to completion in the background, permanently tying up a pool
 # slot for every deal slow enough to time out. Running the render in a real
 # OS process lets us SIGKILL it on timeout instead (PAR-183).
-_PDF_RENDER_TIMEOUT_S = 45
+# 180s (not 45s) because the budget, not the mechanism, was wrong: large
+# snapshots genuinely cost ~90-100s of layout on prod hardware — the Deed
+# deal (3,059 txns) returned 200 at 95.2s and 105.6s uncontended on
+# 2026-08-17, and 45s killed the same render mid-layout. Interim mitigation
+# only; the real fix is async generation (see
+# docs/PAR-177-async-pdf-implementation-plan.md). Still well under Cloud
+# Run's own timeoutSeconds=1200. Note this budget wraps write_pdf() alone —
+# auth/DB/HTML-build sit outside it, so client-visible worst case is higher.
+_PDF_RENDER_TIMEOUT_S = 180
 _PDF_KILL_GRACE_S = 5
 _pdf_mp_ctx = multiprocessing.get_context("fork")
 
