@@ -4,8 +4,10 @@ Shared snapshot-context data layer (PAR-189).
 STATUS: partial extraction. Stage 1 covered Risk Assessment Summary and
 Supplier Payment Analysis (both already implicated in real content-drop bugs
 — PAR-188 and same-night testing respectively). Stage 2 added Transaction
-Pattern Analysis and Tax Compliance Analysis. Stage 3 adds Analyst Notes and
-Inventory Analysis. The remaining ~11 sections are still computed inline in
+Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
+Inventory Analysis. Stage 4 adds Loan Activity Detected and Loan Facilities
+(one LoanActivity concept spanning two template sections). The remaining ~11
+sections are still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
@@ -57,6 +59,7 @@ Materiality = Literal["NEGLIGIBLE", "MINOR", "MATERIAL", "CRITICAL"]
 RevenueConcentrationState = Literal["OK", "INSUFFICIENT_DATA", "UNAVAILABLE"]
 SupplierConcentration = Literal["HIGH", "MODERATE", "DIVERSIFIED", "INSUFFICIENT_DATA"]
 KraStatus = Literal["COMPLIANT", "PARTIAL", "INSUFFICIENT_DATA", "NOT_DETECTED"]
+ReconStatus = Literal["EXACT_MATCH", "ACCEPTABLE", "COVERAGE_GAP", "VARIANCE"]
 
 
 def _fmt_kes(cents: int) -> str:
@@ -165,6 +168,35 @@ class Inventory:
     days_inventory_outstanding: Optional[float] = None      # raw, unrounded — see module docstring
     extraction_confidence: Optional[float] = None           # NOT a Percent — see module docstring
     narrative: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class LoanFacility:
+    name: str
+    amount: Money
+    status: ReconStatus   # resolved 4-way status; renderer's own table maps this to badge class/label
+
+
+@dataclass(frozen=True)
+class LoanActivity:
+    disbursed: Money
+    repaid: Money
+    net: Money                              # signed; renderer takes abs() for display, same as original
+    repayments_per_month: float
+    repayment_txn_count: int
+    facilities: List[LoanFacility]
+    bank_net: Money                         # always present (defaults to 0), never truly "unavailable"
+    declared_net: Money                     # always present (defaults to 0), never truly "unavailable"
+    variance: Optional[Percent]             # None -> renderer shows "0%" (original's own quirk, preserved
+                                             # exactly — NOT the usual "--" missing-data convention)
+    status_raw: Optional[str]               # verbatim recon status text (e.g. "HEALTHY"), for direct
+                                             # display — deliberately NOT collapsed into ReconStatus: the
+                                             # template prints this string as-is (snapshot.html:1224), and
+                                             # ReconStatus's 4 buckets would lose real values like "HEALTHY"
+                                             # or "ACCEPTABLE_VARIANCE" that _status_to_badge() collapses
+                                             # for badge purposes only. Kept separate deliberately — not in
+                                             # docs/PAR-189-shared-context-schema.md's proposed LoanActivity,
+                                             # added here because byte-fidelity requires it.
 
 
 @dataclass(frozen=True)
@@ -308,6 +340,90 @@ def _build_inventory(
         days_inventory_outstanding=dio,
         extraction_confidence=extraction_confidence_raw,
         narrative=narrative,
+    )
+
+
+def _resolve_recon_status(status_raw: Optional[str], coverage_incomplete: bool) -> ReconStatus:
+    """
+    Mirrors snapshot_html_renderer._status_to_badge()'s branching exactly
+    (minus the class/label — that stays a WeasyPrint presentation concern).
+    """
+    if status_raw == "EXACT_MATCH":
+        return "EXACT_MATCH"
+    if status_raw in ("ACCEPTABLE", "ACCEPTABLE_VARIANCE", "HEALTHY"):
+        return "ACCEPTABLE"
+    if coverage_incomplete:
+        return "COVERAGE_GAP"
+    return "VARIANCE"
+
+
+def _build_loan_activity(
+    txns: List[Dict],
+    in_active_period,
+    af: Dict,
+    recon_available: bool,
+    loans_r: Dict,
+    coverage_incomplete: bool,
+) -> LoanActivity:
+    # No `t["txn_date"]` truthiness guard here, deliberately matching the
+    # original exactly — unlike the Tax Compliance loop, the original loan
+    # repayment loop calls in_active_period(m) even when m == "" (missing
+    # txn_date). Not homogenizing the two; preserving the original as-is.
+    repay_months: Dict[str, int] = defaultdict(int)
+    for t in txns:
+        if t["role"] == "loan_repayment" and t["signed"] < 0:
+            m = (t["txn_date"] or "")[:7]
+            if in_active_period(m):
+                repay_months[m] += 1
+    repayments_per_month = (
+        sum(repay_months.values()) / len(repay_months) if repay_months else 0
+    )
+    repayment_txn_count = sum(1 for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0)
+
+    disbursed_cents = sum(
+        t["signed"] for t in txns if t["role"] == "loan_disbursement" and t["signed"] > 0
+    )
+    repaid_cents = sum(
+        t["abs"] for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0
+    )
+    net_cents = disbursed_cents - repaid_cents
+
+    status_raw = (loans_r.get("status") or None) if recon_available else None
+    resolved_status = _resolve_recon_status(status_raw or "VARIANCE", coverage_incomplete)
+
+    # Not gated on recon_available: matches the original exactly, which never
+    # explicitly checked it here either — af is already {} when
+    # recon_available is False (set that way by the caller), so
+    # af.get("loan_breakdown") naturally yields [] in that state anyway.
+    facilities = [
+        LoanFacility(
+            name=fac.get("name") or "--",
+            amount=Money(cents=int(fac.get("amount_cents") or 0)),
+            status=resolved_status,
+        )
+        for fac in (af.get("loan_breakdown") or [])
+    ]
+
+    # Deliberately loans_r.get(key, 0) — NOT `or 0` — matching the original
+    # exactly, including its latent behavior: a key present with an explicit
+    # None value raises TypeError here, same as the original did. Not
+    # silently hardening this; that would be an undocumented behavior change.
+    bank_net_cents = int(loans_r.get("bank_net_borrowing_kes", 0) * 100)
+    declared_net_cents = int(loans_r.get("declared_net_borrowing_kes", 0) * 100)
+    variance_raw = loans_r.get("variance_pct")
+    variance = Percent(value=variance_raw / 100) if variance_raw is not None else None
+
+    return LoanActivity(
+        disbursed=Money(cents=disbursed_cents),
+        repaid=Money(cents=repaid_cents),
+        net=Money(cents=net_cents),
+        repayments_per_month=repayments_per_month,
+        repayment_txn_count=repayment_txn_count,
+        facilities=facilities,
+        bank_net=Money(cents=bank_net_cents),
+        declared_net=Money(cents=declared_net_cents),
+        variance=variance,
+        status_raw=status_raw,
     )
 
 
@@ -519,10 +635,10 @@ def build_snapshot_context(
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 3 of PAR-189. Returns:
+    PARTIAL — Stage 4 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
-         "inventory": Inventory, "analyst_notes": Optional[str]}
+         "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -548,7 +664,7 @@ def build_snapshot_context(
 
     af_result = (
         sb.table("pds_audited_financials")
-        .select("financial_year, inventory_cents, cost_of_sales_cents, extraction_confidence")
+        .select("financial_year, inventory_cents, cost_of_sales_cents, extraction_confidence, loan_breakdown")
         .eq("deal_id", deal_id)
         .execute()
         .data or []
@@ -584,6 +700,18 @@ def build_snapshot_context(
 
     recon_tier: Tier = (recon_section.get("tier") or "LOW_CONFIDENCE") if recon_available else "OBSERVED"
 
+    # Same coverage-incomplete derivation snapshot_html_renderer.py still
+    # computes independently for the not-yet-extracted 4-Point Reconciliation
+    # section (rev/exp/loan badges there) — reused here, not a new concept,
+    # just recomputed from acct_cov_raw which this function already fetches.
+    missing_bank_names = [
+        a.get("bank_name") for a in (acct_cov_raw.get("account_details") or [])
+        if a.get("status") != "SUBMITTED" and a.get("bank_name")
+    ]
+    coverage_incomplete = recon_available and bool(missing_bank_names)
+
+    loans_r: Dict = (recon_section.get("loan_activity") or {}) if recon_available else {}
+
     transaction_patterns = _build_transaction_patterns(canonical.get("transactions") or [])
 
     txns = _fetch_txns_for_context(sb, deal_id)
@@ -596,12 +724,14 @@ def build_snapshot_context(
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
     inventory = _build_inventory(af, recon_available, inventory_config)
+    loans = _build_loan_activity(txns, in_active_period, af, recon_available, loans_r, coverage_incomplete)
     risk = _build_risk_assessment(
         txns, recon_tier, acct_cov_raw, transaction_patterns.critical_count, supplier_config,
     )
 
     return {
         "risk": risk,
+        "loans": loans,
         "supplier_payments": supplier_payments,
         "transaction_patterns": transaction_patterns,
         "tax_compliance": tax_compliance,
