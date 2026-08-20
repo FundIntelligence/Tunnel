@@ -20,6 +20,7 @@ from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cash
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
+    Composition as _Composition,
     Inventory as _Inventory,
     LoanActivity as _LoanActivity,
     Money as _Money,
@@ -241,6 +242,29 @@ def _loan_activity_ctx_from(loans: _LoanActivity) -> Dict[str, Any]:
         "loan_bank_net_str":     _fmt_money_kes(loans.bank_net),
         "loan_declared_net_str": _fmt_money_kes(loans.declared_net),
         "loan_variance_str":     f"{loans.variance.value * 100:.1f}%" if loans.variance is not None else "0%",
+    }
+
+
+def _composition_ctx_from(comp: _Composition) -> Dict[str, Any]:
+    # comp.segments deliberately carries no colour (design doc §1c flags
+    # inflow_segments[].color / outflow_segments[].color as a hex-literal
+    # format-agnostic violation) — and unlike Stage 4's badge classes, the
+    # CURRENT template never actually reads seg.color at all (only .label,
+    # .pct, .amount_str — confirmed by grep against snapshot.html), so there
+    # is nothing here for a WeasyPrint adapter to reconstruct. Not dropped
+    # silently: flagged in the PAR-189 report.
+    segments = [
+        {
+            "label": seg.label,
+            "pct": round(seg.share.value * 100),
+            "amount_str": _fmt_kes_millions(seg.amount.cents),
+        }
+        for seg in comp.segments
+    ]
+    return {
+        "total_str": _fmt_kes_millions(comp.total.cents),
+        "segments": segments,
+        "warn": comp.advisory or "",
     }
 
 
@@ -755,76 +779,22 @@ def render_snapshot_html(
         })
 
     # ── Composition segments ─────────────────────────────────────────────────
-    _in_groups  = [("revenue_operational", "pesalink_inflow"), ("mpesa_inflow",), ("transfer",)]
-    _in_labels  = ["Bank transfers / invoiced", "M-Pesa channel", "Inter-account"]
-    _in_colors  = ["#0D9488", "#6366F1", "#F59E0B"]
+    # PAR-189 Stage 5: computation now lives in build_snapshot_context() — see
+    # _composition_ctx_from() above. by_role_in/total_in/by_role_out/total_out
+    # (computed above, unchanged) stay needed locally: Key Metrics'
+    # income_quality_pct (not yet extracted) already used them before this
+    # block even ran. mpesa_cents/mpesa_pct specifically are recomputed as a
+    # small residual below because the not-yet-extracted Observed Patterns
+    # "M-Pesa concentration" card still reads mpesa_pct directly.
+    inflow_composition_ctx = _composition_ctx_from(shared_ctx["inflow"])
+    outflow_composition_ctx = _composition_ctx_from(shared_ctx["outflow"])
+    inflow_segments = inflow_composition_ctx["segments"]
+    outflow_segments = outflow_composition_ctx["segments"]
+    inflow_warn = inflow_composition_ctx["warn"]
+    outflow_warn = outflow_composition_ctx["warn"]
 
-    inflow_segments = []
-    in_accounted = 0
-    for roles, label, color in zip(_in_groups, _in_labels, _in_colors):
-        total = sum(by_role_in.get(r, 0) for r in roles)
-        if total > 0 and total_in > 0:
-            pct = max(1, int(total / total_in * 100))
-            in_accounted += pct
-            inflow_segments.append({
-                "label": label, "pct": pct, "color": color,
-                "amount_str": _fmt_kes_millions(total),
-            })
-    other_in = total_in - sum(by_role_in.get(r, 0) for grp in _in_groups for r in grp)
-    if other_in > 0 and total_in > 0:
-        inflow_segments.append({
-            "label": "Other / unclassified",
-            "pct": max(0, 100 - in_accounted),
-            "color": "#D1D5DB",
-            "amount_str": _fmt_kes_millions(other_in),
-        })
-
-    _out_groups = [
-        ("supplier", "supplier_payment"),
-        ("operational", "operational_payment"),
-        ("payroll",),
-        ("loan_repayment",),
-        ("tax_payment",),
-    ]
-    _out_labels = ["Procurement / COGS", "Operational", "Payroll", "Loan repayments", "Tax (KRA)"]
-    _out_colors = ["#1C2135", "#B45309", "#4338CA", "#0D9488", "#B91C1C"]
-
-    outflow_segments = []
-    out_accounted = 0
-    for roles, label, color in zip(_out_groups, _out_labels, _out_colors):
-        total = sum(by_role_out.get(r, 0) for r in roles)
-        if total > 0 and total_out > 0:
-            pct = max(1, int(total / total_out * 100))
-            out_accounted += pct
-            outflow_segments.append({
-                "label": label, "pct": pct, "color": color,
-                "amount_str": _fmt_kes_millions(total),
-            })
-    other_out = total_out - sum(by_role_out.get(r, 0) for grp in _out_groups for r in grp)
-    if other_out > 0 and total_out > 0:
-        outflow_segments.append({
-            "label": "Finance charges / other",
-            "pct": max(0, 100 - out_accounted),
-            "color": "#D1D5DB",
-            "amount_str": _fmt_kes_millions(other_out),
-        })
-
-    # Composition warn strings
     mpesa_cents = by_role_in.get("mpesa_inflow", 0)
     mpesa_pct   = (mpesa_cents / total_in * 100) if total_in else 0
-    mpesa_txn_count = sum(1 for t in canon_tagged if t["role"] == "mpesa_inflow" and t["amount_cents"] > 0)
-    mpesa_avg = (mpesa_cents / mpesa_txn_count / 100) if mpesa_txn_count > 0 else 0
-    inflow_warn = (
-        f"M-Pesa at {mpesa_txn_count:,} transactions (avg {currency} {mpesa_avg:,.0f} per txn) · "
-        "verify consistency with declared business model and customer type · pattern observed, not concluded"
-    ) if mpesa_pct > 25 else ""
-
-    procurement_cents = sum(by_role_out.get(r, 0) for r in ("supplier", "supplier_payment"))
-    procurement_pct   = (procurement_cents / total_out * 100) if total_out else 0
-    outflow_warn = (
-        f"Procurement outflows ({procurement_pct:.0f}%) — cash procurement controls and cross-border "
-        "documentation should be verified · observed supplier payments represent partial COGS visibility"
-    ) if procurement_pct > 50 else ""
 
     # ── Supplier Payment Analysis (PAR-63) ────────────────────────────────────
     # PAR-189 Stage 1: computation now lives in build_snapshot_context()
@@ -1283,10 +1253,10 @@ def render_snapshot_html(
         "cashflow_note":      cashflow_note,
         "cashflow_peak_trough_note": cashflow_peak_trough_note,
         "cashflow_trend_note": cashflow_trend_note,
-        "inflow_total_str":   _fmt_kes_millions(total_in),
+        "inflow_total_str":   inflow_composition_ctx["total_str"],
         "inflow_segments":    inflow_segments,
         "inflow_warn":        inflow_warn,
-        "outflow_total_str":  _fmt_kes_millions(total_out),
+        "outflow_total_str":  outflow_composition_ctx["total_str"],
         "outflow_segments":   outflow_segments,
         "outflow_warn":       outflow_warn,
         "tax_count":          len(tax_txns),

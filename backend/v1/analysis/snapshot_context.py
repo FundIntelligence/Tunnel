@@ -5,9 +5,10 @@ STATUS: partial extraction. Stage 1 covered Risk Assessment Summary and
 Supplier Payment Analysis (both already implicated in real content-drop bugs
 — PAR-188 and same-night testing respectively). Stage 2 added Transaction
 Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
-Inventory Analysis. Stage 4 adds Loan Activity Detected and Loan Facilities
-(one LoanActivity concept spanning two template sections). The remaining ~11
-sections are still computed inline in
+Inventory Analysis. Stage 4 added Loan Activity Detected and Loan Facilities
+(one LoanActivity concept spanning two template sections). Stage 5 adds
+Inflow Composition and Outflow Composition. The remaining ~9 sections are
+still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
@@ -30,6 +31,18 @@ wrapped in Percent — the original template displays it as "0.87", never
 "87%", so treating it as a Percent (which the WeasyPrint adapter would
 multiply by 100) would silently produce the wrong number.
 
+Stage 5 note: Segment.share (Inflow/Outflow Composition) is NOT each
+segment's true fraction of the total. The original computes each segment's
+displayed percentage as max(1, int(total/grand_total*100)) — an integer
+floor with a minimum of 1% for any included segment — and the "Other"
+bucket's percentage as 100 minus the SUM of the other segments' already-
+floored percentages (a chart-must-sum-to-100 residual, not other/total on
+its own). Both are display-layer artifacts of the original, not a
+recomputable property of the segment's raw amount. Preserved exactly:
+share.value stores that already-computed integer percentage divided by 100,
+not amount/total. Recomputing a "true" share here would silently change
+what every segment displays.
+
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
 CSS class names, hex colours, or markup. Each renderer (WeasyPrint today,
 reportlab later) owns its own mapping from these typed values to
@@ -41,8 +54,9 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
+from ..analytics import CASHFLOW_INFLOW_ROLES
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from ._snapshot_fetch_helpers import _get_supabase, _paginate
@@ -200,6 +214,23 @@ class LoanActivity:
 
 
 @dataclass(frozen=True)
+class Segment:
+    key: str            # stable id (e.g. "procurement_cogs") — renderer owns colour, per design doc §2
+    label: str
+    amount: Money
+    share: Percent       # NOT the segment's true fraction of the total — see module docstring: this
+                          # preserves the original's own display-layer floor-to-min-1%/residual-for-
+                          # "other" logic exactly, re-expressed as a 0-1 fraction for schema compliance.
+
+
+@dataclass(frozen=True)
+class Composition:
+    total: Money
+    segments: List[Segment]
+    advisory: Optional[str] = None   # None -> renderer shows "" (inflow_warn/outflow_warn's original default)
+
+
+@dataclass(frozen=True)
 class SupplierPayments:
     available: bool
     total: Optional[Money] = None
@@ -341,6 +372,120 @@ def _build_inventory(
         extraction_confidence=extraction_confidence_raw,
         narrative=narrative,
     )
+
+
+_IN_GROUPS = [("revenue_operational", "pesalink_inflow"), ("mpesa_inflow",), ("transfer",)]
+_IN_LABELS = ["Bank transfers / invoiced", "M-Pesa channel", "Inter-account"]
+_IN_KEYS = ["bank_transfers_invoiced", "mpesa_channel", "inter_account"]
+
+_OUT_GROUPS = [
+    ("supplier", "supplier_payment"),
+    ("operational", "operational_payment"),
+    ("payroll",),
+    ("loan_repayment",),
+    ("tax_payment",),
+]
+_OUT_LABELS = ["Procurement / COGS", "Operational", "Payroll", "Loan repayments", "Tax (KRA)"]
+_OUT_KEYS = ["procurement_cogs", "operational", "payroll", "loan_repayments", "tax_kra"]
+
+
+def _build_canon_tagged(canonical: Dict) -> List[Dict]:
+    """
+    Mirrors render_snapshot_html()'s own canon_tagged construction exactly
+    (same silent-drop of any row missing txn_date). Both this function and
+    the renderer build it independently from the same canonical_json —
+    accepted duplication, same pattern as everywhere else in this module.
+    """
+    canon_role_by_txn: Dict[str, str] = {
+        str(m.get("txn_id") or ""): m.get("role", "")
+        for m in (canonical.get("txn_entity_map") or [])
+    }
+    canon_tagged: List[Dict] = []
+    for t in canonical.get("transactions") or []:
+        txn_date = str(t.get("txn_date") or "")
+        if not txn_date:
+            continue
+        txn_id = str(t.get("id") or t.get("txn_id") or "")
+        canon_tagged.append({
+            "role": canon_role_by_txn.get(txn_id, ""),
+            "amount_cents": int(t.get("signed_amount_cents") or 0),
+            "txn_date": txn_date,
+            "txn_id": txn_id,
+        })
+    return canon_tagged
+
+
+def _build_composition(canon_tagged: List[Dict], currency: str) -> Tuple[Composition, Composition]:
+    by_role_in: Dict[str, int] = defaultdict(int)
+    total_in = 0
+    for t in canon_tagged:
+        if t["amount_cents"] > 0 and t["role"] in CASHFLOW_INFLOW_ROLES:
+            by_role_in[t["role"]] += t["amount_cents"]
+            total_in += t["amount_cents"]
+
+    by_role_out: Dict[str, int] = defaultdict(int)
+    total_out = 0
+    for t in canon_tagged:
+        if t["amount_cents"] < 0:
+            amt = abs(t["amount_cents"])
+            by_role_out[t["role"]] += amt
+            total_out += amt
+
+    inflow_segments: List[Segment] = []
+    in_accounted = 0
+    for roles, label, key in zip(_IN_GROUPS, _IN_LABELS, _IN_KEYS):
+        total = sum(by_role_in.get(r, 0) for r in roles)
+        if total > 0 and total_in > 0:
+            pct = max(1, int(total / total_in * 100))
+            in_accounted += pct
+            inflow_segments.append(
+                Segment(key=key, label=label, amount=Money(cents=total), share=Percent(value=pct / 100))
+            )
+    other_in = total_in - sum(by_role_in.get(r, 0) for grp in _IN_GROUPS for r in grp)
+    if other_in > 0 and total_in > 0:
+        other_pct = max(0, 100 - in_accounted)
+        inflow_segments.append(
+            Segment(key="other", label="Other / unclassified",
+                    amount=Money(cents=other_in), share=Percent(value=other_pct / 100))
+        )
+
+    outflow_segments: List[Segment] = []
+    out_accounted = 0
+    for roles, label, key in zip(_OUT_GROUPS, _OUT_LABELS, _OUT_KEYS):
+        total = sum(by_role_out.get(r, 0) for r in roles)
+        if total > 0 and total_out > 0:
+            pct = max(1, int(total / total_out * 100))
+            out_accounted += pct
+            outflow_segments.append(
+                Segment(key=key, label=label, amount=Money(cents=total), share=Percent(value=pct / 100))
+            )
+    other_out = total_out - sum(by_role_out.get(r, 0) for grp in _OUT_GROUPS for r in grp)
+    if other_out > 0 and total_out > 0:
+        other_pct = max(0, 100 - out_accounted)
+        outflow_segments.append(
+            Segment(key="other", label="Finance charges / other",
+                    amount=Money(cents=other_out), share=Percent(value=other_pct / 100))
+        )
+
+    mpesa_cents = by_role_in.get("mpesa_inflow", 0)
+    mpesa_pct = (mpesa_cents / total_in * 100) if total_in else 0
+    mpesa_txn_count = sum(1 for t in canon_tagged if t["role"] == "mpesa_inflow" and t["amount_cents"] > 0)
+    mpesa_avg = (mpesa_cents / mpesa_txn_count / 100) if mpesa_txn_count > 0 else 0
+    inflow_advisory = (
+        f"M-Pesa at {mpesa_txn_count:,} transactions (avg {currency} {mpesa_avg:,.0f} per txn) · "
+        "verify consistency with declared business model and customer type · pattern observed, not concluded"
+    ) if mpesa_pct > 25 else None
+
+    procurement_cents = sum(by_role_out.get(r, 0) for r in ("supplier", "supplier_payment"))
+    procurement_pct = (procurement_cents / total_out * 100) if total_out else 0
+    outflow_advisory = (
+        f"Procurement outflows ({procurement_pct:.0f}%) — cash procurement controls and cross-border "
+        "documentation should be verified · observed supplier payments represent partial COGS visibility"
+    ) if procurement_pct > 50 else None
+
+    inflow = Composition(total=Money(cents=total_in, currency=currency), segments=inflow_segments, advisory=inflow_advisory)
+    outflow = Composition(total=Money(cents=total_out, currency=currency), segments=outflow_segments, advisory=outflow_advisory)
+    return inflow, outflow
 
 
 def _resolve_recon_status(status_raw: Optional[str], coverage_incomplete: bool) -> ReconStatus:
@@ -635,10 +780,11 @@ def build_snapshot_context(
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 4 of PAR-189. Returns:
+    PARTIAL — Stage 5 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
-         "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity}
+         "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity,
+         "inflow": Composition, "outflow": Composition}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -655,12 +801,14 @@ def build_snapshot_context(
 
     deal_result = (
         sb.table("pds_deals")
-        .select("analyst_notes")
+        .select("analyst_notes, currency")
         .eq("id", deal_id)
         .single()
         .execute()
     )
-    analyst_notes: Optional[str] = (deal_result.data or {}).get("analyst_notes") or None
+    deal_row: Dict = deal_result.data or {}
+    analyst_notes: Optional[str] = deal_row.get("analyst_notes") or None
+    currency: str = deal_row.get("currency") or "KES"
 
     af_result = (
         sb.table("pds_audited_financials")
@@ -714,6 +862,9 @@ def build_snapshot_context(
 
     transaction_patterns = _build_transaction_patterns(canonical.get("transactions") or [])
 
+    canon_tagged = _build_canon_tagged(canonical)
+    inflow, outflow = _build_composition(canon_tagged, currency)
+
     txns = _fetch_txns_for_context(sb, deal_id)
 
     entity_rows = _paginate(sb, "pds_entities", "entity_id, display_name", deal_id)
@@ -737,4 +888,6 @@ def build_snapshot_context(
         "tax_compliance": tax_compliance,
         "inventory": inventory,
         "analyst_notes": analyst_notes,
+        "inflow": inflow,
+        "outflow": outflow,
     }
