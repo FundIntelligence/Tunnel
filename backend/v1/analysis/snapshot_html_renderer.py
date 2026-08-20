@@ -23,6 +23,8 @@ from .snapshot_context import (
     Money as _Money,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
+    TaxCompliance as _TaxCompliance,
+    TransactionPatterns as _TransactionPatterns,
     build_snapshot_context,
 )
 from ._snapshot_fetch_helpers import _get_supabase, _paginate
@@ -158,6 +160,26 @@ def _risk_assessment_ctx_from(risk: _RiskAssessment) -> Dict[str, Any]:
         "anomaly_summary":        risk.anomaly_narrative,
         "conclusion":             risk.conclusion,
         "transfer_note":          risk.transfer_caveat,
+    }
+
+
+def _transaction_patterns_ctx_from(tp: _TransactionPatterns) -> Dict[str, Any]:
+    return {
+        "critical_count":  tp.critical_count,
+        "high_count":      tp.high_count,
+        "total_flagged":   tp.total_flagged,
+        "total_txn_count": tp.total_txn_count,
+        "clause":          tp.narrative,
+    }
+
+
+def _tax_compliance_ctx_from(tc: _TaxCompliance) -> Dict[str, Any]:
+    return {
+        "total_str":      _fmt_money_kes(tc.total),
+        "n_tax_months":   tc.months_with_tax,
+        "n_total_months": tc.months_total,
+        "kra_compliance": tc.status,
+        "clause":         tc.narrative,
     }
 
 
@@ -749,121 +771,34 @@ def render_snapshot_html(
     supplier_payments_ctx: Dict[str, Any] = _supplier_payments_ctx_from(shared_ctx["supplier_payments"])
 
     # ── Transaction Pattern Analysis (PAR-63) ─────────────────────────────────
-    # tx["anomalies"] is computed by anomaly_detector.py during run_pipeline()
-    # and mutated onto the same raw transaction dicts that flow through to
-    # build_pds_payload() — it's sealed into canonical_json.transactions[] but
-    # never written to any DB column, so it can ONLY be read from
-    # canonical_json, not from the live pds_raw_transactions fetch (txns).
-    # Both the anomaly aggregation AND the total-transaction denominator below
-    # are read from the SAME raw canonical.get("transactions") list, in a
-    # single pass — deliberately not canon_tagged (which silently drops any
-    # row missing a txn_date, line ~230 above) or total_txn_count (which is
-    # len(txns), the live-fetch count) — to avoid the exact numerator/
-    # denominator cross-source mismatch caught in Tax Compliance Analysis
-    # (PR #110 review). Legacy snapshots sealed before anomaly_detector.py
-    # existed simply have no "anomalies" key per transaction — treated as an
-    # empty list, not an error.
-    _SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
-    canon_raw_transactions = canonical.get("transactions") or []
-    total_txn_count_canon = len(canon_raw_transactions)
-
-    all_anomalies: List[Dict[str, Any]] = []
-    for t in canon_raw_transactions:
-        for a in (t.get("anomalies") or []):
-            all_anomalies.append({
-                "type":     a.get("type") or "UNKNOWN",
-                "severity": a.get("severity") or "LOW",
-                "reason":   a.get("reason") or "",
-                "abs_amount_cents": abs(int(t.get("signed_amount_cents") or 0)),
-                "txn_date": t.get("txn_date") or "",
-            })
-
-    total_flagged  = len(all_anomalies)
-    critical_count = sum(1 for a in all_anomalies if a["severity"] == "CRITICAL")
-    high_count     = sum(1 for a in all_anomalies if a["severity"] == "HIGH")
-
-    if all_anomalies:
-        top_anomaly = max(
-            all_anomalies,
-            key=lambda a: (_SEVERITY_RANK.get(a["severity"], 0), a["abs_amount_cents"]),
-        )
-    else:
-        top_anomaly = None
-
-    if top_anomaly and top_anomaly["severity"] in ("CRITICAL", "HIGH"):
-        top_pattern_clause = (
-            f"The most significant: a {top_anomaly['type']} of "
-            f"{_fmt_kes(top_anomaly['abs_amount_cents'])} on {top_anomaly['txn_date']} "
-            f"({top_anomaly['reason']})."
-        )
-    else:
-        top_pattern_clause = "No high-severity transaction patterns were detected."
-
-    transaction_patterns_ctx: Dict[str, Any] = {
-        "critical_count":  critical_count,
-        "high_count":      high_count,
-        "total_flagged":   total_flagged,
-        "total_txn_count": total_txn_count_canon,
-        "clause":          top_pattern_clause,
-    }
+    # PAR-189 Stage 2: computation now lives in build_snapshot_context()
+    # (snapshot_context.py) — this just re-derives the presentation dict the
+    # template expects. See _transaction_patterns_ctx_from() above.
+    transaction_patterns_ctx: Dict[str, Any] = _transaction_patterns_ctx_from(
+        shared_ctx["transaction_patterns"]
+    )
 
     # ── Tax Compliance Analysis (PAR-63) ──────────────────────────────────────
-    # Live recompute over the same txns list already in scope for this render
-    # — NOT the cached pds_documents.analytics.credit_scoring_inputs blob
-    # (credit_scoring_inputs_list above). A stale cache silently drifting
-    # after an analyst override or reprocessing is exactly the "wrong answer
-    # without an error" risk PARITY_SCIENCE.md flags for an investor-facing
-    # compliance conclusion. Mirrors the by_month_rev/procurement_cents
-    # aggregation pattern already used in this file — no new query, no new
-    # style. Renders in both recon_available states — depends only on live
-    # transaction data.
-    _TAX_ROLES = ("tax_payment", "kra_payment")
-    # PAR-100: minimum tax-transaction sample before trusting a categorical
-    # COMPLIANT/PARTIAL status — the same arithmetic-soundness principle as
-    # Supplier Payment Analysis's _MIN_SUPPLIER_SAMPLE_SIZE (30 txns): at a
-    # handful of transactions the ratio can't produce a meaningful answer
-    # regardless of the real pattern. Deliberately NOT reusing 30 here — tax
-    # payments are monthly-cadence (PAYE/VAT), realistically capping around
-    # 12-24/year for any real deal, so a 30-transaction floor would make
-    # almost every deal (including the canonical MBAKSTESTBUILDEX fixture,
-    # at 5) read "insufficient data" regardless of how genuinely compliant
-    # the pattern is — that would defeat the section's purpose rather than
-    # protect it. 3 requires at least a quarter's worth of tax activity
-    # before asserting a categorical status, without over-tightening for a
-    # role whose real-world volume is inherently low.
-    _MIN_TAX_SAMPLE_SIZE = 3
-    tax_months_active: set = set()
-    tax_total_cents_active = 0
-    tax_txn_count_active = 0
-    # Denominator must come from the same txns list as the numerator above —
-    # period_months (used elsewhere in this file) is derived from
-    # monthly_merged/canon_tagged, which is sourced from canonical_json, not
-    # from txns. Mixing the two would compute a ratio whose numerator and
-    # denominator disagree on which data source is authoritative, silently
-    # defeating the whole point of live-recomputing this section instead of
-    # trusting a cache. See PAR-63 PR #110 review — caught before merge.
-    #
-    # PAR-100: payroll_months_active piggybacks on this same single pass so
-    # the "Irregular payroll" Observed Pattern card below (~line 1030) can
-    # share n_total_months as its denominator too, instead of pairing a
-    # cached pds_documents.analytics.credit_scoring_inputs numerator
-    # (populated once at ingestion, never refreshed) with this file's live
-    # period — the exact numerator/denominator cross-source split this
-    # section was already rebuilt to avoid for tax compliance.
+    # PAR-189 Stage 2: the tax-specific part of this computation now lives in
+    # build_snapshot_context() — see _tax_compliance_ctx_from() above. What
+    # stays here is a reduced version of the original single-pass loop, kept
+    # ONLY for payroll_stability_live / n_payroll_months / n_total_months,
+    # which the not-yet-extracted "Irregular payroll" Observed Pattern card
+    # below still reads. The original loop also accumulated tax_months_active
+    # / tax_total_cents_active / tax_txn_count_active in the same pass — that
+    # part moved into build_snapshot_context()'s _build_tax_compliance() and
+    # is intentionally NOT recomputed here.
+    tax_compliance_ctx: Dict[str, Any] = _tax_compliance_ctx_from(shared_ctx["tax_compliance"])
+
     all_months_active: set = set()
     payroll_months_active: set = set()
     for t in txns:
         m = (t["txn_date"] or "")[:7]
         if t["txn_date"] and _in_active_period(m):
             all_months_active.add(m)
-            if t["role"] in _TAX_ROLES and t["signed"] < 0:
-                tax_months_active.add(m)
-                tax_total_cents_active += t["abs"]
-                tax_txn_count_active += 1
             if t["role"] == "payroll":
                 payroll_months_active.add(m)
 
-    n_tax_months   = len(tax_months_active)
     n_total_months = len(all_months_active)
     n_payroll_months = len(payroll_months_active)
 
@@ -879,47 +814,6 @@ def render_snapshot_html(
         payroll_stability_live = "MOSTLY_CONSISTENT"
     else:
         payroll_stability_live = "IRREGULAR"
-
-    # A genuine zero (n_tax_txns == 0) is already an honest, meaningful
-    # finding — NOT_DETECTED, with its own explanatory clause below — and is
-    # left untouched. The insufficient-data gate only applies to the thin
-    # nonzero case (1-2 transactions), where the ratio itself is otherwise
-    # able to compute a confident-looking but statistically meaningless
-    # categorical status.
-    if n_total_months == 0 or tax_txn_count_active == 0:
-        kra_compliance = "NOT_DETECTED"
-    elif tax_txn_count_active < _MIN_TAX_SAMPLE_SIZE:
-        kra_compliance = "INSUFFICIENT_DATA"
-    elif n_tax_months >= n_total_months * 0.8:
-        kra_compliance = "COMPLIANT"
-    elif n_tax_months > 0:
-        kra_compliance = "PARTIAL"
-    else:
-        kra_compliance = "NOT_DETECTED"
-
-    if kra_compliance == "COMPLIANT":
-        tax_compliance_clause = "Tax payment pattern is consistent with the business's stated activity level."
-    elif kra_compliance == "PARTIAL":
-        tax_compliance_clause = "Partial tax payment pattern — verify against filed returns."
-    elif kra_compliance == "INSUFFICIENT_DATA":
-        tax_compliance_clause = (
-            f"Insufficient tax transaction volume for a reliable compliance "
-            f"assessment (N={tax_txn_count_active})."
-        )
-    else:
-        tax_compliance_clause = (
-            "No tax payments detected in bank activity. This does not necessarily "
-            "indicate non-compliance — tax may be paid from an account outside this "
-            "statement set, or by a third party. Verify against a KRA compliance certificate."
-        )
-
-    tax_compliance_ctx: Dict[str, Any] = {
-        "total_str":      _fmt_kes(tax_total_cents_active),
-        "n_tax_months":   n_tax_months,
-        "n_total_months": n_total_months,
-        "kra_compliance": kra_compliance,
-        "clause":         tax_compliance_clause,
-    }
 
     # ── Inter-Account Transfer Analysis (PAR-63; live-checked per PAR-102) ───
     # Self-transfer/cash-sweep detection between a company's own bank accounts
