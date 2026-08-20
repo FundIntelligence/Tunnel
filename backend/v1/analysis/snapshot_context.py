@@ -7,8 +7,9 @@ Supplier Payment Analysis (both already implicated in real content-drop bugs
 Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
 Inventory Analysis. Stage 4 added Loan Activity Detected and Loan Facilities
 (one LoanActivity concept spanning two template sections). Stage 5 added
-Inflow Composition and Outflow Composition. Stage 6 adds Tax Payment Pattern.
-The remaining ~8 sections are still computed inline in
+Inflow Composition and Outflow Composition. Stage 6 added Tax Payment Pattern.
+Stage 7 adds Inter-Account Transfer Analysis.
+The remaining ~6 sections are still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
@@ -51,6 +52,16 @@ share.value stores that already-computed integer percentage divided by 100,
 not amount/total. Recomputing a "true" share here would silently change
 what every segment displays.
 
+Stage 7 note: InterAccountTransfer carries a semantic `state`
+(DETECTED / NO_TRANSFERS_FOUND / UNAVAILABLE) rather than the original's
+inline badge text ("Detected" / "No Transfers Found" / "Not Available") — the
+badge string is presentation and now lives in the WeasyPrint adapter, per
+ratified decision #5. The NO_TRANSFERS_FOUND vs UNAVAILABLE distinction is
+load-bearing and must never be collapsed: the first means detection ran and
+genuinely found nothing, the second means the pre-PAR-102 per-account tagging
+gap makes detection structurally impossible. Reporting the second as the
+first would be a false negative on a real financial claim.
+
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
 CSS class names, hex colours, or markup. Each renderer (WeasyPrint today,
 reportlab later) owns its own mapping from these typed values to
@@ -67,7 +78,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 from ..analytics import CASHFLOW_INFLOW_ROLES
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
-from ._snapshot_fetch_helpers import _get_supabase, _paginate
+from ._snapshot_fetch_helpers import _bank_label, _get_supabase, _paginate
 
 Cents = int
 
@@ -83,6 +94,12 @@ RevenueConcentrationState = Literal["OK", "INSUFFICIENT_DATA", "UNAVAILABLE"]
 SupplierConcentration = Literal["HIGH", "MODERATE", "DIVERSIFIED", "INSUFFICIENT_DATA"]
 KraStatus = Literal["COMPLIANT", "PARTIAL", "INSUFFICIENT_DATA", "NOT_DETECTED"]
 ReconStatus = Literal["EXACT_MATCH", "ACCEPTABLE", "COVERAGE_GAP", "VARIANCE"]
+TransferDetectionState = Literal["DETECTED", "NO_TRANSFERS_FOUND", "UNAVAILABLE"]
+
+# Roles an analyst can apply by override to assert a transaction is a
+# self-transfer. Distinct from system detection (pds_transfer_links) —
+# see InterAccountTransfer.override_note.
+_TRANSFER_ROLES = ("transfer", "internal_transfer")
 
 
 def _fmt_kes(cents: int) -> str:
@@ -276,6 +293,60 @@ class SupplierPayments:
 
 
 @dataclass(frozen=True)
+class TransferPair:
+    """
+    One detected self-transfer route between two of the company's own accounts.
+
+    `label` is a human route name ("Equity -> KCB"), built from each side's
+    detected bank label with the original's exact fallbacks — the document's
+    detected bank name, else "Account <first-8-of-document_id>", else a
+    positional "Account A"/"Account B". Kept as a single string because that
+    is precisely what the original computed and what the template renders; it
+    is a name, not a style.
+    """
+    label: str
+    count: int
+    total: Money
+
+
+@dataclass(frozen=True)
+class InterAccountTransfer:
+    """
+    Inter-Account Transfer Analysis (PAR-63, live-checked per PAR-102).
+
+    `state` is the semantic three-way result, NOT a badge string — per PAR-189
+    ratified decision #5, each renderer owns its own state -> label mapping
+    (WeasyPrint's lives in _inter_account_transfer_ctx_from()). The original
+    computed the badge text inline ("Detected" / "No Transfers Found" /
+    "Not Available"); that text is presentation and does not belong here.
+
+    The three states are the original's three branches, preserved exactly:
+      DETECTED            — real pds_transfer_links rows exist for this deal.
+      NO_TRANSFERS_FOUND  — zero links AND 2+ distinct account_id values, i.e.
+                            detection genuinely ran and found nothing.
+      UNAVAILABLE         — zero links AND <2 distinct account_id values, i.e.
+                            the pre-PAR-102 per-account tagging gap. This is an
+                            infrastructure limitation, NOT a finding of "no
+                            transfers" — the distinction is the whole point of
+                            the three-way split and must not be collapsed.
+
+    Per ratified decision #1, the "missing" case carries a null value plus a
+    separate reason rather than an overloaded field: `total` is None and
+    `pair_count` is 0 for both non-DETECTED states, with `state` carrying the
+    reason. Per decision #2, `note`/`override_note` stay as pre-written prose
+    (they embed computed figures mid-sentence, the same judgment already
+    applied to LoanActivity's and TransactionPatterns' narratives).
+    """
+    state: TransferDetectionState
+    pairs: List[TransferPair]
+    pair_count: int                  # 0 unless state == DETECTED
+    total: Optional[Money]           # None unless state == DETECTED
+    manual_override_count: int
+    note: str
+    override_note: str
+
+
+@dataclass(frozen=True)
 class RiskAssessment:
     tier: Tier
     advisory_tier: Optional[Materiality]
@@ -293,13 +364,16 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     Minimal txn fetch for the sections covered so far: txn_date, role,
     signed amount, abs amount, descriptor, entity_id. Mirrors
     render_snapshot_html()'s txns list construction exactly (same
-    null-safe abs derivation) but skips balance/account/document columns,
-    which none of these sections read. Stage 6 added normalized_descriptor
-    (-> "desc") for Tax Payment Pattern's penalty-keyword detection.
+    null-safe abs derivation) but skips the balance column, which none of
+    these sections read. Stage 6 added normalized_descriptor (-> "desc") for
+    Tax Payment Pattern's penalty-keyword detection. Stage 7 added "id",
+    account_id and document_id, which Inter-Account Transfer Analysis needs to
+    count distinct accounts and to name each side of a detected transfer pair.
     """
     txn_rows = _paginate(
         sb, "pds_raw_transactions",
-        "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor",
+        "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor, "
+        "account_id, document_id",
         deal_id,
     )
     map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
@@ -307,12 +381,15 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     entity_id_by_txn = {r["txn_id"]: r.get("entity_id") for r in map_rows}
 
     return [{
+        "id": t["id"],
         "txn_date": t["txn_date"],
         "signed": t["signed_amount_cents"] or 0,
         "abs": t["abs_amount_cents"] if t["abs_amount_cents"] is not None else abs(t["signed_amount_cents"] or 0),
         "desc": t["normalized_descriptor"] or "",
         "role": role_by_txn.get(t["id"], "other"),
         "entity_id": entity_id_by_txn.get(t["id"]),
+        "account_id": t.get("account_id"),
+        "document_id": t.get("document_id"),
     } for t in txn_rows]
 
 
@@ -768,6 +845,110 @@ def _build_supplier_payments(
     )
 
 
+def _build_inter_account_transfer(
+    txns: List[Dict],
+    transfer_link_rows: List[Dict],
+    doc_bank_by_id: Dict[Optional[str], Optional[str]],
+    currency: str,
+) -> InterAccountTransfer:
+    """
+    Inter-Account Transfer Analysis (PAR-63; live-checked per PAR-102).
+
+    Transcribed from the original inline block in render_snapshot_html().
+    Two fidelity points preserved deliberately rather than "cleaned up":
+
+    1. The DETECTED branch is gated on `transfer_link_rows` being truthy
+       ALONE — it does not also require 2+ distinct account_ids. So a deal
+       carrying real transfer_links while still having degenerate account_id
+       tagging renders the real breakdown, not the limitation stub. That
+       ordering is the original's and is preserved exactly.
+
+    2. `manual_override_count` (analyst-asserted self-transfers, by role) is
+       computed and reported completely independently of system detection —
+       the override note renders in all three states, and a deal can have
+       analyst overrides while system detection reports UNAVAILABLE. These are
+       two different claims about the same deal and the original keeps them
+       separate on purpose; collapsing them would overstate what was detected.
+    """
+    manual_override_count = sum(1 for t in txns if t["role"] in _TRANSFER_ROLES)
+
+    if manual_override_count > 0:
+        override_note = (
+            f"{manual_override_count} transaction(s) were manually flagged by an analyst "
+            "as self-transfers via override — see the Overrides section. This is "
+            "analyst-asserted, not system-detected, and does not reflect automatic "
+            "self-transfer/cash-sweep detection."
+        )
+    else:
+        override_note = "No transactions have been manually flagged as self-transfers for this deal."
+
+    document_id_by_txn: Dict[str, Optional[str]] = {t["id"]: t.get("document_id") for t in txns}
+    distinct_account_ids = {t.get("account_id") for t in txns if t.get("account_id")}
+
+    def _account_label(txn_id: str, fallback: str) -> str:
+        doc_id = document_id_by_txn.get(txn_id)
+        return doc_bank_by_id.get(doc_id) or (f"Account {doc_id[:8]}" if doc_id else fallback)
+
+    if transfer_link_rows:
+        pair_count = len(transfer_link_rows)
+        total_cents = sum(l["abs_amount_cents"] for l in transfer_link_rows)
+        pair_agg: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "cents": 0})
+        for link in transfer_link_rows:
+            out_label = _account_label(link["txn_out_id"], "Account A")
+            in_label = _account_label(link["txn_in_id"], "Account B")
+            key = f"{out_label} -> {in_label}"
+            pair_agg[key]["count"] += 1
+            pair_agg[key]["cents"] += link["abs_amount_cents"]
+        pairs = [
+            TransferPair(label=key, count=agg["count"], total=Money(agg["cents"], currency))
+            for key, agg in sorted(pair_agg.items())
+        ]
+        note = (
+            f"{pair_count} inter-account transfer pair(s) detected between this company's own "
+            f"bank accounts, totaling {_fmt_kes(total_cents)}. Detected automatically by pairing "
+            "same-amount, opposite-sign transactions across different accounts within a short "
+            "window — see the breakdown above."
+        )
+        return InterAccountTransfer(
+            state="DETECTED",
+            pairs=pairs,
+            pair_count=pair_count,
+            total=Money(total_cents, currency),
+            manual_override_count=manual_override_count,
+            note=note,
+            override_note=override_note,
+        )
+
+    if len(distinct_account_ids) >= 2:
+        note = (
+            "Self-transfer / cash-sweep detection ran for this deal — transactions are tagged "
+            "with distinct per-account identifiers — and found no qualifying inter-account "
+            "transfer pairs in this period. This is a genuine result, not an infrastructure gap."
+        )
+        state: TransferDetectionState = "NO_TRANSFERS_FOUND"
+    else:
+        note = (
+            "Self-transfer / cash-sweep analysis between this company's own bank accounts "
+            "is not currently available. Detection depends on each transaction being tagged "
+            "with the specific account it belongs to, and that per-account tagging is not "
+            "yet populated correctly in the current ingestion pipeline — every transaction "
+            "currently resolves to the same undifferentiated account value, so the matching "
+            "logic cannot distinguish between a company's own accounts. This is a known "
+            "infrastructure gap, not a finding that no such transfers exist."
+        )
+        state = "UNAVAILABLE"
+
+    return InterAccountTransfer(
+        state=state,
+        pairs=[],
+        pair_count=0,
+        total=None,
+        manual_override_count=manual_override_count,
+        note=note,
+        override_note=override_note,
+    )
+
+
 def _build_risk_assessment(
     txns: List[Dict],
     recon_tier: Tier,
@@ -864,12 +1045,13 @@ def build_snapshot_context(
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 6 of PAR-189. Returns:
+    PARTIAL — Stage 7 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
          "tax_payment_pattern": TaxPaymentPattern,
          "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity,
-         "inflow": Composition, "outflow": Composition}
+         "inflow": Composition, "outflow": Composition,
+         "inter_account_transfer": InterAccountTransfer}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -957,6 +1139,41 @@ def build_snapshot_context(
         e["entity_id"]: e.get("display_name") for e in entity_rows
     }
 
+    # PAR-189 Stage 7 — Inter-Account Transfer Analysis. Needs two fetches no
+    # earlier stage required: pds_transfer_links (system-detected pairs) and
+    # pds_documents (to name each side of a pair by its detected bank label).
+    # The document fetch deliberately selects only the three columns this
+    # section reads; render_snapshot_html() still does its own wider
+    # pds_documents fetch for doc pills / credit-scoring inputs, which are
+    # not yet extracted.
+    transfer_link_rows: List[Dict] = (
+        sb.table("pds_transfer_links")
+        .select("txn_out_id, txn_in_id, abs_amount_cents")
+        .eq("deal_id", deal_id)
+        .execute()
+        .data or []
+    )
+    transfer_doc_rows: List[Dict] = (
+        sb.table("pds_documents")
+        .select("id, storage_url, source_files")
+        .eq("deal_id", deal_id)
+        .execute()
+        .data or []
+    )
+    doc_bank_by_id: Dict[Optional[str], Optional[str]] = {}
+    for doc in transfer_doc_rows:
+        bank_name = _bank_label(doc.get("storage_url") or "")
+        if not bank_name:
+            for sf in (doc.get("source_files") or []):
+                bank_name = _bank_label(str(sf))
+                if bank_name:
+                    break
+        doc_bank_by_id[doc.get("id")] = bank_name
+
+    inter_account_transfer = _build_inter_account_transfer(
+        txns, transfer_link_rows, doc_bank_by_id, currency,
+    )
+
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
     tax_payment_pattern = _build_tax_payment_pattern(txns)
@@ -977,4 +1194,5 @@ def build_snapshot_context(
         "analyst_notes": analyst_notes,
         "inflow": inflow,
         "outflow": outflow,
+        "inter_account_transfer": inter_account_transfer,
     }
