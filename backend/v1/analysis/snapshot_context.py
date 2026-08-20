@@ -8,8 +8,8 @@ Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
 Inventory Analysis. Stage 4 added Loan Activity Detected and Loan Facilities
 (one LoanActivity concept spanning two template sections). Stage 5 added
 Inflow Composition and Outflow Composition. Stage 6 added Tax Payment Pattern.
-Stage 7 adds Inter-Account Transfer Analysis.
-The remaining ~6 sections are still computed inline in
+Stage 7 added Inter-Account Transfer Analysis. Stage 8 adds Account Coverage.
+The remaining ~5 sections are still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
@@ -62,6 +62,25 @@ genuinely found nothing, the second means the pre-PAR-102 per-account tagging
 gap makes detection structurally impossible. Reporting the second as the
 first would be a false negative on a real financial claim.
 
+Stage 8 note: Account Coverage is the first section where ratified decision
+#5 does substantial work — the original carried three separate CSS-class
+lookup tables inline (advisory tier -> stat colour, materiality -> status
+pill, submitted/missing -> status pill) plus a pre-rendered "✓ Submitted"
+label. All four are presentation and now live in the WeasyPrint adapter; the
+context carries only `Materiality` and `AccountSubmissionStatus` enums.
+
+Stage 8 also found and fixed a REAL latent formatting divergence introduced
+by Stage 1, not a hypothetical one: `coverage_pct` reaches this layer already
+rounded to hundredths (round(basis_points / 100, 2)), and storing it as a 0-1
+`Percent` then multiplying back by 100 to format reintroduces float error.
+For 45 of the 10,001 possible basis-point values that changes the rendered
+digit (e.g. coverage_pct 0.85 rendered "0.9" instead of the original "0.8").
+Stage 1's Risk Assessment adapter had been shipping that divergence since PR
+#161; it was invisible to every stage's byte-diff because the Deed document
+has no audited financials and renders "--" for coverage on both sides. Both
+call sites now format via _fmt_coverage_pct() in snapshot_html_renderer.py,
+which re-rounds to hundredths first. See that helper's docstring.
+
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
 CSS class names, hex colours, or markup. Each renderer (WeasyPrint today,
 reportlab later) owns its own mapping from these typed values to
@@ -72,7 +91,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 
 from ..analytics import CASHFLOW_INFLOW_ROLES
@@ -95,6 +114,16 @@ SupplierConcentration = Literal["HIGH", "MODERATE", "DIVERSIFIED", "INSUFFICIENT
 KraStatus = Literal["COMPLIANT", "PARTIAL", "INSUFFICIENT_DATA", "NOT_DETECTED"]
 ReconStatus = Literal["EXACT_MATCH", "ACCEPTABLE", "COVERAGE_GAP", "VARIANCE"]
 TransferDetectionState = Literal["DETECTED", "NO_TRANSFERS_FOUND", "UNAVAILABLE"]
+AccountSubmissionStatus = Literal["SUBMITTED", "MISSING"]
+
+# Prose shown when audited financials haven't been submitted, so
+# calculate_account_coverage() has nothing to compare against. Narrative stays
+# a pre-written string per PAR-189 ratified decision #2.
+ACCOUNT_COVERAGE_UNAVAILABLE_NOTE = (
+    "Account coverage compares the bank accounts declared in audited "
+    "financials (Note 11 cash breakdown) against the statements "
+    "submitted. Submit audited financials to populate this advisory."
+)
 
 # Roles an analyst can apply by override to assert a transaction is a
 # self-transfer. Distinct from system detection (pds_transfer_links) —
@@ -344,6 +373,61 @@ class InterAccountTransfer:
     manual_override_count: int
     note: str
     override_note: str
+
+
+@dataclass(frozen=True)
+class DeclaredAccount:
+    """
+    One bank account declared in audited financials (Note 11 cash breakdown),
+    and whether a statement for it was actually submitted.
+
+    `status` and `materiality` are semantic values, not the status-pill CSS
+    classes the original carried alongside them (`status-matched` /
+    `status-missing` / `status-critical`) — per PAR-189 ratified decision #5
+    those belong to each renderer's own style table. The original also carried
+    a pre-rendered `status_label` ("✓ Submitted" / "Missing"); the tick is
+    presentation and now lives in the WeasyPrint adapter.
+    """
+    bank_name: Optional[str]          # None -> renderer shows "--"
+    declared_balance: Money
+    status: AccountSubmissionStatus
+    materiality: Optional[Materiality]  # None -> renderer shows "--"
+
+
+@dataclass(frozen=True)
+class AccountCoverage:
+    """
+    Account Coverage — Declared vs Submitted.
+
+    Sourced entirely from `recon_section["account_coverage"]`, which
+    build_snapshot_context() already fetches for RiskAssessment (Stage 1) and
+    LoanActivity's coverage_incomplete (Stage 4) — this section adds no new
+    fetch and no new upstream.
+
+    `available` is False whenever `coverage_pct` is absent, which covers both
+    "no audited financials submitted at all" and
+    calculate_account_coverage()'s own SKIPPED return (no cash_breakdown in
+    the audited financials). Per ratified decision #1 the unavailable case is
+    null values plus `unavailable_note` carrying the reason, never sentinel
+    strings stuffed into the value fields.
+
+    `coverage` is a 0-1 fraction per decision #3. NOTE for any renderer
+    formatting it back to a percentage string: see _fmt_coverage_pct() in
+    snapshot_html_renderer.py — the upstream value is an exact hundredth
+    (round(basis_points / 100, 2)) and naively multiplying the stored fraction
+    by 100 reintroduces float error that changes the rendered digit for 45 of
+    the 10,001 possible values. Re-round to hundredths before formatting.
+    """
+    available: bool
+    coverage: Optional[Percent] = None
+    advisory_tier: Optional[Materiality] = None
+    declared_count: Optional[int] = None
+    submitted_count: Optional[int] = None
+    missing_count: Optional[int] = None
+    missing_balance: Optional[Money] = None
+    recommendation: Optional[str] = None
+    accounts: List[DeclaredAccount] = field(default_factory=list)
+    unavailable_note: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -949,6 +1033,61 @@ def _build_inter_account_transfer(
     )
 
 
+def _build_account_coverage(acct_cov_raw: Dict, currency: str) -> AccountCoverage:
+    """
+    Account Coverage — Declared vs Submitted (PAR-189 Stage 8).
+
+    Transcribed from the original inline block in render_snapshot_html().
+    Fidelity points preserved deliberately:
+
+    1. The available/unavailable branch keys off `coverage_pct is not None` —
+       NOT off recon_available, and not off the dict being non-empty.
+       calculate_account_coverage() can return {"status": "SKIPPED", ...} when
+       the audited financials carry no cash_breakdown; that dict is truthy but
+       has no coverage_pct, and the original correctly renders the locked
+       state for it. Keying off anything else would flip that case.
+
+    2. `bank_name` and `materiality` use `or`-style fallbacks in the original
+       (falsy -> "--"), while `advisory_tier` and `recommendation` use
+       `.get(key, default)` (absent -> default, but present-and-None would
+       fall through as None). For every dict calculate_account_coverage() can
+       actually produce, all four keys are present and non-empty whenever
+       coverage_pct is present, so the two forms cannot diverge on real data.
+       They are carried here as plain Optionals with the renderer applying the
+       "--"/"" fallback, which reproduces the original for every reachable
+       input. The only behaviour this normalises is a legacy/corrupt sealed
+       recon_section carrying an explicit None, where the original would have
+       rendered the literal string "None" into a partner-facing document.
+    """
+    if acct_cov_raw.get("coverage_pct") is None:
+        return AccountCoverage(
+            available=False,
+            unavailable_note=ACCOUNT_COVERAGE_UNAVAILABLE_NOTE,
+        )
+
+    accounts = [
+        DeclaredAccount(
+            bank_name=a.get("bank_name") or None,
+            declared_balance=Money(int(a.get("declared_balance_cents") or 0), currency),
+            status="SUBMITTED" if a.get("status") == "SUBMITTED" else "MISSING",
+            materiality=a.get("materiality") or None,
+        )
+        for a in (acct_cov_raw.get("account_details") or [])
+    ]
+
+    return AccountCoverage(
+        available=True,
+        coverage=Percent(value=acct_cov_raw["coverage_pct"] / 100),
+        advisory_tier=acct_cov_raw.get("advisory_tier") or None,
+        declared_count=acct_cov_raw.get("declared_accounts_count", 0),
+        submitted_count=acct_cov_raw.get("submitted_accounts_count", 0),
+        missing_count=acct_cov_raw.get("missing_accounts_count", 0),
+        missing_balance=Money(int(acct_cov_raw.get("missing_balance_cents") or 0), currency),
+        recommendation=acct_cov_raw.get("recommendation") or None,
+        accounts=accounts,
+    )
+
+
 def _build_risk_assessment(
     txns: List[Dict],
     recon_tier: Tier,
@@ -1045,13 +1184,14 @@ def build_snapshot_context(
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 7 of PAR-189. Returns:
+    PARTIAL — Stage 8 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
          "tax_payment_pattern": TaxPaymentPattern,
          "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity,
          "inflow": Composition, "outflow": Composition,
-         "inter_account_transfer": InterAccountTransfer}
+         "inter_account_transfer": InterAccountTransfer,
+         "account_coverage": AccountCoverage}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -1174,6 +1314,11 @@ def build_snapshot_context(
         txns, transfer_link_rows, doc_bank_by_id, currency,
     )
 
+    # PAR-189 Stage 8 — Account Coverage. No new fetch: acct_cov_raw is the
+    # same dict already resolved above for RiskAssessment (Stage 1) and
+    # coverage_incomplete (Stage 4).
+    account_coverage = _build_account_coverage(acct_cov_raw, currency)
+
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
     tax_payment_pattern = _build_tax_payment_pattern(txns)
@@ -1195,4 +1340,5 @@ def build_snapshot_context(
         "inflow": inflow,
         "outflow": outflow,
         "inter_account_transfer": inter_account_transfer,
+        "account_coverage": account_coverage,
     }
