@@ -21,6 +21,7 @@ from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
     Composition as _Composition,
+    InterAccountTransfer as _InterAccountTransfer,
     Inventory as _Inventory,
     LoanActivity as _LoanActivity,
     Money as _Money,
@@ -31,7 +32,7 @@ from .snapshot_context import (
     TransactionPatterns as _TransactionPatterns,
     build_snapshot_context,
 )
-from ._snapshot_fetch_helpers import _get_supabase, _paginate
+from ._snapshot_fetch_helpers import _bank_label, _get_supabase, _paginate
 
 logger = logging.getLogger(__name__)
 
@@ -45,32 +46,16 @@ MONTH_ABBR = {
 
 REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
 
-_BANK_ALIASES = [
-    ("KCB",         ["kcb", "kenya commercial bank"]),
-    ("Equity",      ["equity"]),
-    ("Absa",        ["absa", "barclays"]),
-    ("Zemo",        ["zemo"]),
-    ("NCBA",        ["ncba", "nic bank", "commercial bank of africa"]),
-    ("Co-op",       ["co-operative bank", "coop bank", "co-op"]),
-    ("DTB",         ["dtb", "diamond trust"]),
-    ("Stanbic",     ["stanbic"]),
-    ("IM Bank",     ["im bank", "imperial bank"]),
-    ("Family Bank", ["family bank"]),
-    ("Prime Bank",  ["prime bank"]),
-]
+# PAR-189 Stage 7: _BANK_ALIASES / _bank_label moved to
+# _snapshot_fetch_helpers.py (unchanged) so snapshot_context.py can share them
+# without a circular import. _bank_label is re-imported above, so
+# `renderer._bank_label(...)` still resolves for existing callers and tests.
+# _BANK_ALIASES is not re-imported — nothing outside the helper module reads it.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _bank_label(url: str) -> Optional[str]:
-    n = (url or "").lower()
-    for key, aliases in _BANK_ALIASES:
-        if any(a in n for a in aliases):
-            return key
-    return None
-
 
 def _fmt_kes(cents: int) -> str:
     return f"KES {cents / 100:,.0f}"
@@ -257,6 +242,28 @@ def _loan_activity_ctx_from(loans: _LoanActivity) -> Dict[str, Any]:
     }
 
 
+def _inter_account_transfer_ctx_from(iat: _InterAccountTransfer) -> Dict[str, Any]:
+    """
+    PAR-189 Stage 7. WeasyPrint owns the state -> badge-label mapping; the
+    shared context carries only the semantic state (ratified decision #5).
+    The three labels below are the exact strings the original computed inline.
+    """
+    badge_label = {
+        "DETECTED":           "Detected",
+        "NO_TRANSFERS_FOUND": "No Transfers Found",
+        "UNAVAILABLE":        "Not Available",
+    }[iat.state]
+    return {
+        "badge_label":   badge_label,
+        "pairs": [
+            {"label": p.label, "count": p.count, "total_str": _fmt_money_kes(p.total)}
+            for p in iat.pairs
+        ],
+        "note":          iat.note,
+        "override_note": iat.override_note,
+    }
+
+
 def _composition_ctx_from(comp: _Composition) -> Dict[str, Any]:
     # comp.segments deliberately carries no colour (design doc §1c flags
     # inflow_segments[].color / outflow_segments[].color as a hex-literal
@@ -349,9 +356,11 @@ def render_snapshot_html(
     )
     credit_scoring_inputs_list: List[Dict] = []
     doc_pills: List[Dict] = []
-    # PAR-102: document_id -> detected bank label, reused by Inter-Account
-    # Transfer Analysis below to name each side of a detected transfer pair.
-    doc_bank_by_id: Dict[str, Optional[str]] = {}
+    # PAR-189 Stage 7: the document_id -> detected-bank-label map that used to
+    # be built here existed solely to name each side of an Inter-Account
+    # Transfer pair. That section now builds its own from its own
+    # pds_documents fetch inside build_snapshot_context(), so the map is no
+    # longer accumulated here — bank_name below still feeds the doc pill label.
 
     for doc in docs:
         analytics = doc.get("analytics") or {}
@@ -366,7 +375,6 @@ def render_snapshot_html(
                 bank_name = _bank_label(str(sf))
                 if bank_name:
                     break
-        doc_bank_by_id[doc.get("id")] = bank_name
         label = f"{bank_name or 'Bank'} · {txn_count:,} txns"
         doc_pills.append({"label": label, "active": True})
 
@@ -846,95 +854,18 @@ def render_snapshot_html(
     else:
         payroll_stability_live = "IRREGULAR"
 
-    # ── Inter-Account Transfer Analysis (PAR-63; live-checked per PAR-102) ───
-    # Self-transfer/cash-sweep detection between a company's own bank accounts
-    # depends on transfer_matcher.match_transfers() pairing transactions across
-    # DIFFERENT accounts, which requires per-transaction account_id tagging.
-    # PAR-102 fixed that tagging (str(document_id) per source document) for
-    # deals ingested after commit 64bebd4, but older/still-broken deals still
-    # resolve every transaction to the same undifferentiated account value.
-    # This section now checks pds_transfer_links directly rather than
-    # asserting the old blanket "not available" for every deal:
-    #   - real transfer_links rows exist       -> render the real breakdown
-    #   - zero rows AND 2+ distinct account_id  -> detection ran, genuine zero
-    #   - zero rows AND <2 distinct account_id  -> honest limitation stub
-    #     (unchanged copy — still accurate for any deal whose account_id
-    #     tagging is still broken)
-    _TRANSFER_ROLES = ("transfer", "internal_transfer")
-    manual_transfer_count = sum(1 for t in txns if t["role"] in _TRANSFER_ROLES)
-
-    if manual_transfer_count > 0:
-        transfer_override_note = (
-            f"{manual_transfer_count} transaction(s) were manually flagged by an analyst "
-            "as self-transfers via override — see the Overrides section. This is "
-            "analyst-asserted, not system-detected, and does not reflect automatic "
-            "self-transfer/cash-sweep detection."
-        )
-    else:
-        transfer_override_note = "No transactions have been manually flagged as self-transfers for this deal."
-
-    transfer_link_rows = (
-        sb.table("pds_transfer_links")
-        .select("txn_out_id, txn_in_id, abs_amount_cents")
-        .eq("deal_id", deal_id)
-        .execute()
-        .data or []
+    # ── Inter-Account Transfer Analysis — PAR-189 Stage 7 ────────────────────
+    # Now computed by build_snapshot_context() (shared_ctx["inter_account_transfer"])
+    # rather than inline here. The three-way branch (real pds_transfer_links
+    # rows / genuine zero / pre-PAR-102 tagging-gap stub) and both narratives
+    # moved unchanged into _build_inter_account_transfer(); only the badge
+    # string stayed on this side, in _inter_account_transfer_ctx_from(), since
+    # it is presentation. See that builder's docstring for the two fidelity
+    # points preserved (DETECTED is gated on transfer_links alone, and the
+    # analyst-override count is independent of system detection).
+    inter_account_transfer_ctx: Dict[str, Any] = _inter_account_transfer_ctx_from(
+        shared_ctx["inter_account_transfer"]
     )
-    document_id_by_txn: Dict[str, Optional[str]] = {t["id"]: t.get("document_id") for t in txn_rows}
-    distinct_account_ids = {t.get("account_id") for t in txn_rows if t.get("account_id")}
-
-    def _account_label(txn_id: str, fallback: str) -> str:
-        doc_id = document_id_by_txn.get(txn_id)
-        return doc_bank_by_id.get(doc_id) or (f"Account {doc_id[:8]}" if doc_id else fallback)
-
-    if transfer_link_rows:
-        total_count = len(transfer_link_rows)
-        total_cents = sum(l["abs_amount_cents"] for l in transfer_link_rows)
-        pair_agg: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "cents": 0})
-        for link in transfer_link_rows:
-            out_label = _account_label(link["txn_out_id"], "Account A")
-            in_label  = _account_label(link["txn_in_id"], "Account B")
-            key = f"{out_label} -> {in_label}"
-            pair_agg[key]["count"] += 1
-            pair_agg[key]["cents"] += link["abs_amount_cents"]
-        transfer_pairs = [
-            {"label": key, "count": agg["count"], "total_str": _fmt_kes(agg["cents"])}
-            for key, agg in sorted(pair_agg.items())
-        ]
-        inter_account_transfer_note = (
-            f"{total_count} inter-account transfer pair(s) detected between this company's own "
-            f"bank accounts, totaling {_fmt_kes(total_cents)}. Detected automatically by pairing "
-            "same-amount, opposite-sign transactions across different accounts within a short "
-            "window — see the breakdown above."
-        )
-        inter_account_badge = "Detected"
-    elif len(distinct_account_ids) >= 2:
-        transfer_pairs = []
-        inter_account_transfer_note = (
-            "Self-transfer / cash-sweep detection ran for this deal — transactions are tagged "
-            "with distinct per-account identifiers — and found no qualifying inter-account "
-            "transfer pairs in this period. This is a genuine result, not an infrastructure gap."
-        )
-        inter_account_badge = "No Transfers Found"
-    else:
-        transfer_pairs = []
-        inter_account_transfer_note = (
-            "Self-transfer / cash-sweep analysis between this company's own bank accounts "
-            "is not currently available. Detection depends on each transaction being tagged "
-            "with the specific account it belongs to, and that per-account tagging is not "
-            "yet populated correctly in the current ingestion pipeline — every transaction "
-            "currently resolves to the same undifferentiated account value, so the matching "
-            "logic cannot distinguish between a company's own accounts. This is a known "
-            "infrastructure gap, not a finding that no such transfers exist."
-        )
-        inter_account_badge = "Not Available"
-
-    inter_account_transfer_ctx: Dict[str, Any] = {
-        "badge_label": inter_account_badge,
-        "pairs": transfer_pairs,
-        "note": inter_account_transfer_note,
-        "override_note": transfer_override_note,
-    }
 
     # ── Tax Payment Pattern — PAR-189 Stage 6 (shared_ctx["tax_payment_pattern"])
     tax_payment_pattern_ctx: Dict[str, Any] = _tax_payment_pattern_ctx_from(
