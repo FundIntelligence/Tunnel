@@ -21,6 +21,7 @@ from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
     Inventory as _Inventory,
+    LoanActivity as _LoanActivity,
     Money as _Money,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
@@ -202,6 +203,44 @@ def _inventory_ctx_from(inv: _Inventory) -> Dict[str, Any]:
         "confidence_str": (
             f"{inv.extraction_confidence:.2f}" if inv.extraction_confidence is not None else "not recorded"
         ),
+    }
+
+
+# Mirrors _status_to_badge()'s branching exactly, keyed by the already-
+# resolved ReconStatus instead of a raw status string + coverage_incomplete
+# bool — the resolution itself now happens in snapshot_context.py
+# (_resolve_recon_status), this table is just the renderer's own
+# status->style mapping, per PAR-189's "renderer owns colour/class" rule.
+_RECON_STATUS_BADGE = {
+    "EXACT_MATCH":  ("b-exact",    "Exact match"),
+    "ACCEPTABLE":   ("b-ok",       "Acceptable"),
+    "COVERAGE_GAP": ("b-warn",     "Gap · coverage incomplete"),
+    "VARIANCE":     ("b-variance", "Variance"),
+}
+
+
+def _loan_activity_ctx_from(loans: _LoanActivity) -> Dict[str, Any]:
+    loan_facilities = []
+    for fac in loans.facilities:
+        match_class, match_label = _RECON_STATUS_BADGE[fac.status]
+        loan_facilities.append({
+            "name":        fac.name,
+            "amount_str":  _fmt_money_kes(fac.amount),
+            "match_class": match_class,
+            "match_label": match_label,
+        })
+
+    return {
+        "loan_disbursed_str":    _fmt_money_kes(loans.disbursed),
+        "loan_repaid_str":       _fmt_money_kes(loans.repaid),
+        "loan_net_str":          _fmt_kes(abs(loans.net.cents)),
+        "loan_freq_str":         f"{loans.repayments_per_month:.1f} txns / month",
+        "loan_facility_count":   loans.repayment_txn_count,
+        "loan_facilities":       loan_facilities,
+        "loan_recon_status":     loans.status_raw or "",
+        "loan_bank_net_str":     _fmt_money_kes(loans.bank_net),
+        "loan_declared_net_str": _fmt_money_kes(loans.declared_net),
+        "loan_variance_str":     f"{loans.variance.value * 100:.1f}%" if loans.variance is not None else "0%",
     }
 
 
@@ -474,14 +513,11 @@ def render_snapshot_html(
     )
     loan_repayment_txn_count = sum(1 for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0)
 
-    # Aggregate loan cashflows
-    loan_disbursed_cents = sum(
-        t["signed"] for t in txns if t["role"] == "loan_disbursement" and t["signed"] > 0
-    )
-    loan_repaid_cents = sum(
-        t["abs"] for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0
-    )
-    loan_net_cents = loan_disbursed_cents - loan_repaid_cents
+    # PAR-189 Stage 4: loan_disbursed_cents/loan_repaid_cents/loan_net_cents
+    # used to be computed here — now sourced from build_snapshot_context()
+    # (shared_ctx["loans"]) via _loan_activity_ctx_from(). loan_freq /
+    # loan_repayment_txn_count stay computed below (unchanged) because Key
+    # Metrics (not yet extracted) still reads them directly.
 
     # Cash trend (null-safe — balance_cents may be null for pre-migration rows)
     bal_txns = sorted(
@@ -1144,24 +1180,12 @@ def render_snapshot_html(
             "assessment":   loan_assessment,
         })
 
-    # ── Loan facilities table (recon state) ──────────────────────────────────
-    loans_r        = (recon_section.get("loan_activity") or {}) if recon_available else {}
-    loan_recon_status = loans_r.get("status") or ""
-    fac_match_class, fac_match_label = _status_to_badge(loan_recon_status or "VARIANCE", coverage_incomplete)
-    loan_facilities = [
-        {
-            "name":        fac.get("name") or "--",
-            "amount_str":  _fmt_kes(fac.get("amount_cents") or 0),
-            "match_class": fac_match_class,
-            "match_label": fac_match_label,
-        }
-        for fac in (af.get("loan_breakdown") or [])
-    ]
-
-    loan_bank_net_str     = _fmt_kes(int(loans_r.get("bank_net_borrowing_kes", 0) * 100))
-    loan_declared_net_str = _fmt_kes(int(loans_r.get("declared_net_borrowing_kes", 0) * 100))
-    loan_var_raw          = loans_r.get("variance_pct")
-    loan_variance_str     = f"{loan_var_raw:.1f}%" if loan_var_raw is not None else "0%"
+    # ── Loan facilities table (recon state) + Loan Activity Detected ─────────
+    # PAR-189 Stage 4: both now come from build_snapshot_context()'s single
+    # LoanActivity (shared_ctx["loans"]) — see _loan_activity_ctx_from() above.
+    # coverage_incomplete (still computed below, unchanged) stays needed
+    # locally for the not-yet-extracted 4-Point Reconciliation badges.
+    loan_ctx: Dict[str, Any] = _loan_activity_ctx_from(shared_ctx["loans"])
 
     # ── Inventory Analysis (PAR-63, recon state only) ────────────────────────
     # PAR-189 Stage 3: computation now lives in build_snapshot_context() — see
@@ -1171,7 +1195,7 @@ def render_snapshot_html(
 
     # ── Verify-page summary (reuses figures already computed above) ──────────
     if recon_available:
-        loan_recon_label = (loans_r.get("status") or "VARIANCE").replace("_", " ").title()
+        loan_recon_label = (shared_ctx["loans"].status_raw or "VARIANCE").replace("_", " ").title()
     else:
         loan_recon_label = "Not reconciled"
     vp_confidence_color = "positive" if recon_tier == "HIGH_CONFIDENCE" else (
@@ -1271,16 +1295,16 @@ def render_snapshot_html(
         "tax_jan_spike_str":  tax_jan_spike_str,
         "tax_total_str":      _fmt_kes(tax_total_cents),
         "tax_note":           tax_note,
-        "loan_disbursed_str": _fmt_kes(loan_disbursed_cents),
-        "loan_repaid_str":    _fmt_kes(loan_repaid_cents),
-        "loan_net_str":       _fmt_kes(abs(loan_net_cents)),
-        "loan_freq_str":      f"{loan_freq:.1f} txns / month",
-        "loan_facility_count": loan_repayment_txn_count,
-        "loan_facilities":    loan_facilities,
-        "loan_recon_status":  loan_recon_status,
-        "loan_bank_net_str":  loan_bank_net_str,
-        "loan_declared_net_str": loan_declared_net_str,
-        "loan_variance_str":  loan_variance_str,
+        "loan_disbursed_str": loan_ctx["loan_disbursed_str"],
+        "loan_repaid_str":    loan_ctx["loan_repaid_str"],
+        "loan_net_str":       loan_ctx["loan_net_str"],
+        "loan_freq_str":      loan_ctx["loan_freq_str"],
+        "loan_facility_count": loan_ctx["loan_facility_count"],
+        "loan_facilities":    loan_ctx["loan_facilities"],
+        "loan_recon_status":  loan_ctx["loan_recon_status"],
+        "loan_bank_net_str":  loan_ctx["loan_bank_net_str"],
+        "loan_declared_net_str": loan_ctx["loan_declared_net_str"],
+        "loan_variance_str":  loan_ctx["loan_variance_str"],
         "recon_rows":         recon_rows,
         "recon_fiscal_note":  recon_fiscal_note,
         "patterns":           patterns,
