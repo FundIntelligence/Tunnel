@@ -27,6 +27,7 @@ from .snapshot_context import (
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
     TaxCompliance as _TaxCompliance,
+    TaxPaymentPattern as _TaxPaymentPattern,
     TransactionPatterns as _TransactionPatterns,
     build_snapshot_context,
 )
@@ -183,6 +184,17 @@ def _tax_compliance_ctx_from(tc: _TaxCompliance) -> Dict[str, Any]:
         "n_total_months": tc.months_total,
         "kra_compliance": tc.status,
         "clause":         tc.narrative,
+    }
+
+
+def _tax_payment_pattern_ctx_from(tpp: _TaxPaymentPattern) -> Dict[str, Any]:
+    return {
+        "tax_count":         tpp.txn_count,
+        "tax_freq_str":      f"{tpp.avg_per_month:.1f} / month" if tpp.avg_per_month is not None else "--",
+        "tax_penalty_count": tpp.penalty_count,
+        "tax_jan_spike_str": _fmt_money_kes(tpp.jan_spike_total) if tpp.jan_spike_total is not None else "",
+        "tax_total_str":     _fmt_money_kes(tpp.total),
+        "tax_note":          tpp.narrative,
     }
 
 
@@ -561,22 +573,8 @@ def render_snapshot_html(
     # Needs-review count
     needs_review_count = sum(1 for t in txns if t["role"] == "needs_review")
 
-    # Tax
-    tax_txns = [t for t in txns if t["role"] == "tax_payment" and t["signed"] < 0]
-    tax_by_month: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "total": 0})
-    for t in tax_txns:
-        m = (t["txn_date"] or "")[:7]
-        tax_by_month[m]["count"] += 1
-        tax_by_month[m]["total"] += t["abs"]
-    jan_spike = any(m.endswith("-01") for m in tax_by_month)
-    penalty_count = sum(
-        1 for t in tax_txns
-        if any(k in (t["desc"] or "").upper() for k in ("PENALTY", "PENALT", "SURCHARGE", "FINE"))
-    )
-    tax_total_cents = sum(t["abs"] for t in tax_txns)
-    tax_months_count = len(tax_by_month)
-    jan_month = next((m for m in tax_by_month if m.endswith("-01")), None)
-    jan_total = tax_by_month[jan_month]["total"] if jan_month else 0
+    # Tax Payment Pattern (PAR-189 Stage 6: computation now lives in
+    # build_snapshot_context() — see _tax_payment_pattern_ctx_from() above).
 
     # Cashflow net-negative months
     period_months = sorted(m for m in monthly_merged if _in_active_period(m))
@@ -938,28 +936,10 @@ def render_snapshot_html(
         "override_note": transfer_override_note,
     }
 
-    # ── Tax ───────────────────────────────────────────────────────────────────
-    tax_freq_str  = (
-        f"{len(tax_txns) / tax_months_count:.1f} / month" if tax_months_count > 0 else "--"
+    # ── Tax Payment Pattern — PAR-189 Stage 6 (shared_ctx["tax_payment_pattern"])
+    tax_payment_pattern_ctx: Dict[str, Any] = _tax_payment_pattern_ctx_from(
+        shared_ctx["tax_payment_pattern"]
     )
-    tax_jan_spike_str = _fmt_kes(jan_total) if jan_total > 0 else ""
-    if jan_spike and penalty_count == 0:
-        tax_note = (
-            "Consistent KRA cadence observed across all months. "
-            "January spike consistent with prior-year settlement — not a penalty indicator. "
-            "Regular PAYE + VAT cadence maintained. "
-            "Note: Bank payment regularity observed, not compliance status. Verify certificate independently."
-        )
-    elif penalty_count > 0:
-        tax_note = (
-            f"{penalty_count} potential penalty transaction(s) detected — "
-            "verify KRA compliance certificate independently."
-        )
-    else:
-        tax_note = (
-            "Regular KRA payment pattern observed. "
-            "Note: Bank regularity only — verify compliance certificate independently."
-        )
 
     # ── Pattern cards ─────────────────────────────────────────────────────────
     _TAG_CLASS  = {"Watch": "t-wat", "Observed": "t-chk", "Pattern": "t-pat", "Coverage": "t-chk"}
@@ -1259,12 +1239,12 @@ def render_snapshot_html(
         "outflow_total_str":  outflow_composition_ctx["total_str"],
         "outflow_segments":   outflow_segments,
         "outflow_warn":       outflow_warn,
-        "tax_count":          len(tax_txns),
-        "tax_freq_str":       tax_freq_str,
-        "tax_penalty_count":  penalty_count,
-        "tax_jan_spike_str":  tax_jan_spike_str,
-        "tax_total_str":      _fmt_kes(tax_total_cents),
-        "tax_note":           tax_note,
+        "tax_count":          tax_payment_pattern_ctx["tax_count"],
+        "tax_freq_str":       tax_payment_pattern_ctx["tax_freq_str"],
+        "tax_penalty_count":  tax_payment_pattern_ctx["tax_penalty_count"],
+        "tax_jan_spike_str":  tax_payment_pattern_ctx["tax_jan_spike_str"],
+        "tax_total_str":      tax_payment_pattern_ctx["tax_total_str"],
+        "tax_note":           tax_payment_pattern_ctx["tax_note"],
         "loan_disbursed_str": loan_ctx["loan_disbursed_str"],
         "loan_repaid_str":    loan_ctx["loan_repaid_str"],
         "loan_net_str":       loan_ctx["loan_net_str"],
