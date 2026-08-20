@@ -19,6 +19,13 @@ from qrcode.image.svg import SvgImage
 from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cashflow
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
+from .snapshot_context import (
+    Money as _Money,
+    RiskAssessment as _RiskAssessment,
+    SupplierPayments as _SupplierPayments,
+    build_snapshot_context,
+)
+from ._snapshot_fetch_helpers import _get_supabase, _paginate
 
 logger = logging.getLogger(__name__)
 
@@ -50,29 +57,6 @@ _BANK_ALIASES = [
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_supabase():
-    from ..db.supabase_client import get_supabase
-    return get_supabase()
-
-
-def _paginate(sb, table: str, select_cols: str, deal_id: str) -> List[Dict]:
-    rows, offset = [], 0
-    while True:
-        chunk = (
-            sb.table(table)
-            .select(select_cols)
-            .eq("deal_id", deal_id)
-            .range(offset, offset + PAGE_SIZE - 1)
-            .execute()
-            .data or []
-        )
-        rows.extend(chunk)
-        if len(chunk) < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
-    return rows
-
 
 def _bank_label(url: str) -> Optional[str]:
     n = (url or "").lower()
@@ -127,6 +111,57 @@ def _make_qr_svg(url: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PAR-189 Stage 1 — WeasyPrint-side adapters
+#
+# build_snapshot_context() (snapshot_context.py) returns format-agnostic typed
+# values (Money, Percent, enums). These two functions reproduce, byte for
+# byte, the presentation dicts the Jinja template already expects for these
+# two sections — this is the only place WeasyPrint-specific string formatting
+# for these sections should happen going forward.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_money_kes(money: Optional[_Money]) -> str:
+    if money is None:
+        return _fmt_kes(0)
+    return _fmt_kes(money.cents)
+
+
+def _supplier_payments_ctx_from(sp: _SupplierPayments) -> Dict[str, Any]:
+    if not sp.available:
+        return {"available": False}
+    return {
+        "available":    True,
+        "total_str":    _fmt_money_kes(sp.total),
+        "txn_count":    sp.txn_count,
+        "entity_count": sp.counterparty_count,
+        "top_name":     sp.top_counterparty,
+        "top_pct_str":  f"{sp.top_share.value * 100:.1f}%",
+        "clause":       sp.narrative,
+    }
+
+
+def _risk_assessment_ctx_from(risk: _RiskAssessment) -> Dict[str, Any]:
+    if risk.revenue_concentration_state == "UNAVAILABLE":
+        largest_rev_pct_str = "--"
+    elif risk.revenue_concentration_state == "INSUFFICIENT_DATA":
+        largest_rev_pct_str = f"insufficient data (N={risk.revenue_concentration_sample})"
+    else:
+        largest_rev_pct_str = f"{risk.largest_revenue_share.value * 100:.1f}%"
+
+    missing_pct = f"{risk.coverage.value * 100:.1f}" if risk.coverage is not None else "--"
+
+    return {
+        "tier":                   risk.tier,
+        "advisory_tier":          risk.advisory_tier if risk.advisory_tier is not None else "--",
+        "missing_pct":            missing_pct,
+        "largest_rev_pct_str":    largest_rev_pct_str,
+        "anomaly_summary":        risk.anomaly_narrative,
+        "conclusion":             risk.conclusion,
+        "transfer_note":          risk.transfer_caveat,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,6 +178,13 @@ def render_snapshot_html(
           Content and figures are identical — only the header branding changes.
     """
     sb = _get_supabase()
+
+    # PAR-189 Stage 1: Risk Assessment Summary + Supplier Payment Analysis are
+    # computed by build_snapshot_context() (snapshot_context.py) instead of
+    # inline below. This does its own independent fetch (deal_id only) rather
+    # than sharing the fetches this function does further down — see the
+    # PAR-189 report for why, and what that implies for the remaining sections.
+    shared_ctx = build_snapshot_context(deal_id)
 
     # 1. Deal metadata
     deal = (
@@ -700,72 +742,11 @@ def render_snapshot_html(
     ) if procurement_pct > 50 else ""
 
     # ── Supplier Payment Analysis (PAR-63) ────────────────────────────────────
-    # Same role set as procurement_cents above, but broken out per counterparty
-    # entity (not just a role-level total) so a top-supplier concentration
-    # figure can be surfaced. Renders in both recon_available states — this
-    # depends only on live transaction/entity data, not audited financials.
-    _SUPPLIER_ROLES = ("supplier", "supplier_payment")
-    # PAR-89 used 30 transactions as the minimum sample before trusting a
-    # per-deal statistic (median/MAD), falling back to a flat default below
-    # that — see classifier.py's _MIN_SAMPLE_SIZE_FOR_RELATIVE_THRESHOLD. Same
-    # cutoff, same reasoning, applied here to supplier_txn_count specifically
-    # (the actual sample the concentration % is drawn from) rather than total
-    # deal transactions: a concentration % computed over a handful of supplier
-    # transactions is not a stable finding — at N=1 it is mathematically
-    # guaranteed to read 100%, regardless of the business's real supplier mix.
-    _MIN_SUPPLIER_SAMPLE_SIZE = 30
-    supplier_by_entity: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "count": 0})
-    for t in txns:
-        if t["role"] in _SUPPLIER_ROLES and t["signed"] < 0:
-            eid = t.get("entity_id") or ""
-            supplier_by_entity[eid]["total"] += t["abs"]
-            supplier_by_entity[eid]["count"] += 1
-
-    supplier_total_cents  = sum(v["total"] for v in supplier_by_entity.values())
-    supplier_txn_count    = sum(v["count"] for v in supplier_by_entity.values())
-    supplier_entity_count = len(supplier_by_entity)
-
-    if supplier_by_entity and supplier_total_cents > 0:
-        top_eid, top_data = max(supplier_by_entity.items(), key=lambda kv: kv[1]["total"])
-        top_supplier_name = (
-            entity_name_by_id.get(top_eid)
-            or (top_eid[:16] + "…" if len(top_eid) > 16 else top_eid)
-            or "--"
-        )
-        top_supplier_pct = top_data["total"] / supplier_total_cents * 100
-
-        if supplier_txn_count < _MIN_SUPPLIER_SAMPLE_SIZE:
-            supplier_concentration_clause = (
-                f"Insufficient supplier transaction volume for a reliable "
-                f"concentration assessment (N={supplier_txn_count})."
-            )
-        else:
-            # Thresholds mirror the >30% "HIGH concentration" convention
-            # PARITY_SCIENCE.md Part III defines for Customer Concentration —
-            # reused here for the supplier side by analogy, not independently
-            # codified for suppliers. BORROWED THRESHOLD, PENDING FORMAL
-            # PARITY SCIENCE SIGN-OFF — see PAR-63_new_sections_spec.md
-            # Section 2 and the PR description's open-items list. Needs its
-            # own Part III Supplier Concentration pattern entry (Signal/
-            # Confidence/Action) before being treated as a settled rule.
-            if top_supplier_pct >= 30:
-                supplier_concentration_clause = "This represents HIGH supplier concentration risk."
-            elif top_supplier_pct >= 15:
-                supplier_concentration_clause = "This represents MODERATE supplier concentration."
-            else:
-                supplier_concentration_clause = "Supplier spend is well-diversified across counterparties."
-
-        supplier_payments_ctx: Dict[str, Any] = {
-            "available":    True,
-            "total_str":    _fmt_kes(supplier_total_cents),
-            "txn_count":    supplier_txn_count,
-            "entity_count": supplier_entity_count,
-            "top_name":     top_supplier_name,
-            "top_pct_str":  f"{top_supplier_pct:.1f}%",
-            "clause":       supplier_concentration_clause,
-        }
-    else:
-        supplier_payments_ctx = {"available": False}
+    # PAR-189 Stage 1: computation now lives in build_snapshot_context()
+    # (snapshot_context.py) — this just re-derives the presentation dict the
+    # template expects from that typed result. See _supplier_payments_ctx_from()
+    # above.
+    supplier_payments_ctx: Dict[str, Any] = _supplier_payments_ctx_from(shared_ctx["supplier_payments"])
 
     # ── Transaction Pattern Analysis (PAR-63) ─────────────────────────────────
     # tx["anomalies"] is computed by anomaly_detector.py during run_pipeline()
@@ -1365,100 +1346,12 @@ def render_snapshot_html(
         }
 
     # ── Risk Assessment Summary (PAR-63) ──────────────────────────────────────
-    # Reuses existing signals only — tier, account coverage, and the
-    # transaction-pattern rollup are all already computed above; this section
-    # adds exactly one new computation (revenue concentration by entity).
-    #
-    # Confirmed Item 2's pds_entities join (entity_name_by_id) still returns
-    # correctly before reusing it here — not assumed: the supplier-side tests
-    # that depend on the same join (test_supplier_payment_analysis_*) were
-    # re-run and still pass unchanged going into this section.
-    #
-    # largest_rev_pct's numerator AND denominator are both computed from txns
-    # (the live pds_raw_transactions fetch) — mirroring exactly how Supplier
-    # Payment Analysis computes its concentration. Deliberately NOT mixing in
-    # total_in/by_role_in (computed from canon_tagged, i.e. canonical_json) —
-    # that would repeat the exact numerator/denominator cross-source mismatch
-    # caught in Tax Compliance Analysis (PR #110 review). Same minimum-sample
-    # gate as supplier concentration (PAR-89's 30-transaction threshold) for
-    # the same reason: a concentration % over a handful of revenue
-    # transactions is not a stable finding.
-    revenue_by_entity: Dict[str, int] = defaultdict(int)
-    revenue_txn_count = 0
-    for t in txns:
-        if t["role"] in REVENUE_ROLES and t["signed"] > 0:
-            eid = t.get("entity_id") or ""
-            revenue_by_entity[eid] += t["signed"]
-            revenue_txn_count += 1
-
-    revenue_total_cents = sum(revenue_by_entity.values())
-
-    if not revenue_by_entity or revenue_total_cents <= 0:
-        largest_rev_pct_str = "--"
-    elif revenue_txn_count < _MIN_SUPPLIER_SAMPLE_SIZE:
-        largest_rev_pct_str = f"insufficient data (N={revenue_txn_count})"
-    else:
-        top_rev_eid, top_rev_total = max(revenue_by_entity.items(), key=lambda kv: kv[1])
-        largest_rev_pct_str = f"{(top_rev_total / revenue_total_cents * 100):.1f}%"
-
-    risk_critical_count = transaction_patterns_ctx["critical_count"]
-    if risk_critical_count > 0:
-        risk_anomaly_summary = (
-            f"{risk_critical_count} critical transaction-pattern flag(s) were also raised "
-            "(see Transaction Pattern Analysis)."
-        )
-    else:
-        risk_anomaly_summary = "No critical transaction-pattern flags were raised."
-
-    # Overall conclusion — restates _compute_tier()'s own existing blocking
-    # logic (snapshot_generator.py) in prose, not a new/invented rule. Handles
-    # the OBSERVED state (no audited financials at all) as its own case, since
-    # the original spec draft only anticipated HIGH/MEDIUM/LOW_CONFIDENCE.
-    risk_advisory_tier = account_coverage_ctx.get("advisory_tier", "--") if account_coverage_ctx.get("available") else "--"
-    if recon_tier == "OBSERVED":
-        risk_conclusion = (
-            "This report covers bank-observed data only — audited financials have not been "
-            "submitted, so the 4-point reconciliation has not run. Confidence reflects income "
-            "quality and cashflow composition indicators only, not a reconciled tier."
-        )
-    elif recon_tier == "HIGH_CONFIDENCE":
-        risk_conclusion = "This deal meets Parity's threshold for high-confidence credit analysis."
-    elif recon_tier == "MEDIUM_CONFIDENCE" and risk_advisory_tier == "CRITICAL":
-        risk_conclusion = (
-            "Confidence is capped at Medium because of a critical account-coverage gap — "
-            "resolve missing bank statement coverage before treating this as high-confidence."
-        )
-    elif recon_tier == "MEDIUM_CONFIDENCE":
-        risk_conclusion = (
-            "This deal is Medium confidence — cash position or loan activity reconciliation "
-            "did not reach exact-match tolerance."
-        )
-    else:
-        risk_conclusion = (
-            "This deal is Low confidence — cash position and/or loan activity reconciliation "
-            "shows material variance. Manual review is required before credit decisioning."
-        )
-
-    # Self-transfer-netting caveat — same known gap as Inter-Account Transfer
-    # Analysis, cross-referenced rather than independently re-described, so
-    # the two sections don't drift into two different explanations of the
-    # same issue. No internal ticket reference in the rendered copy (same
-    # rule applied to Item 6's stub).
-    risk_transfer_note = (
-        "This confidence tier does not yet net out self-transfers between this company's own "
-        "bank accounts — see Inter-Account Transfer Analysis above for why that detection "
-        "is not currently available."
-    )
-
-    risk_assessment_ctx: Dict[str, Any] = {
-        "tier":                   recon_tier,
-        "advisory_tier":          risk_advisory_tier,
-        "missing_pct":            account_coverage_ctx.get("coverage_pct", "--") if account_coverage_ctx.get("available") else "--",
-        "largest_rev_pct_str":    largest_rev_pct_str,
-        "anomaly_summary":        risk_anomaly_summary,
-        "conclusion":             risk_conclusion,
-        "transfer_note":          risk_transfer_note,
-    }
+    # PAR-189 Stage 1: computation now lives in build_snapshot_context()
+    # (snapshot_context.py), including the two PAR-188 disclosures
+    # (conclusion / transfer_note below) as non-optional fields — this just
+    # re-derives the presentation dict the template expects. See
+    # _risk_assessment_ctx_from() above.
+    risk_assessment_ctx: Dict[str, Any] = _risk_assessment_ctx_from(shared_ctx["risk"])
 
     # ── Render template ───────────────────────────────────────────────────────
     templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
