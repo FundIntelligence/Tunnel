@@ -6,13 +6,21 @@ Supplier Payment Analysis (both already implicated in real content-drop bugs
 — PAR-188 and same-night testing respectively). Stage 2 added Transaction
 Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
 Inventory Analysis. Stage 4 added Loan Activity Detected and Loan Facilities
-(one LoanActivity concept spanning two template sections). Stage 5 adds
-Inflow Composition and Outflow Composition. The remaining ~9 sections are
-still computed inline in
+(one LoanActivity concept spanning two template sections). Stage 5 added
+Inflow Composition and Outflow Composition. Stage 6 adds Tax Payment Pattern.
+The remaining ~8 sections are still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
 the ratified schema decisions this module follows.
+
+Stage 6 note: Tax Payment Pattern is a DIFFERENT role filter from Tax
+Compliance Analysis (Stage 2) despite the similar name and shared "tax"
+domain — see TaxPaymentPattern's docstring for the exact discrepancy
+(role == "tax_payment" only, vs. TaxCompliance's _TAX_ROLES matching both
+"tax_payment" and "kra_payment"). Confirmed by direct read of the original
+inline code, not assumed from naming similarity, and preserved exactly
+rather than unified.
 
 Stage 2 note: Risk Assessment Summary's anomaly count (risk.anomaly_narrative)
 now sources from TransactionPatterns.critical_count instead of a second,
@@ -66,6 +74,7 @@ Cents = int
 REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
 _SUPPLIER_ROLES = ("supplier", "supplier_payment")
 _TAX_ROLES = ("tax_payment", "kra_payment")
+_TAX_PENALTY_KEYWORDS = ("PENALTY", "PENALT", "SURCHARGE", "FINE")
 _SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
 Tier = Literal["OBSERVED", "LOW_CONFIDENCE", "MEDIUM_CONFIDENCE", "HIGH_CONFIDENCE"]
@@ -144,6 +153,30 @@ class TaxCompliance:
     months_with_tax: int
     months_total: int
     status: KraStatus
+    narrative: str
+
+
+@dataclass(frozen=True)
+class TaxPaymentPattern:
+    """
+    Deliberately a SEPARATE role filter from TaxCompliance above, not a
+    reuse: the original inline computation (snapshot_html_renderer.py:565,
+    pre-Stage-6) matches ONLY role == "tax_payment", never "kra_payment" —
+    unlike TaxCompliance's _TAX_ROLES tuple, which matches both. Confirmed
+    by direct read, not assumed from the similar name. Preserved exactly;
+    NOT unified with _TAX_ROLES, since doing so would silently change which
+    transactions this section counts whenever a "kra_payment"-role
+    transaction exists.
+    """
+    txn_count: int
+    avg_per_month: Optional[float]   # raw, unrounded — None only when zero tax-months exist (original's "--")
+    penalty_count: int
+    total: Money
+    jan_spike: bool                  # drives narrative choice — true whenever ANY tax txn falls in a
+                                      # January month, independent of that month's total (see jan_spike_total)
+    jan_spike_total: Optional[Money] # None when the January total is <= 0 (original's own row-suppression
+                                      # check is `jan_total > 0`, a different condition from jan_spike itself —
+                                      # both preserved separately rather than collapsed into one)
     narrative: str
 
 
@@ -258,14 +291,15 @@ class RiskAssessment:
 def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     """
     Minimal txn fetch for the sections covered so far: txn_date, role,
-    signed amount, abs amount, entity_id. Mirrors render_snapshot_html()'s
-    txns list construction exactly (same null-safe abs derivation) but skips
-    balance/descriptor/account/document columns, which none of these
-    sections read.
+    signed amount, abs amount, descriptor, entity_id. Mirrors
+    render_snapshot_html()'s txns list construction exactly (same
+    null-safe abs derivation) but skips balance/account/document columns,
+    which none of these sections read. Stage 6 added normalized_descriptor
+    (-> "desc") for Tax Payment Pattern's penalty-keyword detection.
     """
     txn_rows = _paginate(
         sb, "pds_raw_transactions",
-        "id, txn_date, signed_amount_cents, abs_amount_cents",
+        "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor",
         deal_id,
     )
     map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
@@ -276,6 +310,7 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "txn_date": t["txn_date"],
         "signed": t["signed_amount_cents"] or 0,
         "abs": t["abs_amount_cents"] if t["abs_amount_cents"] is not None else abs(t["signed_amount_cents"] or 0),
+        "desc": t["normalized_descriptor"] or "",
         "role": role_by_txn.get(t["id"], "other"),
         "entity_id": entity_id_by_txn.get(t["id"]),
     } for t in txn_rows]
@@ -629,6 +664,55 @@ def _build_tax_compliance(
     )
 
 
+def _build_tax_payment_pattern(txns: List[Dict]) -> TaxPaymentPattern:
+    tax_txns = [t for t in txns if t["role"] == "tax_payment" and t["signed"] < 0]
+    tax_by_month: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "total": 0})
+    for t in tax_txns:
+        m = (t["txn_date"] or "")[:7]
+        tax_by_month[m]["count"] += 1
+        tax_by_month[m]["total"] += t["abs"]
+
+    jan_spike = any(m.endswith("-01") for m in tax_by_month)
+    penalty_count = sum(
+        1 for t in tax_txns
+        if any(k in (t["desc"] or "").upper() for k in _TAX_PENALTY_KEYWORDS)
+    )
+    tax_total_cents = sum(t["abs"] for t in tax_txns)
+    tax_months_count = len(tax_by_month)
+    jan_month = next((m for m in tax_by_month if m.endswith("-01")), None)
+    jan_total = tax_by_month[jan_month]["total"] if jan_month else 0
+
+    avg_per_month = (len(tax_txns) / tax_months_count) if tax_months_count > 0 else None
+
+    if jan_spike and penalty_count == 0:
+        narrative = (
+            "Consistent KRA cadence observed across all months. "
+            "January spike consistent with prior-year settlement — not a penalty indicator. "
+            "Regular PAYE + VAT cadence maintained. "
+            "Note: Bank payment regularity observed, not compliance status. Verify certificate independently."
+        )
+    elif penalty_count > 0:
+        narrative = (
+            f"{penalty_count} potential penalty transaction(s) detected — "
+            "verify KRA compliance certificate independently."
+        )
+    else:
+        narrative = (
+            "Regular KRA payment pattern observed. "
+            "Note: Bank regularity only — verify compliance certificate independently."
+        )
+
+    return TaxPaymentPattern(
+        txn_count=len(tax_txns),
+        avg_per_month=avg_per_month,
+        penalty_count=penalty_count,
+        total=Money(cents=tax_total_cents),
+        jan_spike=jan_spike,
+        jan_spike_total=Money(cents=jan_total) if jan_total > 0 else None,
+        narrative=narrative,
+    )
+
+
 def _build_supplier_payments(
     txns: List[Dict],
     entity_name_by_id: Dict[str, str],
@@ -780,9 +864,10 @@ def build_snapshot_context(
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 5 of PAR-189. Returns:
+    PARTIAL — Stage 6 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
+         "tax_payment_pattern": TaxPaymentPattern,
          "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity,
          "inflow": Composition, "outflow": Composition}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
@@ -874,6 +959,7 @@ def build_snapshot_context(
 
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
+    tax_payment_pattern = _build_tax_payment_pattern(txns)
     inventory = _build_inventory(af, recon_available, inventory_config)
     loans = _build_loan_activity(txns, in_active_period, af, recon_available, loans_r, coverage_incomplete)
     risk = _build_risk_assessment(
@@ -886,6 +972,7 @@ def build_snapshot_context(
         "supplier_payments": supplier_payments,
         "transaction_patterns": transaction_patterns,
         "tax_compliance": tax_compliance,
+        "tax_payment_pattern": tax_payment_pattern,
         "inventory": inventory,
         "analyst_notes": analyst_notes,
         "inflow": inflow,
