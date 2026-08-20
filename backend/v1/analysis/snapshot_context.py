@@ -1,15 +1,20 @@
 """
 Shared snapshot-context data layer (PAR-189).
 
-STATUS: partial extraction — Stage 1 of the incremental build_snapshot_context()
-migration described in PAR-189. Only two sections are covered so far: Risk
-Assessment Summary and Supplier Payment Analysis (both already implicated in
-real content-drop bugs — PAR-188 and same-night testing respectively). The
-remaining ~55 context keys / ~17 sections are still computed inline in
-snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
-module yet. See docs/PAR-189-shared-context-schema.md for the full target
-schema and section mapping, and the PAR-189 ticket comment (2026-08-20) for
-the ratified schema decisions this module follows.
+STATUS: partial extraction. Stage 1 covered Risk Assessment Summary and
+Supplier Payment Analysis (both already implicated in real content-drop bugs
+— PAR-188 and same-night testing respectively). Stage 2 adds Transaction
+Pattern Analysis and Tax Compliance Analysis. The remaining ~13 sections are
+still computed inline in snapshot_html_renderer.render_snapshot_html() and
+are NOT reachable from this module yet. See docs/PAR-189-shared-context-schema.md
+for the full target schema and section mapping, and the PAR-189 ticket
+comments (2026-08-20) for the ratified schema decisions this module follows.
+
+Stage 2 note: Risk Assessment Summary's anomaly count (risk.anomaly_narrative)
+now sources from TransactionPatterns.critical_count instead of a second,
+separately-computed anomaly loop — Stage 1 duplicated that computation because
+Transaction Pattern Analysis wasn't extracted yet; Stage 2 removes the
+duplication now that it is.
 
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
 CSS class names, hex colours, or markup. Each renderer (WeasyPrint today,
@@ -32,11 +37,18 @@ Cents = int
 
 REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
 _SUPPLIER_ROLES = ("supplier", "supplier_payment")
+_TAX_ROLES = ("tax_payment", "kra_payment")
+_SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
 Tier = Literal["OBSERVED", "LOW_CONFIDENCE", "MEDIUM_CONFIDENCE", "HIGH_CONFIDENCE"]
 Materiality = Literal["NEGLIGIBLE", "MINOR", "MATERIAL", "CRITICAL"]
 RevenueConcentrationState = Literal["OK", "INSUFFICIENT_DATA", "UNAVAILABLE"]
 SupplierConcentration = Literal["HIGH", "MODERATE", "DIVERSIFIED", "INSUFFICIENT_DATA"]
+KraStatus = Literal["COMPLIANT", "PARTIAL", "INSUFFICIENT_DATA", "NOT_DETECTED"]
+
+
+def _fmt_kes(cents: int) -> str:
+    return f"KES {cents / 100:,.0f}"
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,44 @@ DEFAULT_SUPPLIER_CONCENTRATION_CONFIG = SupplierConcentrationConfig()
 
 
 @dataclass(frozen=True)
+class TaxComplianceConfig:
+    """
+    Both values were hardcoded in the original inline logic and are pulled
+    into named config per PAR-189 ratified decision #4 ("any threshold values
+    currently hardcoded in logic get pulled into named config fields ...
+    carry the value, don't silently validate or change it"). Unlike the
+    supplier concentration threshold, neither of these is flagged in the
+    original code as borrowed/unratified — the code comment gives an explicit
+    reasoned justification for 3 (a quarter's worth of monthly-cadence tax
+    activity) — so no PENDING SIGN-OFF caveat applies here, only the general
+    "carry as config, don't hardcode" rule.
+    """
+    min_sample_size: int = 3
+    compliant_coverage_threshold: float = 0.8  # months_with_tax / months_total >= this -> COMPLIANT
+
+
+DEFAULT_TAX_COMPLIANCE_CONFIG = TaxComplianceConfig()
+
+
+@dataclass(frozen=True)
+class TaxCompliance:
+    total: Money
+    months_with_tax: int
+    months_total: int
+    status: KraStatus
+    narrative: str
+
+
+@dataclass(frozen=True)
+class TransactionPatterns:
+    critical_count: int
+    high_count: int
+    total_flagged: int
+    total_txn_count: int
+    narrative: str
+
+
+@dataclass(frozen=True)
 class SupplierPayments:
     available: bool
     total: Optional[Money] = None
@@ -104,14 +154,15 @@ class RiskAssessment:
 
 def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     """
-    Minimal txn fetch for the two sections covered so far: role, signed
-    amount, abs amount, entity_id. Mirrors render_snapshot_html()'s txns
-    list construction exactly (same null-safe abs derivation) but skips
-    balance/descriptor/date columns, which these two sections never read.
+    Minimal txn fetch for the sections covered so far: txn_date, role,
+    signed amount, abs amount, entity_id. Mirrors render_snapshot_html()'s
+    txns list construction exactly (same null-safe abs derivation) but skips
+    balance/descriptor/account/document columns, which none of these
+    sections read.
     """
     txn_rows = _paginate(
         sb, "pds_raw_transactions",
-        "id, signed_amount_cents, abs_amount_cents",
+        "id, txn_date, signed_amount_cents, abs_amount_cents",
         deal_id,
     )
     map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
@@ -119,11 +170,108 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     entity_id_by_txn = {r["txn_id"]: r.get("entity_id") for r in map_rows}
 
     return [{
+        "txn_date": t["txn_date"],
         "signed": t["signed_amount_cents"] or 0,
         "abs": t["abs_amount_cents"] if t["abs_amount_cents"] is not None else abs(t["signed_amount_cents"] or 0),
         "role": role_by_txn.get(t["id"], "other"),
         "entity_id": entity_id_by_txn.get(t["id"]),
     } for t in txn_rows]
+
+
+def _build_transaction_patterns(canon_raw_transactions: List[Dict]) -> TransactionPatterns:
+    all_anomalies: List[Dict] = []
+    for t in canon_raw_transactions:
+        for a in (t.get("anomalies") or []):
+            all_anomalies.append({
+                "type": a.get("type") or "UNKNOWN",
+                "severity": a.get("severity") or "LOW",
+                "reason": a.get("reason") or "",
+                "abs_amount_cents": abs(int(t.get("signed_amount_cents") or 0)),
+                "txn_date": t.get("txn_date") or "",
+            })
+
+    total_flagged = len(all_anomalies)
+    critical_count = sum(1 for a in all_anomalies if a["severity"] == "CRITICAL")
+    high_count = sum(1 for a in all_anomalies if a["severity"] == "HIGH")
+
+    top_anomaly = (
+        max(all_anomalies, key=lambda a: (_SEVERITY_RANK.get(a["severity"], 0), a["abs_amount_cents"]))
+        if all_anomalies else None
+    )
+
+    if top_anomaly and top_anomaly["severity"] in ("CRITICAL", "HIGH"):
+        narrative = (
+            f"The most significant: a {top_anomaly['type']} of "
+            f"{_fmt_kes(top_anomaly['abs_amount_cents'])} on {top_anomaly['txn_date']} "
+            f"({top_anomaly['reason']})."
+        )
+    else:
+        narrative = "No high-severity transaction patterns were detected."
+
+    return TransactionPatterns(
+        critical_count=critical_count,
+        high_count=high_count,
+        total_flagged=total_flagged,
+        total_txn_count=len(canon_raw_transactions),
+        narrative=narrative,
+    )
+
+
+def _build_tax_compliance(
+    txns: List[Dict],
+    in_active_period,
+    config: TaxComplianceConfig,
+) -> TaxCompliance:
+    tax_months_active: set = set()
+    tax_total_cents_active = 0
+    tax_txn_count_active = 0
+    all_months_active: set = set()
+    for t in txns:
+        m = (t["txn_date"] or "")[:7]
+        if t["txn_date"] and in_active_period(m):
+            all_months_active.add(m)
+            if t["role"] in _TAX_ROLES and t["signed"] < 0:
+                tax_months_active.add(m)
+                tax_total_cents_active += t["abs"]
+                tax_txn_count_active += 1
+
+    n_tax_months = len(tax_months_active)
+    n_total_months = len(all_months_active)
+
+    if n_total_months == 0 or tax_txn_count_active == 0:
+        status: KraStatus = "NOT_DETECTED"
+    elif tax_txn_count_active < config.min_sample_size:
+        status = "INSUFFICIENT_DATA"
+    elif n_tax_months >= n_total_months * config.compliant_coverage_threshold:
+        status = "COMPLIANT"
+    elif n_tax_months > 0:
+        status = "PARTIAL"
+    else:
+        status = "NOT_DETECTED"
+
+    if status == "COMPLIANT":
+        narrative = "Tax payment pattern is consistent with the business's stated activity level."
+    elif status == "PARTIAL":
+        narrative = "Partial tax payment pattern — verify against filed returns."
+    elif status == "INSUFFICIENT_DATA":
+        narrative = (
+            f"Insufficient tax transaction volume for a reliable compliance "
+            f"assessment (N={tax_txn_count_active})."
+        )
+    else:
+        narrative = (
+            "No tax payments detected in bank activity. This does not necessarily "
+            "indicate non-compliance — tax may be paid from an account outside this "
+            "statement set, or by a third party. Verify against a KRA compliance certificate."
+        )
+
+    return TaxCompliance(
+        total=Money(cents=tax_total_cents_active),
+        months_with_tax=n_tax_months,
+        months_total=n_total_months,
+        status=status,
+        narrative=narrative,
+    )
 
 
 def _build_supplier_payments(
@@ -272,18 +420,24 @@ def _build_risk_assessment(
 
 def build_snapshot_context(
     deal_id: str,
-    config: SupplierConcentrationConfig = DEFAULT_SUPPLIER_CONCENTRATION_CONFIG,
+    supplier_config: SupplierConcentrationConfig = DEFAULT_SUPPLIER_CONCENTRATION_CONFIG,
+    tax_config: TaxComplianceConfig = DEFAULT_TAX_COMPLIANCE_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 1 of PAR-189. Returns only:
-        {"risk": RiskAssessment, "supplier_payments": SupplierPayments}
+    PARTIAL — Stage 2 of PAR-189. Returns:
+        {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
+         "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
-    Everything else render_snapshot_html() needs is still computed inline there.
+    Everything else render_snapshot_html() needs is still computed inline there —
+    including a small residual fragment of what used to be the Tax Compliance
+    Analysis loop (payroll_stability_live / n_payroll_months / n_total_months),
+    kept inline because the not-yet-extracted Observed Patterns section reads
+    those same local variables. See the PAR-189 Stage 2 report for detail.
 
     This function does its own independent deal/txn/recon fetch rather than
     being fed data already fetched by render_snapshot_html() — see the
     PAR-189 report for why that duplication exists at this stage and what it
-    means for the remaining ~17 sections.
+    means for the remaining sections.
     """
     sb = _get_supabase()
 
@@ -295,6 +449,13 @@ def build_snapshot_context(
         .data or []
     )
     recon_available = len(af_result) > 0
+    af_financial_year = af_result[0].get("financial_year") if recon_available else None
+
+    if recon_available and af_financial_year:
+        _active_year = str(af_financial_year)
+        in_active_period = lambda m: m.startswith(f"{_active_year}-")  # noqa: E731
+    else:
+        in_active_period = lambda m: True  # noqa: E731
 
     snap_res = (
         sb.table("pds_snapshots")
@@ -317,12 +478,7 @@ def build_snapshot_context(
 
     recon_tier: Tier = (recon_section.get("tier") or "LOW_CONFIDENCE") if recon_available else "OBSERVED"
 
-    critical_pattern_count = sum(
-        1
-        for t in (canonical.get("transactions") or [])
-        for a in (t.get("anomalies") or [])
-        if (a.get("severity") or "LOW") == "CRITICAL"
-    )
+    transaction_patterns = _build_transaction_patterns(canonical.get("transactions") or [])
 
     txns = _fetch_txns_for_context(sb, deal_id)
 
@@ -331,7 +487,15 @@ def build_snapshot_context(
         e["entity_id"]: e.get("display_name") for e in entity_rows
     }
 
-    supplier_payments = _build_supplier_payments(txns, entity_name_by_id, config)
-    risk = _build_risk_assessment(txns, recon_tier, acct_cov_raw, critical_pattern_count, config)
+    supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
+    tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
+    risk = _build_risk_assessment(
+        txns, recon_tier, acct_cov_raw, transaction_patterns.critical_count, supplier_config,
+    )
 
-    return {"risk": risk, "supplier_payments": supplier_payments}
+    return {
+        "risk": risk,
+        "supplier_payments": supplier_payments,
+        "transaction_patterns": transaction_patterns,
+        "tax_compliance": tax_compliance,
+    }
