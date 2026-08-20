@@ -20,11 +20,13 @@ from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cash
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
+    AccountCoverage as _AccountCoverage,
     Composition as _Composition,
     InterAccountTransfer as _InterAccountTransfer,
     Inventory as _Inventory,
     LoanActivity as _LoanActivity,
     Money as _Money,
+    Percent as _Percent,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
     TaxCompliance as _TaxCompliance,
@@ -117,6 +119,34 @@ def _fmt_money_kes(money: Optional[_Money]) -> str:
     return _fmt_kes(money.cents)
 
 
+def _fmt_coverage_pct(pct: _Percent) -> str:
+    """
+    Format account-coverage's 0-1 Percent as the original's one-decimal string.
+
+    PAR-189 Stage 8. The round(..., 2) is load-bearing, not cosmetic.
+
+    `coverage_pct` is produced upstream by calculate_account_coverage() as
+    round(coverage_basis_points / 100, 2) — an exact hundredth — and the
+    original formatted THAT value directly with f"{value:.1f}". Storing it as
+    a 0-1 fraction (ratified decision #3) and multiplying back by 100
+    reintroduces float representation error, which changes the rendered digit
+    for any value landing exactly on a .x5 rounding boundary: 45 of the 10,001
+    possible basis-point values, e.g. 0.85 formats as "0.9" via the naive
+    round-trip but "0.8" in the original. Re-rounding to hundredths undoes the
+    error and reproduces the original byte-for-byte for all 10,001.
+
+    This is NOT a theoretical concern — Stage 1's Risk Assessment adapter
+    shipped the naive form in PR #161 and has been rendering those 45 values
+    one tenth of a point off ever since. It escaped every stage's byte-diff
+    because the Deed verification document has no audited financials, so
+    coverage is None and both sides render "--". Both call sites use this
+    helper now. Percentages NOT sourced from a pre-rounded upstream (supplier
+    top-share, revenue concentration) are true ratios computed identically on
+    both paths and correctly do not use this helper.
+    """
+    return f"{round(pct.value * 100, 2):.1f}"
+
+
 def _supplier_payments_ctx_from(sp: _SupplierPayments) -> Dict[str, Any]:
     if not sp.available:
         return {"available": False}
@@ -139,7 +169,12 @@ def _risk_assessment_ctx_from(risk: _RiskAssessment) -> Dict[str, Any]:
     else:
         largest_rev_pct_str = f"{risk.largest_revenue_share.value * 100:.1f}%"
 
-    missing_pct = f"{risk.coverage.value * 100:.1f}" if risk.coverage is not None else "--"
+    # PAR-189 Stage 8 fix: was f"{risk.coverage.value * 100:.1f}", which
+    # diverged from the pre-Stage-1 original for 45 of the 10,001 possible
+    # coverage values. The original reused Account Coverage's already-formatted
+    # coverage_pct string; see _fmt_coverage_pct() for why the re-round is
+    # required to reproduce it.
+    missing_pct = _fmt_coverage_pct(risk.coverage) if risk.coverage is not None else "--"
 
     return {
         "tier":                   risk.tier,
@@ -261,6 +296,65 @@ def _inter_account_transfer_ctx_from(iat: _InterAccountTransfer) -> Dict[str, An
         ],
         "note":          iat.note,
         "override_note": iat.override_note,
+    }
+
+
+# PAR-189 Stage 8 — WeasyPrint's style tables for Account Coverage. These are
+# the three CSS-class lookups the original kept inline inside
+# render_snapshot_html(); per ratified decision #5 they belong to the renderer,
+# not the shared context, which carries only Materiality /
+# AccountSubmissionStatus enums. Values are unchanged from the original.
+_AC_STAT_COLOR = {  # advisory tier → coverage-stat-value modifier
+    "NEGLIGIBLE": "ok", "MINOR": "warn", "MATERIAL": "warn", "CRITICAL": "critical",
+}
+_AC_MATERIALITY_PILL = {  # account materiality → status-pill class
+    "NEGLIGIBLE": "status-matched", "MINOR": "status-matched",
+    "MATERIAL": "status-critical", "CRITICAL": "status-critical",
+}
+_AC_SUBMISSION_PILL = {  # submission status → status-pill class
+    "SUBMITTED": "status-matched", "MISSING": "status-missing",
+}
+_AC_SUBMISSION_LABEL = {  # submission status → displayed label (glyph is presentation)
+    "SUBMITTED": "✓ Submitted", "MISSING": "Missing",
+}
+
+
+def _account_coverage_ctx_from(ac: _AccountCoverage) -> Dict[str, Any]:
+    """
+    PAR-189 Stage 8. Reproduces the presentation dict the template already
+    reads. The "--"/"" fallbacks below are the original's own defaults for
+    absent keys, applied here rather than in the shared context.
+
+    `missing_count` is emitted because the original emitted it, keeping this
+    dict identical to the pre-extraction one — but note the template does not
+    currently read it (same category as the dead `.color` field Stage 5 found
+    on the composition segments). Left in rather than quietly dropped.
+    """
+    if not ac.available:
+        return {"available": False, "note": ac.unavailable_note or ""}
+
+    color_class = _AC_STAT_COLOR.get(ac.advisory_tier, "critical")
+    return {
+        "available":            True,
+        "coverage_pct":         _fmt_coverage_pct(ac.coverage),
+        "coverage_color_class": color_class,
+        "declared_count":       ac.declared_count,
+        "submitted_count":      ac.submitted_count,
+        "missing_count":        ac.missing_count,
+        "missing_balance_str":  _fmt_money_kes(ac.missing_balance),
+        "advisory_tier":        ac.advisory_tier if ac.advisory_tier is not None else "--",
+        "recommendation":       ac.recommendation if ac.recommendation is not None else "",
+        "accounts": [
+            {
+                "bank_name":         a.bank_name if a.bank_name is not None else "--",
+                "declared_str":      _fmt_money_kes(a.declared_balance),
+                "status_label":      _AC_SUBMISSION_LABEL[a.status],
+                "status_class":      _AC_SUBMISSION_PILL[a.status],
+                "materiality":       a.materiality if a.materiality is not None else "--",
+                "materiality_class": _AC_MATERIALITY_PILL.get(a.materiality, "status-critical"),
+            }
+            for a in ac.accounts
+        ],
     }
 
 
@@ -1083,46 +1177,15 @@ def render_snapshot_html(
         "warning" if recon_tier in ("MEDIUM_CONFIDENCE", "LOW_CONFIDENCE") else ""
     )
 
-    # ── Account coverage section context ─────────────────────────────────────
-    _AC_STAT_COLOR = {  # advisory tier → coverage-stat-value modifier
-        "NEGLIGIBLE": "ok", "MINOR": "warn", "MATERIAL": "warn", "CRITICAL": "critical",
-    }
-    _AC_MATERIALITY_PILL = {  # account materiality → status-pill class
-        "NEGLIGIBLE": "status-matched", "MINOR": "status-matched",
-        "MATERIAL": "status-critical", "CRITICAL": "status-critical",
-    }
-    if acct_cov_raw.get("coverage_pct") is not None:
-        account_coverage_ctx: Dict[str, Any] = {
-            "available":        True,
-            "coverage_pct":     f"{acct_cov_raw.get('coverage_pct', 0):.1f}",
-            "coverage_color_class": _AC_STAT_COLOR.get(acct_cov_raw.get("advisory_tier"), "critical"),
-            "declared_count":   acct_cov_raw.get("declared_accounts_count", 0),
-            "submitted_count":  acct_cov_raw.get("submitted_accounts_count", 0),
-            "missing_count":    acct_cov_raw.get("missing_accounts_count", 0),
-            "missing_balance_str": _fmt_kes(int(acct_cov_raw.get("missing_balance_cents") or 0)),
-            "advisory_tier":    acct_cov_raw.get("advisory_tier", "--"),
-            "recommendation":   acct_cov_raw.get("recommendation", ""),
-            "accounts": [
-                {
-                    "bank_name":    a.get("bank_name") or "--",
-                    "declared_str": _fmt_kes(int(a.get("declared_balance_cents") or 0)),
-                    "status_label": "✓ Submitted" if a.get("status") == "SUBMITTED" else "Missing",
-                    "status_class": "status-matched" if a.get("status") == "SUBMITTED" else "status-missing",
-                    "materiality":  a.get("materiality") or "--",
-                    "materiality_class": _AC_MATERIALITY_PILL.get(a.get("materiality"), "status-critical"),
-                }
-                for a in (acct_cov_raw.get("account_details") or [])
-            ],
-        }
-    else:
-        account_coverage_ctx = {
-            "available": False,
-            "note": (
-                "Account coverage compares the bank accounts declared in audited "
-                "financials (Note 11 cash breakdown) against the statements "
-                "submitted. Submit audited financials to populate this advisory."
-            ),
-        }
+    # ── Account Coverage — PAR-189 Stage 8 ───────────────────────────────────
+    # Now computed by build_snapshot_context() (shared_ctx["account_coverage"])
+    # rather than inline here. The available/unavailable branch, the per-account
+    # rows and the locked-state prose all moved into _build_account_coverage();
+    # the three CSS-class lookup tables and the "✓ Submitted" label stayed on
+    # this side, in _account_coverage_ctx_from(), since they are presentation.
+    account_coverage_ctx: Dict[str, Any] = _account_coverage_ctx_from(
+        shared_ctx["account_coverage"]
+    )
 
     # ── Risk Assessment Summary (PAR-63) ──────────────────────────────────────
     # PAR-189 Stage 1: computation now lives in build_snapshot_context()
