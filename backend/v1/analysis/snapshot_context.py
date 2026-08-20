@@ -3,18 +3,30 @@ Shared snapshot-context data layer (PAR-189).
 
 STATUS: partial extraction. Stage 1 covered Risk Assessment Summary and
 Supplier Payment Analysis (both already implicated in real content-drop bugs
-— PAR-188 and same-night testing respectively). Stage 2 adds Transaction
-Pattern Analysis and Tax Compliance Analysis. The remaining ~13 sections are
-still computed inline in snapshot_html_renderer.render_snapshot_html() and
-are NOT reachable from this module yet. See docs/PAR-189-shared-context-schema.md
-for the full target schema and section mapping, and the PAR-189 ticket
-comments (2026-08-20) for the ratified schema decisions this module follows.
+— PAR-188 and same-night testing respectively). Stage 2 added Transaction
+Pattern Analysis and Tax Compliance Analysis. Stage 3 adds Analyst Notes and
+Inventory Analysis. The remaining ~11 sections are still computed inline in
+snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
+module yet. See docs/PAR-189-shared-context-schema.md for the full target
+schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
+the ratified schema decisions this module follows.
 
 Stage 2 note: Risk Assessment Summary's anomaly count (risk.anomaly_narrative)
 now sources from TransactionPatterns.critical_count instead of a second,
 separately-computed anomaly loop — Stage 1 duplicated that computation because
 Transaction Pattern Analysis wasn't extracted yet; Stage 2 removes the
 duplication now that it is.
+
+Stage 3 note: Inventory's days_inventory_outstanding and turnover are kept as
+raw, UNROUNDED floats (not the Optional[int]/pre-rounded form one might
+expect) specifically so the WeasyPrint adapter's f"{value:.0f} days" /
+f"{value:.1f}x" formatting reproduces the original single-step computation
+exactly — rounding once in the data layer and again in the adapter risks a
+rounding-order mismatch, the same reasoning already applied to Percent in
+Stage 1. extraction_confidence is also kept a plain float, deliberately NOT
+wrapped in Percent — the original template displays it as "0.87", never
+"87%", so treating it as a Percent (which the WeasyPrint adapter would
+multiply by 100) would silently produce the wrong number.
 
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
 CSS class names, hex colours, or markup. Each renderer (WeasyPrint today,
@@ -128,6 +140,34 @@ class TransactionPatterns:
 
 
 @dataclass(frozen=True)
+class InventoryConfig:
+    """
+    Both cutoffs were hardcoded in the original inline logic; pulled into
+    named config per PAR-189 ratified decision #4. Neither is flagged in the
+    original code as borrowed/unratified (no PARITY_SCIENCE.md cross-
+    reference, unlike supplier concentration), so no pending-sign-off caveat
+    applies — just the general carry-as-config rule.
+    """
+    low_risk_turnover_threshold: float = 6.0       # turnover >= this -> LOW risk
+    moderate_turnover_threshold: float = 3.0        # turnover >= this -> moderate
+
+
+DEFAULT_INVENTORY_CONFIG = InventoryConfig()
+
+
+@dataclass(frozen=True)
+class Inventory:
+    available: bool
+    fiscal_year: Optional[str] = None
+    inventory: Optional[Money] = None
+    cost_of_sales: Optional[Money] = None
+    turnover: Optional[float] = None                       # raw, unrounded — see module docstring
+    days_inventory_outstanding: Optional[float] = None      # raw, unrounded — see module docstring
+    extraction_confidence: Optional[float] = None           # NOT a Percent — see module docstring
+    narrative: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class SupplierPayments:
     available: bool
     total: Optional[Money] = None
@@ -213,6 +253,60 @@ def _build_transaction_patterns(canon_raw_transactions: List[Dict]) -> Transacti
         high_count=high_count,
         total_flagged=total_flagged,
         total_txn_count=len(canon_raw_transactions),
+        narrative=narrative,
+    )
+
+
+def _build_inventory(
+    af: Dict,
+    recon_available: bool,
+    config: InventoryConfig,
+) -> Inventory:
+    fiscal_year = str(af.get("financial_year") or "") if recon_available else ""
+    inventory_cents_raw = af.get("inventory_cents") if recon_available else None
+    cost_of_sales_cents_raw = af.get("cost_of_sales_cents") if recon_available else None
+    extraction_confidence_raw = af.get("extraction_confidence") if recon_available else None
+
+    data_present = (
+        recon_available
+        and inventory_cents_raw is not None
+        and cost_of_sales_cents_raw is not None
+        and int(inventory_cents_raw) > 0
+    )
+
+    if not data_present:
+        narrative = (
+            f"Inventory and/or cost of sales figures were not present in the audited "
+            f"financial statements provided for FY{fiscal_year} — inventory analysis cannot "
+            "be computed for this deal."
+        ) if recon_available else (
+            "Inventory analysis requires audited financials — not yet submitted for this deal."
+        )
+        return Inventory(available=False, fiscal_year=fiscal_year or None, narrative=narrative)
+
+    inventory_cents = int(inventory_cents_raw)
+    cost_of_sales_cents = int(cost_of_sales_cents_raw)
+    turnover = cost_of_sales_cents / inventory_cents
+    dio = 365 / turnover if turnover > 0 else None
+
+    if turnover >= config.low_risk_turnover_threshold:
+        narrative = "Inventory turns over quickly relative to cost of sales — LOW inventory risk."
+    elif turnover >= config.moderate_turnover_threshold:
+        narrative = "Inventory turnover is moderate."
+    else:
+        narrative = (
+            "Inventory turns over slowly — may indicate slow-moving stock or "
+            "overstocking risk."
+        )
+
+    return Inventory(
+        available=True,
+        fiscal_year=fiscal_year or None,
+        inventory=Money(cents=inventory_cents),
+        cost_of_sales=Money(cents=cost_of_sales_cents),
+        turnover=turnover,
+        days_inventory_outstanding=dio,
+        extraction_confidence=extraction_confidence_raw,
         narrative=narrative,
     )
 
@@ -422,11 +516,13 @@ def build_snapshot_context(
     deal_id: str,
     supplier_config: SupplierConcentrationConfig = DEFAULT_SUPPLIER_CONCENTRATION_CONFIG,
     tax_config: TaxComplianceConfig = DEFAULT_TAX_COMPLIANCE_CONFIG,
+    inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 2 of PAR-189. Returns:
+    PARTIAL — Stage 3 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
-         "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance}
+         "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
+         "inventory": Inventory, "analyst_notes": Optional[str]}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -441,15 +537,25 @@ def build_snapshot_context(
     """
     sb = _get_supabase()
 
+    deal_result = (
+        sb.table("pds_deals")
+        .select("analyst_notes")
+        .eq("id", deal_id)
+        .single()
+        .execute()
+    )
+    analyst_notes: Optional[str] = (deal_result.data or {}).get("analyst_notes") or None
+
     af_result = (
         sb.table("pds_audited_financials")
-        .select("financial_year")
+        .select("financial_year, inventory_cents, cost_of_sales_cents, extraction_confidence")
         .eq("deal_id", deal_id)
         .execute()
         .data or []
     )
     recon_available = len(af_result) > 0
-    af_financial_year = af_result[0].get("financial_year") if recon_available else None
+    af: Dict = af_result[0] if recon_available else {}
+    af_financial_year = af.get("financial_year") if recon_available else None
 
     if recon_available and af_financial_year:
         _active_year = str(af_financial_year)
@@ -489,6 +595,7 @@ def build_snapshot_context(
 
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
+    inventory = _build_inventory(af, recon_available, inventory_config)
     risk = _build_risk_assessment(
         txns, recon_tier, acct_cov_raw, transaction_patterns.critical_count, supplier_config,
     )
@@ -498,4 +605,6 @@ def build_snapshot_context(
         "supplier_payments": supplier_payments,
         "transaction_patterns": transaction_patterns,
         "tax_compliance": tax_compliance,
+        "inventory": inventory,
+        "analyst_notes": analyst_notes,
     }

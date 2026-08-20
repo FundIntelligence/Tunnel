@@ -20,6 +20,7 @@ from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cash
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
+    Inventory as _Inventory,
     Money as _Money,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
@@ -183,6 +184,27 @@ def _tax_compliance_ctx_from(tc: _TaxCompliance) -> Dict[str, Any]:
     }
 
 
+def _inventory_ctx_from(inv: _Inventory) -> Dict[str, Any]:
+    if not inv.available:
+        return {
+            "available": False,
+            "financial_year": inv.fiscal_year or "",
+            "note": inv.narrative,
+        }
+    return {
+        "available":      True,
+        "financial_year": inv.fiscal_year or "",
+        "inventory_str":  _fmt_money_kes(inv.inventory),
+        "cogs_str":       _fmt_money_kes(inv.cost_of_sales),
+        "turnover_str":   f"{inv.turnover:.1f}x",
+        "dio_str":        f"{inv.days_inventory_outstanding:.0f} days" if inv.days_inventory_outstanding is not None else "--",
+        "clause":         inv.narrative,
+        "confidence_str": (
+            f"{inv.extraction_confidence:.2f}" if inv.extraction_confidence is not None else "not recorded"
+        ),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,7 +241,12 @@ def render_snapshot_html(
     ) or {}
     company_name: str = deal.get("company_name") or "--"
     currency: str     = deal.get("currency") or "KES"
-    analyst_notes: str = deal.get("analyst_notes") or ""
+    # PAR-189 Stage 3: analyst_notes now sourced from build_snapshot_context()
+    # (shared_ctx["analyst_notes"]) instead of this same `deal` row read
+    # directly above. The `deal` fetch itself is untouched (still needed for
+    # company_name/currency), so analyst_notes is fetched twice for now —
+    # same accepted duplication pattern as every other Stage 1-3 field.
+    analyst_notes: str = shared_ctx["analyst_notes"] or ""
 
     # 2. Snapshot — decode canonical_json
     snap_res = (
@@ -1137,57 +1164,10 @@ def render_snapshot_html(
     loan_variance_str     = f"{loan_var_raw:.1f}%" if loan_var_raw is not None else "0%"
 
     # ── Inventory Analysis (PAR-63, recon state only) ────────────────────────
-    # Single fiscal-year audited-financials figure, not a monthly time series.
-    # turnover = cost_of_sales_cents / inventory_cents; DIO = 365 / turnover.
-    inv_fy = str(af.get("financial_year") or "") if recon_available else ""
-    inventory_cents_raw     = af.get("inventory_cents") if recon_available else None
-    cost_of_sales_cents_raw = af.get("cost_of_sales_cents") if recon_available else None
-    extraction_confidence_raw = af.get("extraction_confidence") if recon_available else None
-
-    inventory_data_present = (
-        recon_available
-        and inventory_cents_raw is not None
-        and cost_of_sales_cents_raw is not None
-        and int(inventory_cents_raw) > 0
-    )
-    if inventory_data_present:
-        inventory_cents     = int(inventory_cents_raw)
-        cost_of_sales_cents = int(cost_of_sales_cents_raw)
-        inventory_turnover   = cost_of_sales_cents / inventory_cents
-        dio_days             = 365 / inventory_turnover if inventory_turnover > 0 else None
-        if inventory_turnover >= 6:
-            inventory_clause = "Inventory turns over quickly relative to cost of sales — LOW inventory risk."
-        elif inventory_turnover >= 3:
-            inventory_clause = "Inventory turnover is moderate."
-        else:
-            inventory_clause = (
-                "Inventory turns over slowly — may indicate slow-moving stock or "
-                "overstocking risk."
-            )
-        inventory_ctx: Dict[str, Any] = {
-            "available":      True,
-            "financial_year": inv_fy,
-            "inventory_str":  _fmt_kes(inventory_cents),
-            "cogs_str":       _fmt_kes(cost_of_sales_cents),
-            "turnover_str":   f"{inventory_turnover:.1f}x",
-            "dio_str":        f"{dio_days:.0f} days" if dio_days is not None else "--",
-            "clause":         inventory_clause,
-            "confidence_str": (
-                f"{extraction_confidence_raw:.2f}" if extraction_confidence_raw is not None else "not recorded"
-            ),
-        }
-    else:
-        inventory_ctx = {
-            "available": False,
-            "financial_year": inv_fy,
-            "note": (
-                f"Inventory and/or cost of sales figures were not present in the audited "
-                f"financial statements provided for FY{inv_fy} — inventory analysis cannot "
-                "be computed for this deal."
-            ) if recon_available else (
-                "Inventory analysis requires audited financials — not yet submitted for this deal."
-            ),
-        }
+    # PAR-189 Stage 3: computation now lives in build_snapshot_context() — see
+    # _inventory_ctx_from() above. This just re-derives the presentation dict
+    # the template expects.
+    inventory_ctx: Dict[str, Any] = _inventory_ctx_from(shared_ctx["inventory"])
 
     # ── Verify-page summary (reuses figures already computed above) ──────────
     if recon_available:
