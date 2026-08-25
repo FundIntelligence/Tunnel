@@ -9,7 +9,8 @@ export default function ReactQueryProvider({ children }: { children: React.React
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
-        staleTime: 2 * 60 * 1000, // 2 minutes
+        staleTime: Infinity, // never auto-refetch; cache lives for the whole tab session
+        gcTime: Infinity,    // don't evict unobserved queries either — same lifetime as staleTime
         retry: 1,
       },
       mutations: {

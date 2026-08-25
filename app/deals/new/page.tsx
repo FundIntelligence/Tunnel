@@ -2,11 +2,13 @@
 
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
+import { useQueryClient } from '@tanstack/react-query'
 import { createBrowserClient } from '@/lib/supabase'
 import { createDeal } from '@/lib/v1-api'
 
 export default function NewDealPage() {
   const router = useRouter()
+  const queryClient = useQueryClient()
   const [dealName, setDealName] = useState('')
   const [companyName, setCompanyName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -32,6 +34,8 @@ export default function NewDealPage() {
     setError('')
     try {
       const { deal } = await createDeal('KES', dealName.trim(), undefined, companyName.trim())
+      // Prefix match invalidates ['deals', userId] without needing userId here.
+      queryClient.invalidateQueries({ queryKey: ['deals'] })
       router.push(`/v1/deal?deal_id=${deal.id}`)
     } catch (err: any) {
       setError(err?.message || 'Failed to create deal. Please try again.')
