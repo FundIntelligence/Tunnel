@@ -8,8 +8,9 @@ Pattern Analysis and Tax Compliance Analysis. Stage 3 added Analyst Notes and
 Inventory Analysis. Stage 4 added Loan Activity Detected and Loan Facilities
 (one LoanActivity concept spanning two template sections). Stage 5 added
 Inflow Composition and Outflow Composition. Stage 6 added Tax Payment Pattern.
-Stage 7 added Inter-Account Transfer Analysis. Stage 8 adds Account Coverage.
-The remaining ~5 sections are still computed inline in
+Stage 7 added Inter-Account Transfer Analysis. Stage 8 added Account Coverage.
+Stage 9 adds the 4-Point Reconciliation table.
+The remaining ~4 sections are still computed inline in
 snapshot_html_renderer.render_snapshot_html() and are NOT reachable from this
 module yet. See docs/PAR-189-shared-context-schema.md for the full target
 schema and section mapping, and the PAR-189 ticket comments (2026-08-20) for
@@ -78,7 +79,7 @@ digit (e.g. coverage_pct 0.85 rendered "0.9" instead of the original "0.8").
 Stage 1's Risk Assessment adapter had been shipping that divergence since PR
 #161; it was invisible to every stage's byte-diff because the Deed document
 has no audited financials and renders "--" for coverage on both sides. Both
-call sites now format via _fmt_coverage_pct() in snapshot_html_renderer.py,
+call sites now format via _fmt_pct_1dp() in snapshot_html_renderer.py,
 which re-rounds to hundredths first. See that helper's docstring.
 
 Format-agnostic per PAR-189: nothing returned from this module contains HTML,
@@ -115,6 +116,7 @@ KraStatus = Literal["COMPLIANT", "PARTIAL", "INSUFFICIENT_DATA", "NOT_DETECTED"]
 ReconStatus = Literal["EXACT_MATCH", "ACCEPTABLE", "COVERAGE_GAP", "VARIANCE"]
 TransferDetectionState = Literal["DETECTED", "NO_TRANSFERS_FOUND", "UNAVAILABLE"]
 AccountSubmissionStatus = Literal["SUBMITTED", "MISSING"]
+ReconCheckKey = Literal["cash_position", "revenue", "expenses", "loan_activity"]
 
 # Prose shown when audited financials haven't been submitted, so
 # calculate_account_coverage() has nothing to compare against. Narrative stays
@@ -376,6 +378,81 @@ class InterAccountTransfer:
 
 
 @dataclass(frozen=True)
+class ReconCheckConfig:
+    """
+    The 15% expense-gap acceptability cutoff was hardcoded inline in the
+    original (`abs(exp_gap or 0) <= 15`), so it becomes a named config value
+    per PAR-189 ratified decision #4. Like TaxComplianceConfig and unlike
+    SupplierConcentrationConfig, the original carries no "borrowed / pending
+    Parity Science sign-off" marker on it, so no such caveat is attached here
+    — only the general carry-as-config rule.
+
+    Note this is a DIFFERENT 15 from reconciliation_engine's own
+    `0 <= gap_pct <= 15` revenue banding (line ~391). They are two separate
+    hardcoded thresholds that happen to share a value; this config governs
+    only the renderer-side expense badge, and deliberately does not reach
+    into the engine's own banding.
+    """
+    expense_acceptable_gap_pct: float = 15.0
+
+
+DEFAULT_RECON_CHECK_CONFIG = ReconCheckConfig()
+
+
+@dataclass(frozen=True)
+class ReconCheck:
+    """
+    One row of the 4-Point Reconciliation table.
+
+    `status` is the semantic 4-way ReconStatus (shared with Stage 4's
+    LoanFacility via _resolve_recon_status) — NOT the original's
+    (badge_class, badge_label) tuple or its `variance_class`. All three of
+    those are CSS and live in the renderer's own table per ratified
+    decision #5.
+
+    `variance` is a 0-1 fraction per decision #3. IMPORTANT for renderers:
+    the underlying gap_pct/variance_pct values arrive from
+    reconciliation_engine already rounded to hundredths, so formatting them
+    back to a percentage string requires the re-rounding in
+    _fmt_pct_1dp() — see that helper. Naive `value * 100` formatting diverges
+    from the original on 748 of the 100,001 values in the plausible
+    -500%..+500% range, including negatives, which these fields routinely are.
+
+    `label` / `observed_sub` / `declared_sub` are the row's fixed descriptive
+    wording. They stay in the shared context rather than moving to each
+    renderer precisely so the two renderers cannot drift on what a row claims
+    to be comparing — that divergence risk is the reason this layer exists.
+    """
+    key: ReconCheckKey
+    label: str
+    observed: Money
+    observed_sub: str
+    declared: Money
+    declared_sub: str
+    variance: Optional[Percent]
+    status: ReconStatus
+    assessment: str
+
+
+@dataclass(frozen=True)
+class FourPointReconciliation:
+    """
+    4-Point Reconciliation — Declared vs Observed.
+
+    `available` mirrors recon_available: with no audited financials there is
+    nothing to reconcile against, and the template renders a separate
+    static locked-state section instead (snapshot.html:1448, which reads no
+    context at all — see the Stage 9 report).
+
+    Per decision #1 the unavailable case is an empty check list plus
+    `fiscal_note=None`, not sentinel rows.
+    """
+    available: bool
+    checks: List[ReconCheck] = field(default_factory=list)
+    fiscal_note: Optional[str] = None   # None -> renderer shows "" (original's own default)
+
+
+@dataclass(frozen=True)
 class DeclaredAccount:
     """
     One bank account declared in audited financials (Note 11 cash breakdown),
@@ -412,7 +489,7 @@ class AccountCoverage:
     strings stuffed into the value fields.
 
     `coverage` is a 0-1 fraction per decision #3. NOTE for any renderer
-    formatting it back to a percentage string: see _fmt_coverage_pct() in
+    formatting it back to a percentage string: see _fmt_pct_1dp() in
     snapshot_html_renderer.py — the upstream value is an exact hundredth
     (round(basis_points / 100, 2)) and naively multiplying the stored fraction
     by 100 reintroduces float error that changes the rendered digit for 45 of
@@ -1033,6 +1110,166 @@ def _build_inter_account_transfer(
     )
 
 
+def _kes_to_money(kes_value, currency: str) -> Money:
+    """
+    The recon_section sub-dicts carry KES floats, not cents. The original
+    converted with int(value * 100) — truncation toward zero, NOT rounding.
+    Preserved exactly; switching to round() here would shift half-cent values.
+    """
+    return Money(int((kes_value or 0) * 100), currency)
+
+
+def _build_four_point_reconciliation(
+    recon_section: Dict,
+    recon_available: bool,
+    coverage_incomplete: bool,
+    missing_note: str,
+    fy,
+    currency: str,
+    config: ReconCheckConfig = DEFAULT_RECON_CHECK_CONFIG,
+) -> FourPointReconciliation:
+    """
+    4-Point Reconciliation (PAR-189 Stage 9), transcribed from the original
+    inline block in render_snapshot_html().
+
+    Four fidelity points preserved deliberately:
+
+    1. **Cash position is never coverage-softened.** The original calls
+       _status_to_badge(cash_status) with NO coverage_incomplete argument,
+       while the other three pass it. That is deliberate and documented in
+       the original: the declared Note 11 balance is the company's own
+       attestation of total cash, so a variance there is genuinely
+       unexplained regardless of which statements are missing. Here that
+       becomes _resolve_recon_status(..., coverage_incomplete=False).
+       Cash also never gets missing_note appended to its assessment.
+
+    2. **Each row derives its status differently**, and the differences are
+       real, not incidental:
+         - cash  : raw `status` field, no coverage softening
+         - revenue: parsed out of the free-text `assessment` string by
+                    substring match ("HEALTHY" / "WARNING" / "RISK"), NOT
+                    from any status field
+         - expenses: purely from the gap magnitude vs the config threshold;
+                     the sub-dict's own status field is ignored entirely
+         - loan  : raw `status` field, defaulting to "VARIANCE" when absent
+       Unifying these onto one rule would silently change badge outcomes.
+
+    3. **`abs()` in the assessment strings is applied to the raw
+       already-rounded value**, formatted here in the builder, so it never
+       makes the 0-1 round trip. Only ReconCheck.variance does, and the
+       renderer must use _fmt_pct_1dp() for it.
+
+    4. **Assessments append missing_note only when the resolved status is
+       COVERAGE_GAP**, matching the original's `if badge[0] == "b-warn"`.
+    """
+    if not recon_available:
+        return FourPointReconciliation(available=False)
+
+    cash_r: Dict = recon_section.get("cash_position") or {}
+    rev_r: Dict = recon_section.get("revenue") or {}
+    exp_r: Dict = recon_section.get("expenses") or {}
+    loan_r: Dict = recon_section.get("loan_activity") or {}
+
+    fiscal_note: Optional[str] = None
+    fp = rev_r.get("fiscal_period") or ""
+    if " to " in fp:
+        end_date = fp.split(" to ")[-1]
+        fiscal_note = f"All checks at fiscal year-end {end_date}"
+    elif fy:
+        fiscal_note = f"All checks at fiscal year-end Dec 31 {fy}"
+
+    def _with_missing_note(text: str, status: ReconStatus) -> str:
+        if status == "COVERAGE_GAP":
+            return f"{text.rstrip('.')} {missing_note}"
+        return text
+
+    checks: List[ReconCheck] = []
+
+    # ── Cash position — deliberately NOT coverage-softened (point 1) ─────────
+    cash_var = cash_r.get("variance_pct")
+    cash_status_raw = cash_r.get("status") or "SKIPPED"
+    cash_status = _resolve_recon_status(cash_status_raw, False)
+    if cash_status_raw == "EXACT_MATCH":
+        cash_assessment = "On submitted accounts: KES 0 variance."
+    elif cash_var is not None:
+        cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
+    else:
+        cash_assessment = cash_r.get("reason") or "Insufficient data."
+    checks.append(ReconCheck(
+        key="cash_position",
+        label="Cash position",
+        observed=_kes_to_money(cash_r.get("total_bank_kes", 0), currency),
+        observed_sub="Bank accounts at fiscal year-end",
+        declared=_kes_to_money(cash_r.get("total_declared_kes", 0), currency),
+        declared_sub="Note 11 · cash and equivalents",
+        variance=Percent(cash_var / 100) if cash_var is not None else None,
+        status=cash_status,
+        assessment=cash_assessment,
+    ))
+
+    # ── Revenue — status parsed out of the free-text assessment (point 2) ────
+    rev_gap = rev_r.get("gap_pct")
+    rev_text = rev_r.get("assessment") or ""
+    rev_status_raw = (
+        "HEALTHY" if "HEALTHY" in rev_text
+        else ("ACCEPTABLE" if "WARNING" not in rev_text and "RISK" not in rev_text else "VARIANCE")
+    )
+    rev_status = _resolve_recon_status(rev_status_raw, coverage_incomplete)
+    checks.append(ReconCheck(
+        key="revenue",
+        label="Revenue",
+        observed=_kes_to_money(rev_r.get("bank_inflows_kes", 0), currency),
+        observed_sub="Net operational inflows",
+        declared=_kes_to_money(rev_r.get("declared_revenue_kes", 0), currency),
+        declared_sub="Declared turnover",
+        variance=Percent(rev_gap / 100) if rev_gap is not None else None,
+        status=rev_status,
+        assessment=_with_missing_note(rev_text or "--", rev_status),
+    ))
+
+    # ── Expenses — status purely from gap magnitude vs config (point 2) ──────
+    exp_gap = exp_r.get("gap_pct")
+    exp_status_raw = (
+        "ACCEPTABLE" if abs(exp_gap or 0) <= config.expense_acceptable_gap_pct else "VARIANCE"
+    )
+    exp_status = _resolve_recon_status(exp_status_raw, coverage_incomplete)
+    checks.append(ReconCheck(
+        key="expenses",
+        label="Expenses",
+        observed=_kes_to_money(exp_r.get("bank_outflows_kes", 0), currency),
+        observed_sub="Net operational outflows",
+        declared=_kes_to_money(exp_r.get("declared_expenses_kes", 0), currency),
+        declared_sub="Total declared expenses",
+        variance=Percent(exp_gap / 100) if exp_gap is not None else None,
+        status=exp_status,
+        assessment=_with_missing_note(exp_r.get("explanation") or "--", exp_status),
+    ))
+
+    # ── Loan activity ────────────────────────────────────────────────────────
+    loan_var = loan_r.get("variance_pct")
+    loan_status_raw = loan_r.get("status") or "VARIANCE"
+    loan_status = _resolve_recon_status(loan_status_raw, coverage_incomplete)
+    if loan_status_raw == "EXACT_MATCH":
+        loan_assessment = "Net borrowing matches cashflow statement exactly."
+    elif loan_var is not None:
+        loan_assessment = f"{abs(loan_var):.1f}% variance — review facility discrepancy."
+    else:
+        loan_assessment = loan_r.get("reason") or "Insufficient data."
+    checks.append(ReconCheck(
+        key="loan_activity",
+        label="Loan activity",
+        observed=_kes_to_money(loan_r.get("bank_net_borrowing_kes", 0), currency),
+        observed_sub="Net borrowings · bank-detected",
+        declared=_kes_to_money(loan_r.get("declared_net_borrowing_kes", 0), currency),
+        declared_sub="Cashflow statement · Note 14",
+        variance=Percent(loan_var / 100) if loan_var is not None else None,
+        status=loan_status,
+        assessment=_with_missing_note(loan_assessment, loan_status),
+    ))
+
+    return FourPointReconciliation(available=True, checks=checks, fiscal_note=fiscal_note)
+
+
 def _build_account_coverage(acct_cov_raw: Dict, currency: str) -> AccountCoverage:
     """
     Account Coverage — Declared vs Submitted (PAR-189 Stage 8).
@@ -1182,16 +1419,18 @@ def build_snapshot_context(
     supplier_config: SupplierConcentrationConfig = DEFAULT_SUPPLIER_CONCENTRATION_CONFIG,
     tax_config: TaxComplianceConfig = DEFAULT_TAX_COMPLIANCE_CONFIG,
     inventory_config: InventoryConfig = DEFAULT_INVENTORY_CONFIG,
+    recon_check_config: ReconCheckConfig = DEFAULT_RECON_CHECK_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 8 of PAR-189. Returns:
+    PARTIAL — Stage 9 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
          "tax_payment_pattern": TaxPaymentPattern,
          "inventory": Inventory, "analyst_notes": Optional[str], "loans": LoanActivity,
          "inflow": Composition, "outflow": Composition,
          "inter_account_transfer": InterAccountTransfer,
-         "account_coverage": AccountCoverage}
+         "account_coverage": AccountCoverage,
+         "four_point_reconciliation": FourPointReconciliation}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
@@ -1255,15 +1494,19 @@ def build_snapshot_context(
 
     recon_tier: Tier = (recon_section.get("tier") or "LOW_CONFIDENCE") if recon_available else "OBSERVED"
 
-    # Same coverage-incomplete derivation snapshot_html_renderer.py still
-    # computes independently for the not-yet-extracted 4-Point Reconciliation
-    # section (rev/exp/loan badges there) — reused here, not a new concept,
-    # just recomputed from acct_cov_raw which this function already fetches.
+    # PAR-189 Stage 9: this derivation is no longer duplicated in
+    # snapshot_html_renderer.py — 4-Point Reconciliation was the last consumer
+    # of the renderer's own copy, so missing_bank_names / coverage_incomplete /
+    # missing_note now live here only.
     missing_bank_names = [
         a.get("bank_name") for a in (acct_cov_raw.get("account_details") or [])
         if a.get("status") != "SUBMITTED" and a.get("bank_name")
     ]
     coverage_incomplete = recon_available and bool(missing_bank_names)
+    missing_note = (
+        f"Coverage gap — {', '.join(missing_bank_names)} not submitted."
+        if coverage_incomplete else ""
+    )
 
     loans_r: Dict = (recon_section.get("loan_activity") or {}) if recon_available else {}
 
@@ -1319,6 +1562,19 @@ def build_snapshot_context(
     # coverage_incomplete (Stage 4).
     account_coverage = _build_account_coverage(acct_cov_raw, currency)
 
+    # PAR-189 Stage 9 — 4-Point Reconciliation. No new fetch: recon_section,
+    # coverage_incomplete and missing_note are all already resolved above.
+    # `fy` mirrors render_snapshot_html()'s own derivation exactly.
+    four_point_recon = _build_four_point_reconciliation(
+        recon_section,
+        recon_available,
+        coverage_incomplete,
+        missing_note,
+        str(af_financial_year or "") if recon_available else "",
+        currency,
+        recon_check_config,
+    )
+
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)
     tax_compliance = _build_tax_compliance(txns, in_active_period, tax_config)
     tax_payment_pattern = _build_tax_payment_pattern(txns)
@@ -1341,4 +1597,5 @@ def build_snapshot_context(
         "outflow": outflow,
         "inter_account_transfer": inter_account_transfer,
         "account_coverage": account_coverage,
+        "four_point_reconciliation": four_point_recon,
     }

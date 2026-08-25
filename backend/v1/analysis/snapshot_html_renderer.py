@@ -22,6 +22,7 @@ from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
     AccountCoverage as _AccountCoverage,
     Composition as _Composition,
+    FourPointReconciliation as _FourPointReconciliation,
     InterAccountTransfer as _InterAccountTransfer,
     Inventory as _Inventory,
     LoanActivity as _LoanActivity,
@@ -85,6 +86,15 @@ def _status_to_badge(status: str, coverage_incomplete: bool = False):
     coverage_incomplete distinguishes a gap explainable by missing bank
     statement coverage (amber b-warn) from a gap on otherwise-complete data,
     which is treated as a genuine unexplained variance (red b-variance).
+
+    PAR-189 Stage 9: render_snapshot_html() no longer calls this — the last
+    caller (4-Point Reconciliation) now consumes the shared context's
+    semantic ReconStatus and maps it via _RECON_STATUS_BADGE below. This is
+    deliberately KEPT rather than deleted: it is the reference oracle that
+    tests_v1/test_par189_stage4_extraction.py diffs _resolve_recon_status()
+    against across every status/coverage combination, and v1/tests also
+    exercises it directly. Deleting it would remove a real invariant test,
+    not just dead code.
     """
     if status == "EXACT_MATCH":
         return ("b-exact", "Exact match")
@@ -119,30 +129,39 @@ def _fmt_money_kes(money: Optional[_Money]) -> str:
     return _fmt_kes(money.cents)
 
 
-def _fmt_coverage_pct(pct: _Percent) -> str:
+def _fmt_pct_1dp(pct: _Percent) -> str:
     """
-    Format account-coverage's 0-1 Percent as the original's one-decimal string.
+    Format a 0-1 Percent that came from an already-rounded upstream as the
+    original's one-decimal string.
 
-    PAR-189 Stage 8. The round(..., 2) is load-bearing, not cosmetic.
+    PAR-189 Stage 8 (introduced) / Stage 9 (generalised — renamed from
+    _fmt_coverage_pct now that four reconciliation fields use it too).
+    The round(..., 2) is load-bearing, not cosmetic.
 
-    `coverage_pct` is produced upstream by calculate_account_coverage() as
-    round(coverage_basis_points / 100, 2) — an exact hundredth — and the
-    original formatted THAT value directly with f"{value:.1f}". Storing it as
-    a 0-1 fraction (ratified decision #3) and multiplying back by 100
-    reintroduces float representation error, which changes the rendered digit
-    for any value landing exactly on a .x5 rounding boundary: 45 of the 10,001
-    possible basis-point values, e.g. 0.85 formats as "0.9" via the naive
-    round-trip but "0.8" in the original. Re-rounding to hundredths undoes the
-    error and reproduces the original byte-for-byte for all 10,001.
+    Several upstream percentages reach this layer ALREADY rounded to
+    hundredths — `calculate_account_coverage()` returns
+    round(basis_points / 100, 2), and reconciliation_engine returns
+    round(x / y * 100, 2) for every gap_pct / variance_pct. The original
+    formatted those values directly with f"{value:.1f}". Storing them as 0-1
+    fractions (ratified decision #3) and multiplying back by 100 reintroduces
+    float representation error, changing the rendered digit for any value
+    landing exactly on a .x5 boundary. Re-rounding to hundredths undoes that
+    error and reproduces the original byte-for-byte.
 
-    This is NOT a theoretical concern — Stage 1's Risk Assessment adapter
-    shipped the naive form in PR #161 and has been rendering those 45 values
-    one tenth of a point off ever since. It escaped every stage's byte-diff
-    because the Deed verification document has no audited financials, so
-    coverage is None and both sides render "--". Both call sites use this
-    helper now. Percentages NOT sourced from a pre-rounded upstream (supplier
-    top-share, revenue concentration) are true ratios computed identically on
-    both paths and correctly do not use this helper.
+    Measured, not assumed: 45 of the 10,001 possible coverage values (0-100%)
+    diverge under the naive round-trip, and 748 of the 100,001 values across
+    the -500%..+500% range the reconciliation variances span — negatives very
+    much included, which those fields routinely are. With the re-round,
+    zero divergences across both domains.
+
+    This is NOT theoretical. Stage 1's Risk Assessment adapter shipped the
+    naive form in PR #161; it escaped seven stages of byte-diffs because the
+    Deed verification document has no audited financials, so every affected
+    field renders "--" on both sides.
+
+    Percentages NOT sourced from a pre-rounded upstream (supplier top-share,
+    revenue concentration) are true ratios computed identically on both paths
+    and correctly do not use this helper.
     """
     return f"{round(pct.value * 100, 2):.1f}"
 
@@ -172,9 +191,9 @@ def _risk_assessment_ctx_from(risk: _RiskAssessment) -> Dict[str, Any]:
     # PAR-189 Stage 8 fix: was f"{risk.coverage.value * 100:.1f}", which
     # diverged from the pre-Stage-1 original for 45 of the 10,001 possible
     # coverage values. The original reused Account Coverage's already-formatted
-    # coverage_pct string; see _fmt_coverage_pct() for why the re-round is
+    # coverage_pct string; see _fmt_pct_1dp() for why the re-round is
     # required to reproduce it.
-    missing_pct = _fmt_coverage_pct(risk.coverage) if risk.coverage is not None else "--"
+    missing_pct = _fmt_pct_1dp(risk.coverage) if risk.coverage is not None else "--"
 
     return {
         "tier":                   risk.tier,
@@ -299,6 +318,59 @@ def _inter_account_transfer_ctx_from(iat: _InterAccountTransfer) -> Dict[str, An
     }
 
 
+# PAR-189 Stage 9 — WeasyPrint's style tables for the 4-Point Reconciliation
+# table. The shared context carries only the semantic ReconStatus; these three
+# mappings are presentation and stay here per ratified decision #5. Values are
+# unchanged from the original's _status_to_badge() / _BADGE_VARIANCE_CLASS.
+_RECON_STATUS_BADGE = {
+    "EXACT_MATCH":  ("b-exact",    "Exact match"),
+    "ACCEPTABLE":   ("b-ok",       "Acceptable"),
+    "COVERAGE_GAP": ("b-warn",     "Gap · coverage incomplete"),
+    "VARIANCE":     ("b-variance", "Variance"),
+}
+# Per-row variance formatting. The suffix and the missing-value fallback both
+# differ by row in the original — Revenue/Expenses read "% gap" while Cash and
+# Loan read "%", and Loan alone falls back to "0%" rather than "--". Preserved
+# exactly rather than unified.
+_RECON_VARIANCE_FORMAT = {
+    "cash_position": ("%",     "--"),
+    "revenue":       ("% gap", "--"),
+    "expenses":      ("% gap", "--"),
+    "loan_activity": ("%",     "0%"),
+}
+
+
+def _four_point_recon_ctx_from(fpr: _FourPointReconciliation) -> Dict[str, Any]:
+    """
+    PAR-189 Stage 9. Returns (recon_rows, recon_fiscal_note) as the template
+    expects them. When unavailable, both take the original's empty defaults
+    and the template renders the separate static locked-state section instead.
+    """
+    rows: List[Dict] = []
+    for c in fpr.checks:
+        badge_class, badge_label = _RECON_STATUS_BADGE[c.status]
+        suffix, fallback = _RECON_VARIANCE_FORMAT[c.key]
+        variance_str = (
+            f"{_fmt_pct_1dp(c.variance)}{suffix}" if c.variance is not None else fallback
+        )
+        rows.append({
+            "check":          c.label,
+            "observed_str":   _fmt_money_kes(c.observed),
+            "observed_sub":   c.observed_sub,
+            "declared_str":   _fmt_money_kes(c.declared),
+            "declared_sub":   c.declared_sub,
+            "variance_str":   variance_str,
+            "variance_class": _BADGE_VARIANCE_CLASS[badge_class],
+            "badge_class":    badge_class,
+            "badge_label":    badge_label,
+            "assessment":     c.assessment,
+        })
+    return {
+        "recon_rows": rows,
+        "recon_fiscal_note": fpr.fiscal_note if fpr.fiscal_note is not None else "",
+    }
+
+
 # PAR-189 Stage 8 — WeasyPrint's style tables for Account Coverage. These are
 # the three CSS-class lookups the original kept inline inside
 # render_snapshot_html(); per ratified decision #5 they belong to the renderer,
@@ -336,7 +408,7 @@ def _account_coverage_ctx_from(ac: _AccountCoverage) -> Dict[str, Any]:
     color_class = _AC_STAT_COLOR.get(ac.advisory_tier, "critical")
     return {
         "available":            True,
-        "coverage_pct":         _fmt_coverage_pct(ac.coverage),
+        "coverage_pct":         _fmt_pct_1dp(ac.coverage),
         "coverage_color_class": color_class,
         "declared_count":       ac.declared_count,
         "submitted_count":      ac.submitted_count,
@@ -574,16 +646,11 @@ def render_snapshot_html(
         sealed_recon = canonical.get("recon_section")
         recon_section = sealed_recon if sealed_recon else generate_reconciliation_section(deal_id)
 
-    # 6b. Account coverage advisory — declared accounts (audited Note 11 cash
-    #     breakdown) vs submitted statements. Reuse the value already computed
-    #     inside the reconciliation section when present. In observed-only state
-    #     there are no audited financials to declare accounts against, so the
-    #     advisory is unavailable (calculate_account_coverage requires them) —
-    #     leave it empty and the template renders an "awaiting" stub.
-    if recon_available:
-        acct_cov_raw: Dict = recon_section.get("account_coverage") or {}
-    else:
-        acct_cov_raw = {}
+    # PAR-189 Stage 9: the local acct_cov_raw derivation that used to sit here
+    # is gone. It fed only Account Coverage (extracted in Stage 8) and the
+    # 4-Point Reconciliation badge softening (extracted in this stage), and
+    # build_snapshot_context() resolves the same value from the same
+    # recon_section. recon_section itself is still needed locally below.
 
     # ── Active period ──────────────────────────────────────────────────────
     # Drives every "this period" filter below (avg revenue, loan frequency,
@@ -1027,139 +1094,30 @@ def render_snapshot_html(
 
     patterns = patterns[:5]
 
-    # ── Reconciliation rows (recon state only) ───────────────────────────────
-    recon_rows: List[Dict] = []
-    recon_fiscal_note = ""
-
-    # Coverage-aware badge softening: a variance is only treated as a genuine,
-    # unexplained red b-variance when bank statement coverage is complete.
-    # When accounts are known to be missing, the same underlying variance is
-    # surfaced as an explainable amber b-warn naming the actual missing
-    # account(s) — derived from the real coverage data, not hardcoded to any
-    # one deal, so this calibration applies correctly to every deal on render.
-    missing_bank_names = [
-        a.get("bank_name") for a in (acct_cov_raw.get("account_details") or [])
-        if a.get("status") != "SUBMITTED" and a.get("bank_name")
-    ]
-    coverage_incomplete = recon_available and bool(missing_bank_names)
-    missing_note = (
-        f"Coverage gap — {', '.join(missing_bank_names)} not submitted."
-        if coverage_incomplete else ""
-    )
-
-    if recon_available:
-        cash_r = recon_section.get("cash_position") or {}
-        rev_r  = recon_section.get("revenue") or {}
-        exp_r  = recon_section.get("expenses") or {}
-        loan_r = recon_section.get("loan_activity") or {}
-
-        # Derive fiscal note from sub-section
-        fp = rev_r.get("fiscal_period") or ""
-        if " to " in fp:
-            end_date = fp.split(" to ")[-1]
-            recon_fiscal_note = f"All checks at fiscal year-end {end_date}"
-        elif fy:
-            recon_fiscal_note = f"All checks at fiscal year-end Dec 31 {fy}"
-
-        # Cash position — never softened by coverage gaps: the declared Note 11
-        # balance is the company's own attestation of total cash at year-end, so
-        # a variance here is treated as genuinely unexplained regardless of which
-        # bank statements are missing.
-        cash_var    = cash_r.get("variance_pct")
-        cash_status = cash_r.get("status") or "SKIPPED"
-        cash_badge  = _status_to_badge(cash_status)
-        if cash_status == "EXACT_MATCH":
-            cash_assessment = "On submitted accounts: KES 0 variance."
-        elif cash_var is not None:
-            cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
-        else:
-            cash_assessment = cash_r.get("reason") or "Insufficient data."
-        recon_rows.append({
-            "check":          "Cash position",
-            "observed_str":   _fmt_kes(int(cash_r.get("total_bank_kes", 0) * 100)),
-            "observed_sub":   "Bank accounts at fiscal year-end",
-            "declared_str":   _fmt_kes(int(cash_r.get("total_declared_kes", 0) * 100)),
-            "declared_sub":   "Note 11 · cash and equivalents",
-            "variance_str":   f"{cash_var:.1f}%" if cash_var is not None else "--",
-            "variance_class": _BADGE_VARIANCE_CLASS[cash_badge[0]],
-            "badge_class":    cash_badge[0],
-            "badge_label":    cash_badge[1],
-            "assessment":     cash_assessment,
-        })
-
-        # Revenue
-        rev_gap  = rev_r.get("gap_pct")
-        rev_text = rev_r.get("assessment") or ""
-        rev_status = (
-            "HEALTHY" if "HEALTHY" in rev_text
-            else ("ACCEPTABLE" if "WARNING" not in rev_text and "RISK" not in rev_text else "VARIANCE")
-        )
-        rev_badge = _status_to_badge(rev_status, coverage_incomplete)
-        rev_assessment = rev_text or "--"
-        if rev_badge[0] == "b-warn":
-            rev_assessment = f"{rev_assessment.rstrip('.')} {missing_note}"
-        recon_rows.append({
-            "check":        "Revenue",
-            "observed_str": _fmt_kes(int(rev_r.get("bank_inflows_kes", 0) * 100)),
-            "observed_sub": "Net operational inflows",
-            "declared_str": _fmt_kes(int(rev_r.get("declared_revenue_kes", 0) * 100)),
-            "declared_sub": "Declared turnover",
-            "variance_str": f"{rev_gap:.1f}% gap" if rev_gap is not None else "--",
-            "variance_class": _BADGE_VARIANCE_CLASS[rev_badge[0]],
-            "badge_class":  rev_badge[0],
-            "badge_label":  rev_badge[1],
-            "assessment":   rev_assessment,
-        })
-
-        # Expenses
-        exp_gap   = exp_r.get("gap_pct")
-        exp_badge = _status_to_badge("ACCEPTABLE" if abs(exp_gap or 0) <= 15 else "VARIANCE", coverage_incomplete)
-        exp_assessment = exp_r.get("explanation") or "--"
-        if exp_badge[0] == "b-warn":
-            exp_assessment = f"{exp_assessment.rstrip('.')} {missing_note}"
-        recon_rows.append({
-            "check":        "Expenses",
-            "observed_str": _fmt_kes(int(exp_r.get("bank_outflows_kes", 0) * 100)),
-            "observed_sub": "Net operational outflows",
-            "declared_str": _fmt_kes(int(exp_r.get("declared_expenses_kes", 0) * 100)),
-            "declared_sub": "Total declared expenses",
-            "variance_str": f"{exp_gap:.1f}% gap" if exp_gap is not None else "--",
-            "variance_class": _BADGE_VARIANCE_CLASS[exp_badge[0]],
-            "badge_class":  exp_badge[0],
-            "badge_label":  exp_badge[1],
-            "assessment":   exp_assessment,
-        })
-
-        # Loan activity
-        loan_var    = loan_r.get("variance_pct")
-        loan_status = loan_r.get("status") or "VARIANCE"
-        loan_badge  = _status_to_badge(loan_status, coverage_incomplete)
-        if loan_status == "EXACT_MATCH":
-            loan_assessment = "Net borrowing matches cashflow statement exactly."
-        elif loan_var is not None:
-            loan_assessment = f"{abs(loan_var):.1f}% variance — review facility discrepancy."
-        else:
-            loan_assessment = loan_r.get("reason") or "Insufficient data."
-        if loan_badge[0] == "b-warn":
-            loan_assessment = f"{loan_assessment.rstrip('.')} {missing_note}"
-        recon_rows.append({
-            "check":        "Loan activity",
-            "observed_str": _fmt_kes(int(loan_r.get("bank_net_borrowing_kes", 0) * 100)),
-            "observed_sub": "Net borrowings · bank-detected",
-            "declared_str": _fmt_kes(int(loan_r.get("declared_net_borrowing_kes", 0) * 100)),
-            "declared_sub": "Cashflow statement · Note 14",
-            "variance_str": f"{loan_var:.1f}%" if loan_var is not None else "0%",
-            "variance_class": _BADGE_VARIANCE_CLASS[loan_badge[0]],
-            "badge_class":  loan_badge[0],
-            "badge_label":  loan_badge[1],
-            "assessment":   loan_assessment,
-        })
+    # ── 4-Point Reconciliation — PAR-189 Stage 9 ─────────────────────────────
+    # Now computed by build_snapshot_context()
+    # (shared_ctx["four_point_reconciliation"]) rather than inline here. All
+    # four rows, their per-row status derivations and their assessment prose
+    # moved into _build_four_point_reconciliation(); only the badge/variance
+    # CSS classes and the per-row variance formatting stayed on this side, in
+    # _four_point_recon_ctx_from(), since they are presentation.
+    #
+    # This also retires the renderer's own missing_bank_names /
+    # coverage_incomplete / missing_note derivation: 4-Point Reconciliation
+    # was its last consumer, and build_snapshot_context() has computed the
+    # same values since Stage 1. See that builder's docstring for the four
+    # fidelity points preserved (notably: cash position is deliberately NOT
+    # coverage-softened, and each row derives its status differently).
+    _recon_ctx = _four_point_recon_ctx_from(shared_ctx["four_point_reconciliation"])
+    recon_rows: List[Dict] = _recon_ctx["recon_rows"]
+    recon_fiscal_note: str = _recon_ctx["recon_fiscal_note"]
 
     # ── Loan facilities table (recon state) + Loan Activity Detected ─────────
     # PAR-189 Stage 4: both now come from build_snapshot_context()'s single
     # LoanActivity (shared_ctx["loans"]) — see _loan_activity_ctx_from() above.
-    # coverage_incomplete (still computed below, unchanged) stays needed
-    # locally for the not-yet-extracted 4-Point Reconciliation badges.
+    # (The note that used to sit here about coverage_incomplete still being
+    # needed locally for 4-Point Reconciliation is obsolete as of Stage 9 —
+    # that section is extracted and the local derivation is gone.)
     loan_ctx: Dict[str, Any] = _loan_activity_ctx_from(shared_ctx["loans"])
 
     # ── Inventory Analysis (PAR-63, recon state only) ────────────────────────

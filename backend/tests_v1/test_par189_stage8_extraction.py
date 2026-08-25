@@ -34,7 +34,7 @@ from v1.analysis.snapshot_context import (
 )
 from v1.analysis.snapshot_html_renderer import (
     _account_coverage_ctx_from,
-    _fmt_coverage_pct,
+    _fmt_pct_1dp,
     _risk_assessment_ctx_from,
 )
 
@@ -235,7 +235,7 @@ def test_coverage_pct_round_trip_matches_original_for_every_possible_value():
     for bp in range(0, 10001):
         raw_pct = round(bp / 100, 2)
         expected = f"{raw_pct:.1f}"
-        assert _fmt_coverage_pct(Percent(value=raw_pct / 100)) == expected, (
+        assert _fmt_pct_1dp(Percent(value=raw_pct / 100)) == expected, (
             f"coverage_pct={raw_pct} formatted wrongly"
         )
         if f"{raw_pct / 100 * 100:.1f}" != expected:
