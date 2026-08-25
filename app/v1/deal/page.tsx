@@ -29,7 +29,7 @@ import {
   getLatestAnalysis,
 } from '@/lib/v1-api';
 import type { DealListItem } from '@/lib/v1-api';
-import { useDealsListQuery, useDealDetailQuery, useDealDocumentsQuery, dealDocumentsKey } from '@/lib/queries/deals';
+import { useDealsListQuery, useDealDetailQuery, useDealDocumentsQuery, dealDocumentsKey, dealDetailKey, dealsListKey } from '@/lib/queries/deals';
 import { BatchUpload } from '@/components/BatchUpload';
 import DocumentsTab from '@/components/deal-tabs/DocumentsTab';
 import AnalysisTab from '@/components/deal-tabs/AnalysisTab';
@@ -609,6 +609,11 @@ function V1DealPageInner() {
         creditScoringInputs: csi,
       };
       queryClient.setQueryData(rehydrationKey(activeDeal.id), rehydrationResult);
+      // A run changes deal status/pipeline stage — refresh the detail cache and
+      // the dashboard list (which reads the same status) instead of leaving
+      // them stale for the rest of the (now unbounded) cache lifetime.
+      queryClient.invalidateQueries({ queryKey: dealDetailKey(activeDeal.id) });
+      queryClient.invalidateQueries({ queryKey: dealsListKey(userId) });
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : 'Analysis failed');
       setAnalysisState('error');
@@ -709,6 +714,7 @@ function V1DealPageInner() {
       // Re-export writes a fresh snapshot server-side — invalidate so a later
       // revisit refetches instead of serving the pre-export cache.
       queryClient.invalidateQueries({ queryKey: rehydrationKey(deal.id) });
+      queryClient.invalidateQueries({ queryKey: dealDetailKey(deal.id) });
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed');
       setAnalysisState('done');
@@ -940,7 +946,10 @@ function V1DealPageInner() {
               onRequestParser={setUnknownParserDoc}
               analysisState={analysisState}
               onBankDrop={handleBankDrop}
-              onRemoveStatement={(id) => setStatementQueue((prev) => prev.filter((q) => q.id !== id))}
+              onRemoveStatement={(id) => {
+                setStatementQueue((prev) => prev.filter((q) => q.id !== id));
+                if (deal) queryClient.invalidateQueries({ queryKey: dealDocumentsKey(deal.id) });
+              }}
               auditedFinancialsList={auditedFinancialsList}
               declarationType={declarationType}
               setDeclarationType={setDeclarationType}
