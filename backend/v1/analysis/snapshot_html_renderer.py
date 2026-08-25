@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import uuid
-from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +15,6 @@ import qrcode
 from jinja2 import Environment, FileSystemLoader
 from qrcode.image.svg import SvgImage
 
-from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cashflow
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from .snapshot_context import (
@@ -25,9 +23,11 @@ from .snapshot_context import (
     FourPointReconciliation as _FourPointReconciliation,
     InterAccountTransfer as _InterAccountTransfer,
     Inventory as _Inventory,
+    KeyMetrics as _KeyMetrics,
     LoanActivity as _LoanActivity,
     Money as _Money,
     MonthlyCashflow as _MonthlyCashflow,
+    ObservedPatterns as _ObservedPatterns,
     Percent as _Percent,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
@@ -47,8 +47,6 @@ MONTH_ABBR = {
     "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
     "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
 }
-
-REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
 
 # PAR-189 Stage 7: _BANK_ALIASES / _bank_label moved to
 # _snapshot_fetch_helpers.py (unchanged) so snapshot_context.py can share them
@@ -491,6 +489,101 @@ def _monthly_cashflow_ctx_from(mc: _MonthlyCashflow) -> Dict[str, Any]:
     }
 
 
+def _key_metrics_ctx_from(km: _KeyMetrics) -> List[Dict[str, Any]]:
+    # pbt_margin / income_quality / cash_trend.yoy are all live-computed, not
+    # pre-rounded upstream — re-multiplying their stored 0-1 Percent by 100
+    # measured zero divergence against the original's direct float (400,000+
+    # realistic random cases across .1f/.2f/+.1f formatting, PAR-189 Stage 11
+    # report). loan_variance / revenue_gap ARE pre-rounded upstream (sourced
+    # from recon_section, same class of field as the 4-Point Reconciliation
+    # variances) and use _fmt_pct_1dp() accordingly, same as that precedent —
+    # not reformatted with a plain f-string.
+    avg_rev_cell = {
+        "label": "Avg monthly revenue",
+        "value": _fmt_kes_compact(km.avg_monthly_revenue.cents),
+        "sub":   f"{km.avg_monthly_revenue.currency} · operational inflows",
+        "color_class": "",
+    }
+
+    if km.available:
+        loan_var_str = (
+            f"{_fmt_pct_1dp(km.loan_variance)}% var" if km.loan_variance is not None else "0% var"
+        )
+        rev_gap_str = f"{_fmt_pct_1dp(km.revenue_gap)}%" if km.revenue_gap is not None else "--"
+        return [
+            avg_rev_cell,
+            {
+                "label": "PBT margin",
+                "value": f"{km.pbt_margin.value * 100:.2f}%",
+                "sub":   f"vs declared turnover · FY{km.financial_year}",
+                "color_class": "positive" if km.pbt_margin_positive else "negative",
+            },
+            {
+                "label": "Loan reconciliation",
+                "value": loan_var_str,
+                "sub":   f"{km.loan_status or ''} · Note 14",
+                "color_class": "warning",
+            },
+            {
+                "label": "Revenue gap",
+                "value": rev_gap_str,
+                "sub":   "observed vs declared · accrual basis",
+                "color_class": "warning" if km.revenue_gap_high else "",
+            },
+        ]
+
+    ct = km.cash_trend
+    if ct is not None and ct.first_balance is not None:
+        cash_trend_str = f"{ct.yoy.value * 100:+.1f}%" if ct.yoy is not None else "--"
+        cash_trend_sub = (
+            f"{ct.first_balance.currency} {ct.first_balance.cents / 100:,.0f} → "
+            f"{ct.last_balance.cents / 100:,.0f} YoY"
+        )
+        cash_trend_positive = bool(ct.yoy_positive)
+    else:
+        cash_trend_str = "--"
+        cash_trend_sub = "balance data unavailable"
+        cash_trend_positive = False
+
+    return [
+        avg_rev_cell,
+        {
+            "label": "Income quality",
+            "value": f"{km.income_quality.value * 100:.1f}%",
+            "sub":   "operational vs total inflows",
+            "color_class": "positive" if km.income_quality_high else "warning",
+        },
+        {
+            "label": "Loan obligations",
+            "value": f"{km.loan_repayment_freq_per_month:.1f}/mo",
+            "sub":   f"repayments · {km.loan_repayment_txn_count} txns detected",
+            "color_class": "warning",
+        },
+        {
+            "label": "Cash trend",
+            "value": cash_trend_str,
+            "sub":   cash_trend_sub,
+            "color_class": "positive" if cash_trend_positive else "warning",
+        },
+    ]
+
+
+def _observed_patterns_ctx_from(op: _ObservedPatterns) -> List[Dict[str, Any]]:
+    _TAG_CLASS  = {"Watch": "t-wat", "Observed": "t-chk", "Pattern": "t-pat", "Coverage": "t-chk"}
+    _ITEM_CLASS = {"Watch": "watch", "Observed": "check", "Pattern": "pattern", "Coverage": "check"}
+    return [
+        {
+            "name": p.name,
+            "tag": p.tag,
+            "tag_class": _TAG_CLASS[p.tag],
+            "item_class": _ITEM_CLASS[p.tag],
+            "data_statement": p.data_statement,
+            "check_prompt": p.check_prompt,
+        }
+        for p in op.patterns
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -558,13 +651,16 @@ def render_snapshot_html(
         .execute()
         .data or []
     )
-    credit_scoring_inputs_list: List[Dict] = []
     doc_pills: List[Dict] = []
     # PAR-189 Stage 7: the document_id -> detected-bank-label map that used to
     # be built here existed solely to name each side of an Inter-Account
     # Transfer pair. That section now builds its own from its own
     # pds_documents fetch inside build_snapshot_context(), so the map is no
     # longer accumulated here — bank_name below still feeds the doc pill label.
+    # PAR-189 Stage 11: the credit_scoring_inputs_list this loop used to also
+    # accumulate (for Observed Patterns' "Tax payment gap" card) is gone too
+    # — build_snapshot_context() derives its own copy from its own widened
+    # pds_documents fetch (the same one Inter-Account Transfer already does).
 
     for doc in docs:
         analytics = doc.get("analytics") or {}
@@ -581,10 +677,6 @@ def render_snapshot_html(
                     break
         label = f"{bank_name or 'Bank'} · {txn_count:,} txns"
         doc_pills.append({"label": label, "active": True})
-
-        cs = analytics.get("credit_scoring_inputs") or {}
-        if cs:
-            credit_scoring_inputs_list.append(cs)
 
     # 3b. Monthly cashflow + inflow/outflow composition — sourced from the
     # sealed canonical_json (canon_tagged below), via the exact same
@@ -619,16 +711,13 @@ def render_snapshot_html(
             "txn_id": txn_id,
         })
 
-    monthly_merged: Dict[str, Dict[str, int]] = {
-        row["month"]: {"inflow_cents": row["inflow_cents"], "outflow_cents": row["outflow_cents"]}
-        for row in _monthly_cashflow(canon_tagged)
-    }
-
     # 4. Audited financials (optional — sets recon_available)
     af_result = (
         sb.table("pds_audited_financials")
+        # PAR-189 Stage 11: turnover_cents/profit_before_tax_cents dropped —
+        # only Key Metrics read them, and it's fully extracted now.
         .select(
-            "loan_breakdown, turnover_cents, profit_before_tax_cents, financial_year, "
+            "loan_breakdown, financial_year, "
             "inventory_cents, cost_of_sales_cents, extraction_confidence"
         )
         .eq("deal_id", deal_id)
@@ -690,116 +779,28 @@ def render_snapshot_html(
     # build_snapshot_context() resolves the same value from the same
     # recon_section. recon_section itself is still needed locally below.
 
-    # ── Active period ──────────────────────────────────────────────────────
-    # Drives every "this period" filter below (avg revenue, loan frequency,
-    # cashflow rows/notes). When an audited financial year is declared, scope
-    # to that calendar year. Otherwise there's no real "year" to scope to —
-    # bank-statement-only deals commonly submit a 12-13 month trailing
-    # lookback that crosses a calendar year boundary (e.g. Jan 2025-Jan
-    # 2026), so filtering by max(txn_years) would keep only the trailing
-    # partial year and silently drop every other month. Include every month
-    # present instead.
-    if recon_available and af.get("financial_year"):
-        active_year = str(af["financial_year"])
-        _in_active_period = lambda m: m.startswith(f"{active_year}-")
-    else:
-        active_year = ""
-        _in_active_period = lambda m: True
+    # ── Active period / Computed metrics (PAR-189 Stage 11 — retired) ────────
+    # This block used to derive the "this period" filter (active_year /
+    # _in_active_period) plus avg revenue, inflow/outflow role sums, income
+    # quality, loan repayment frequency, cash trend, and needs-review count —
+    # feeding Key Metrics and Observed Patterns, the last two sections. Both
+    # are now built by build_snapshot_context() (_build_key_metrics() /
+    # _build_observed_patterns() in snapshot_context.py), which does its own
+    # independent recompute of every one of these from its own
+    # txns/canon_tagged/in_active_period, so nothing here has a remaining
+    # reader. Removed rather than left as dead code — see the Stage 11 report
+    # for the by_role_out/total_out finding (already-unused before this
+    # stage, swept away as a direct consequence, not scope creep).
 
-    # ── Computed metrics ──────────────────────────────────────────────────────
-
-    # Avg monthly revenue
-    by_month_rev: Dict[str, int] = defaultdict(int)
-    for t in txns:
-        if t["signed"] > 0 and t["role"] in REVENUE_ROLES:
-            m = (t["txn_date"] or "")[:7]
-            if _in_active_period(m):
-                by_month_rev[m] += t["signed"]
-    avg_rev_cents = (
-        int(sum(by_month_rev.values()) / len(by_month_rev)) if by_month_rev else 0
-    )
-
-    # Inflow composition — CASHFLOW_INFLOW_ROLES include-list, the same
-    # definition monthly_merged above and the live endpoint use (see the
-    # "Monthly cashflow" comment above for why this used to be a third,
-    # independent, exclude-list-based total that didn't match either).
-    by_role_in: Dict[str, int] = defaultdict(int)
-    total_in = 0
-    for t in canon_tagged:
-        if t["amount_cents"] > 0 and t["role"] in CASHFLOW_INFLOW_ROLES:
-            by_role_in[t["role"]] += t["amount_cents"]
-            total_in += t["amount_cents"]
-
-    # Outflow composition — every negative transaction counts, no role
-    # exclusions, matching the live endpoint's definition exactly.
-    by_role_out: Dict[str, int] = defaultdict(int)
-    total_out = 0
-    for t in canon_tagged:
-        if t["amount_cents"] < 0:
-            amt = abs(t["amount_cents"])
-            by_role_out[t["role"]] += amt
-            total_out += amt
-
-    # Income quality
-    op_in = sum(v for k, v in by_role_in.items() if k in REVENUE_ROLES)
-    income_quality_pct = (op_in / total_in * 100) if total_in else 0
-
-    # Loan repayment frequency (active year)
-    repay_months: Dict[str, int] = defaultdict(int)
-    for t in txns:
-        if t["role"] == "loan_repayment" and t["signed"] < 0:
-            m = (t["txn_date"] or "")[:7]
-            if _in_active_period(m):
-                repay_months[m] += 1
-    loan_freq = (
-        sum(repay_months.values()) / len(repay_months) if repay_months else 0
-    )
-    loan_repayment_txn_count = sum(1 for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0)
-
-    # PAR-189 Stage 4: loan_disbursed_cents/loan_repaid_cents/loan_net_cents
-    # used to be computed here — now sourced from build_snapshot_context()
-    # (shared_ctx["loans"]) via _loan_activity_ctx_from(). loan_freq /
-    # loan_repayment_txn_count stay computed below (unchanged) because Key
-    # Metrics (not yet extracted) still reads them directly.
-
-    # Cash trend (null-safe — balance_cents may be null for pre-migration rows)
-    bal_txns = sorted(
-        [t for t in txns if t["balance"] is not None],
-        key=lambda x: x["txn_date"] or "",
-    )
-    if bal_txns:
-        first_bal = bal_txns[0]["balance"]
-        last_bal  = bal_txns[-1]["balance"]
-        yoy_pct   = ((last_bal - first_bal) / abs(first_bal) * 100) if first_bal else None
-        cash_trend_str = f"{yoy_pct:+.1f}%" if yoy_pct is not None else "--"
-        cash_trend_sub = f"{currency} {first_bal/100:,.0f} → {last_bal/100:,.0f} YoY"
-    else:
-        cash_trend_str = "--"
-        cash_trend_sub = "balance data unavailable"
-
-    # Needs-review count
-    needs_review_count = sum(1 for t in txns if t["role"] == "needs_review")
-
-    # Tax Payment Pattern (PAR-189 Stage 6: computation now lives in
-    # build_snapshot_context() — see _tax_payment_pattern_ctx_from() above).
-
-    # ── Monthly Cashflow (PAR-63 + PAR-189 Stage 10) ──────────────────────────
+    # ── Monthly Cashflow (PAR-63 + PAR-189 Stage 10/11) ───────────────────────
     # cashflow_note / cashflow_trend_note / cashflow_peak_trough_note /
-    # cashflow_rows_ctx now come from build_snapshot_context() — see
+    # cashflow_rows_ctx come from build_snapshot_context() — see
     # _build_monthly_cashflow() in snapshot_context.py and
-    # _monthly_cashflow_ctx_from() above.
-    #
-    # period_months / neg_months stay computed locally (unchanged formula) —
-    # the not-yet-extracted Observed Patterns section below still reads both
-    # directly. Cheap re-derivation from the same monthly_merged/canon_tagged
-    # single source, same accepted-duplication precedent as Stage 9's
-    # kms/recon_rows finding — not a hidden coupling back onto Monthly
-    # Cashflow's shared-context builder.
-    period_months = sorted(m for m in monthly_merged if _in_active_period(m))
-    neg_months = sorted(
-        m for m in period_months
-        if (monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]) < 0
-    )
+    # _monthly_cashflow_ctx_from() above. period_months/neg_months, the last
+    # local residual this section carried for Observed Patterns' benefit, is
+    # gone too as of Stage 11 — Observed Patterns now recomputes its own
+    # copy independently inside its own builder, same pattern as everything
+    # else, not read from here.
     monthly_cashflow_ctx = _monthly_cashflow_ctx_from(shared_ctx["monthly_cashflow"])
     cashflow_note = monthly_cashflow_ctx["cashflow_note"]
     cashflow_trend_note = monthly_cashflow_ctx["cashflow_trend_note"]
@@ -858,93 +859,25 @@ def render_snapshot_html(
 
     total_txn_count = len(txns)
 
-    # ── Key metrics (4 cells, different per state) ───────────────────────────
-    if recon_available:
-        turnover_cents = int(af.get("turnover_cents") or 0)
-        pbt_cents      = int(af.get("profit_before_tax_cents") or 0)
-        pbt_margin     = (pbt_cents / turnover_cents * 100) if turnover_cents > 0 else 0
-
-        loans_r = recon_section.get("loan_activity") or {}
-        loan_var_pct = loans_r.get("variance_pct")
-        loan_var_str = (
-            f"{abs(loan_var_pct):.1f}% var" if loan_var_pct is not None else "0% var"
-        )
-
-        rev_r    = recon_section.get("revenue") or {}
-        rev_gap  = rev_r.get("gap_pct")
-        rev_gap_str = f"{rev_gap:.1f}%" if rev_gap is not None else "--"
-
-        kms = [
-            {
-                "label": "Avg monthly revenue",
-                "value": _fmt_kes_compact(avg_rev_cents),
-                "sub":   f"{currency} · operational inflows",
-                "color_class": "",
-            },
-            {
-                "label": "PBT margin",
-                "value": f"{pbt_margin:.2f}%",
-                "sub":   f"vs declared turnover · FY{fy}",
-                "color_class": "positive" if pbt_margin > 0 else "negative",
-            },
-            {
-                "label": "Loan reconciliation",
-                "value": loan_var_str,
-                "sub":   f"{loans_r.get('status', '')} · Note 14",
-                "color_class": "warning",
-            },
-            {
-                "label": "Revenue gap",
-                "value": rev_gap_str,
-                "sub":   "observed vs declared · accrual basis",
-                "color_class": "warning" if (rev_gap or 0) > 15 else "",
-            },
-        ]
-    else:
-        kms = [
-            {
-                "label": "Avg monthly revenue",
-                "value": _fmt_kes_compact(avg_rev_cents),
-                "sub":   f"{currency} · operational inflows",
-                "color_class": "",
-            },
-            {
-                "label": "Income quality",
-                "value": f"{income_quality_pct:.1f}%",
-                "sub":   "operational vs total inflows",
-                "color_class": "positive" if income_quality_pct >= 70 else "warning",
-            },
-            {
-                "label": "Loan obligations",
-                "value": f"{loan_freq:.1f}/mo",
-                "sub":   f"repayments · {loan_repayment_txn_count} txns detected",
-                "color_class": "warning",
-            },
-            {
-                "label": "Cash trend",
-                "value": cash_trend_str,
-                "sub":   cash_trend_sub,
-                "color_class": "positive" if cash_trend_str.startswith("+") else "warning",
-            },
-        ]
+    # ── Key metrics (4 cells, different per state) — PAR-189 Stage 11 ────────
+    # Now computed by build_snapshot_context() (shared_ctx["key_metrics"])
+    # rather than inline here. See _build_key_metrics() in snapshot_context.py
+    # for the per-field round-trip-bug audit; only cell shape/color mapping
+    # stays on this side, in _key_metrics_ctx_from() above.
+    kms = _key_metrics_ctx_from(shared_ctx["key_metrics"])
 
     # ── Composition segments ─────────────────────────────────────────────────
     # PAR-189 Stage 5: computation now lives in build_snapshot_context() — see
-    # _composition_ctx_from() above. by_role_in/total_in/by_role_out/total_out
-    # (computed above, unchanged) stay needed locally: Key Metrics'
-    # income_quality_pct (not yet extracted) already used them before this
-    # block even ran. mpesa_cents/mpesa_pct specifically are recomputed as a
-    # small residual below because the not-yet-extracted Observed Patterns
-    # "M-Pesa concentration" card still reads mpesa_pct directly.
+    # _composition_ctx_from() above. The by_role_in/total_in/mpesa_pct
+    # residual this section used to carry for Key Metrics and Observed
+    # Patterns is gone as of Stage 11 — both now recompute their own copies
+    # independently inside their own builders.
     inflow_composition_ctx = _composition_ctx_from(shared_ctx["inflow"])
     outflow_composition_ctx = _composition_ctx_from(shared_ctx["outflow"])
     inflow_segments = inflow_composition_ctx["segments"]
     outflow_segments = outflow_composition_ctx["segments"]
     inflow_warn = inflow_composition_ctx["warn"]
     outflow_warn = outflow_composition_ctx["warn"]
-
-    mpesa_cents = by_role_in.get("mpesa_inflow", 0)
-    mpesa_pct   = (mpesa_cents / total_in * 100) if total_in else 0
 
     # ── Supplier Payment Analysis (PAR-63) ────────────────────────────────────
     # PAR-189 Stage 1: computation now lives in build_snapshot_context()
@@ -963,40 +896,12 @@ def render_snapshot_html(
 
     # ── Tax Compliance Analysis (PAR-63) ──────────────────────────────────────
     # PAR-189 Stage 2: the tax-specific part of this computation now lives in
-    # build_snapshot_context() — see _tax_compliance_ctx_from() above. What
-    # stays here is a reduced version of the original single-pass loop, kept
-    # ONLY for payroll_stability_live / n_payroll_months / n_total_months,
-    # which the not-yet-extracted "Irregular payroll" Observed Pattern card
-    # below still reads. The original loop also accumulated tax_months_active
-    # / tax_total_cents_active / tax_txn_count_active in the same pass — that
-    # part moved into build_snapshot_context()'s _build_tax_compliance() and
-    # is intentionally NOT recomputed here.
+    # build_snapshot_context() — see _tax_compliance_ctx_from() above. Its
+    # last residual here — payroll_stability_live / n_payroll_months /
+    # n_total_months, kept for the "Irregular payroll" Observed Pattern card
+    # — is gone as of Stage 11: Observed Patterns recomputes its own copy
+    # independently inside _build_observed_patterns() now.
     tax_compliance_ctx: Dict[str, Any] = _tax_compliance_ctx_from(shared_ctx["tax_compliance"])
-
-    all_months_active: set = set()
-    payroll_months_active: set = set()
-    for t in txns:
-        m = (t["txn_date"] or "")[:7]
-        if t["txn_date"] and _in_active_period(m):
-            all_months_active.add(m)
-            if t["role"] == "payroll":
-                payroll_months_active.add(m)
-
-    n_total_months = len(all_months_active)
-    n_payroll_months = len(payroll_months_active)
-
-    # Mirrors backend/v1/analytics.py::credit_scoring_inputs()'s own
-    # payroll_stability thresholds (consistent/mostly-consistent/irregular
-    # cutoffs) — same classification, recomputed live over this render's
-    # txns/active-period instead of read from the stale cached blob.
-    if n_total_months == 0 or n_payroll_months == 0:
-        payroll_stability_live = "NOT_DETECTED"
-    elif n_payroll_months == n_total_months:
-        payroll_stability_live = "CONSISTENT"
-    elif n_payroll_months >= n_total_months * 8 // 10:
-        payroll_stability_live = "MOSTLY_CONSISTENT"
-    else:
-        payroll_stability_live = "IRREGULAR"
 
     # ── Inter-Account Transfer Analysis — PAR-189 Stage 7 ────────────────────
     # Now computed by build_snapshot_context() (shared_ctx["inter_account_transfer"])
@@ -1016,66 +921,15 @@ def render_snapshot_html(
         shared_ctx["tax_payment_pattern"]
     )
 
-    # ── Pattern cards ─────────────────────────────────────────────────────────
-    _TAG_CLASS  = {"Watch": "t-wat", "Observed": "t-chk", "Pattern": "t-pat", "Coverage": "t-chk"}
-    _ITEM_CLASS = {"Watch": "watch", "Observed": "check", "Pattern": "pattern", "Coverage": "check"}
-
-    patterns: List[Dict] = []
-
-    if mpesa_pct > 40:
-        tag = "Watch"
-        patterns.append({
-            "name": "M-Pesa concentration",
-            "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-            "data_statement": f"M-Pesa inflows represent {mpesa_pct:.1f}% of total observed inflows",
-            "check_prompt": "→ Review: consistent with declared customer mix and B2B model?",
-        })
-
-    for cs in credit_scoring_inputs_list:
-        if cs.get("kra_compliance") == "GAPS_DETECTED":
-            tag = "Observed"
-            patterns.append({
-                "name": "Tax payment gap",
-                "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-                "data_statement": cs.get("kra_note") or "Tax payment gaps detected",
-                "check_prompt": "→ Review: gap months explained by filing schedule or missed payments?",
-            })
-            break
-
-    # PAR-100: payroll_stability_live/n_payroll_months/n_total_months are all
-    # computed above from the single live pass over txns (same block as Tax
-    # Compliance Analysis) — no cached credit_scoring_inputs field used here.
-    if payroll_stability_live == "IRREGULAR":
-        tag = "Pattern"
-        patterns.append({
-            "name": "Irregular payroll",
-            "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-            "data_statement": f"Payroll detected in {n_payroll_months} of {n_total_months} months",
-            "check_prompt": "→ Review: casual workforce or payroll routed off-statement?",
-        })
-
-    if len(neg_months) > 2:
-        label_months = ", ".join(
-            MONTH_ABBR.get(m[5:7], m[5:7]) for m in neg_months[:3]
-        ) + ("..." if len(neg_months) > 3 else "")
-        tag = "Pattern"
-        patterns.append({
-            "name": "Net-negative months",
-            "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-            "data_statement": f"{len(neg_months)} of {len(period_months)} months net-negative: {label_months}",
-            "check_prompt": "→ Review: seasonal pattern or sustained cash drain?",
-        })
-
-    if needs_review_count > 100:
-        tag = "Coverage"
-        patterns.append({
-            "name": "Analyst classification pending",
-            "tag": tag, "tag_class": _TAG_CLASS[tag], "item_class": _ITEM_CLASS[tag],
-            "data_statement": f"{needs_review_count} transactions flagged needs_review",
-            "check_prompt": "→ Review: resolve in Parity dashboard before finalising snapshot.",
-        })
-
-    patterns = patterns[:5]
+    # ── Pattern cards — PAR-189 Stage 11 ──────────────────────────────────────
+    # Now computed by build_snapshot_context() (shared_ctx["observed_patterns"])
+    # rather than inline here. This was the last section — see
+    # _build_observed_patterns() in snapshot_context.py for the independent
+    # recompute of every raw aggregate it needs (mpesa_pct, neg_months/
+    # period_months, payroll_stability_live and friends, needs_review_count),
+    # none of which is read from this file anymore. Only tag/item CSS class
+    # mapping stays on this side, in _observed_patterns_ctx_from() above.
+    patterns = _observed_patterns_ctx_from(shared_ctx["observed_patterns"])
 
     # ── 4-Point Reconciliation — PAR-189 Stage 9 ─────────────────────────────
     # Now computed by build_snapshot_context()
