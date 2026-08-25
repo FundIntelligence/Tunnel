@@ -341,6 +341,114 @@ class MonthlyCashflow:
 
 
 @dataclass(frozen=True)
+class KeyMetricsConfig:
+    """
+    Both thresholds were hardcoded in the original inline logic; pulled into
+    named config per PAR-189 ratified decision #4. Neither is flagged in the
+    original as borrowed/unratified, so no PENDING SIGN-OFF caveat applies —
+    same footing as TaxComplianceConfig.
+
+    income_quality_threshold is a 0-1 fraction (schema convention). Revenue
+    gap deliberately is NOT: rev_gap arrives already rounded to hundredths
+    from reconciliation_engine (same class of pre-rounded upstream as the
+    4-Point Reconciliation variances Stage 9 found), and the >15 comparison
+    in the original runs on that raw, un-round-tripped value. Keeping the
+    threshold in the same percentage-point units the comparison actually
+    happens in avoids ever needing to round-trip a config value through
+    Percent just to compare it — see _build_key_metrics for where the
+    decision is made once, on the raw value, and carried as a plain bool.
+    """
+    income_quality_threshold: float = 0.70
+    revenue_gap_warning_threshold_pct: float = 15.0
+
+
+DEFAULT_KEY_METRICS_CONFIG = KeyMetricsConfig()
+
+
+@dataclass(frozen=True)
+class CashTrend:
+    """
+    None fields distinguish two genuinely different original states, not one:
+    `first_balance is None` -> no balance-bearing transactions at all
+    ("balance data unavailable"). `first_balance` set but `yoy is None` ->
+    balance data exists but the opening balance was exactly 0, so a
+    year-over-year percent is mathematically undefined (division by zero
+    guarded in the original) — the sub-line still renders real balances in
+    that case, only the headline percent shows "--". Both are real original
+    branches, preserved as two independently-nullable signals rather than
+    one flattened availability flag.
+    """
+    yoy: Optional[Percent] = None          # live-computed (NOT pre-rounded upstream) — safe to re-multiply for display
+    yoy_positive: Optional[bool] = None    # decided on the raw, unrounded yoy fraction; mirrors yoy's nullness
+    first_balance: Optional[Money] = None
+    last_balance: Optional[Money] = None
+
+
+@dataclass(frozen=True)
+class KeyMetrics:
+    """
+    Two mutually exclusive branches gated by `available` (mirrors
+    recon_available), same pattern as FourPointReconciliation. Exactly one
+    of the two field groups below is populated per instance; the other's
+    fields stay None. avg_monthly_revenue is the one metric common to both
+    of the original's 4-cell layouts, so it lives outside either group.
+
+    Round-trip-bug audit (PAR-189 Stage 8/9 pattern), done per field, not
+    assumed clean or assumed broken:
+      - pbt_margin, income_quality: live-computed from raw cents each render,
+        never stored pre-rounded anywhere upstream. Multiplying a 0-1 Percent
+        back by 100 introduces no divergence here — there is no original
+        rounded value to diverge FROM. Rendered with a plain f-string, not
+        _fmt_pct_1dp().
+      - loan_variance, revenue_gap: sourced from recon_section (the sealed
+        reconciliation section) — the SAME pre-rounded-to-hundredths class of
+        field the 4-Point Reconciliation variances are. Rendered with
+        _fmt_pct_1dp() in the WeasyPrint adapter, matching that precedent
+        exactly, not reinventing a second fix for the same bug class.
+      - cash_trend.yoy: live-computed from raw balance cents, same footing as
+        pbt_margin/income_quality — not pre-rounded upstream.
+    Every threshold-driven bool below (pbt_margin_positive,
+    income_quality_high, revenue_gap_high, cash_trend.yoy_positive) is
+    decided in the builder directly from the RAW, un-round-tripped value,
+    never re-derived from the stored Percent downstream — so even the
+    live-computed fields carry zero round-trip risk for their color/badge
+    decisions, not just their display text.
+    """
+    available: bool
+    avg_monthly_revenue: Money
+
+    # recon_available branch
+    pbt_margin: Optional[Percent] = None
+    pbt_margin_positive: Optional[bool] = None
+    financial_year: Optional[str] = None
+    loan_variance: Optional[Percent] = None
+    loan_status: Optional[str] = None
+    revenue_gap: Optional[Percent] = None
+    revenue_gap_high: Optional[bool] = None
+
+    # not-available (observed-only) branch
+    income_quality: Optional[Percent] = None
+    income_quality_high: Optional[bool] = None
+    loan_repayment_freq_per_month: Optional[float] = None
+    loan_repayment_txn_count: Optional[int] = None
+    cash_trend: Optional[CashTrend] = None
+
+
+@dataclass(frozen=True)
+class ObservedPattern:
+    key: str              # stable id — renderer owns tag/item CSS classes, per design doc §2
+    name: str
+    tag: Literal["Watch", "Observed", "Pattern", "Coverage"]
+    data_statement: str
+    check_prompt: str
+
+
+@dataclass(frozen=True)
+class ObservedPatterns:
+    patterns: List[ObservedPattern]   # already capped at 5, in original priority order
+
+
+@dataclass(frozen=True)
 class TransferPair:
     """
     One detected self-transfer route between two of the company's own accounts.
@@ -542,16 +650,18 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
     Minimal txn fetch for the sections covered so far: txn_date, role,
     signed amount, abs amount, descriptor, entity_id. Mirrors
     render_snapshot_html()'s txns list construction exactly (same
-    null-safe abs derivation) but skips the balance column, which none of
-    these sections read. Stage 6 added normalized_descriptor (-> "desc") for
-    Tax Payment Pattern's penalty-keyword detection. Stage 7 added "id",
+    null-safe abs derivation). Stage 6 added normalized_descriptor (-> "desc")
+    for Tax Payment Pattern's penalty-keyword detection. Stage 7 added "id",
     account_id and document_id, which Inter-Account Transfer Analysis needs to
     count distinct accounts and to name each side of a detected transfer pair.
+    Stage 11 added balance_cents (-> "balance", None-safe, matching the
+    renderer's own null-safe bal_txns filter), which Key Metrics' Cash Trend
+    needs and no earlier section did.
     """
     txn_rows = _paginate(
         sb, "pds_raw_transactions",
         "id, txn_date, signed_amount_cents, abs_amount_cents, normalized_descriptor, "
-        "account_id, document_id",
+        "balance_cents, account_id, document_id",
         deal_id,
     )
     map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
@@ -564,6 +674,7 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "signed": t["signed_amount_cents"] or 0,
         "abs": t["abs_amount_cents"] if t["abs_amount_cents"] is not None else abs(t["signed_amount_cents"] or 0),
         "desc": t["normalized_descriptor"] or "",
+        "balance": t.get("balance_cents"),
         "role": role_by_txn.get(t["id"], "other"),
         "entity_id": entity_id_by_txn.get(t["id"]),
         "account_id": t.get("account_id"),
@@ -891,6 +1002,241 @@ def _build_monthly_cashflow(
         peak_trough_note=peak_trough_note,
         rows=rows,
     )
+
+
+_REVENUE_ROLES = {"revenue_operational", "mpesa_inflow", "pesalink_inflow"}
+# Mirrors the value snapshot_html_renderer.REVENUE_ROLES held before Stage 11
+# — that module-level constant is now dead code there (Key Metrics/Observed
+# Patterns were its only readers) and was removed. This is the sole
+# remaining copy; no longer a "kept in sync by hand" duplication.
+
+
+def _build_key_metrics(
+    txns: List[Dict],
+    canon_tagged: List[Dict],
+    in_active_period,
+    recon_available: bool,
+    af: Dict,
+    recon_section: Dict,
+    currency: str,
+    config: KeyMetricsConfig = DEFAULT_KEY_METRICS_CONFIG,
+) -> KeyMetrics:
+    """
+    Key Metrics (PAR-189 Stage 11), transcribed from the original inline
+    "Key metrics (4 cells, different per state)" block in
+    render_snapshot_html(). See KeyMetrics' own docstring for the per-field
+    round-trip-bug audit — this function is where each of those decisions is
+    actually made, once, on raw values.
+    """
+    # Avg monthly revenue — common to both branches. Independent recompute of
+    # the renderer's own by_month_rev loop over the same txns/in_active_period.
+    by_month_rev: Dict[str, int] = defaultdict(int)
+    for t in txns:
+        if t["signed"] > 0 and t["role"] in _REVENUE_ROLES:
+            m = (t["txn_date"] or "")[:7]
+            if in_active_period(m):
+                by_month_rev[m] += t["signed"]
+    avg_rev_cents = (
+        int(sum(by_month_rev.values()) / len(by_month_rev)) if by_month_rev else 0
+    )
+    avg_monthly_revenue = Money(cents=avg_rev_cents, currency=currency)
+
+    if recon_available:
+        turnover_cents = int(af.get("turnover_cents") or 0)
+        pbt_cents = int(af.get("profit_before_tax_cents") or 0)
+        pbt_margin_raw = (pbt_cents / turnover_cents * 100) if turnover_cents > 0 else 0
+
+        loans_r = recon_section.get("loan_activity") or {}
+        loan_var_pct = loans_r.get("variance_pct")
+
+        rev_r = recon_section.get("revenue") or {}
+        rev_gap = rev_r.get("gap_pct")
+
+        return KeyMetrics(
+            available=True,
+            avg_monthly_revenue=avg_monthly_revenue,
+            pbt_margin=Percent(value=pbt_margin_raw / 100),
+            pbt_margin_positive=pbt_margin_raw > 0,
+            financial_year=str(af.get("financial_year") or ""),
+            loan_variance=(
+                Percent(value=abs(loan_var_pct) / 100) if loan_var_pct is not None else None
+            ),
+            loan_status=loans_r.get("status", ""),
+            revenue_gap=Percent(value=rev_gap / 100) if rev_gap is not None else None,
+            # Decided on the raw, pre-rounded rev_gap directly — never on a
+            # value that has been through the 0-1 Percent round trip. See
+            # KeyMetricsConfig's docstring for why the threshold stays in
+            # percentage-point units rather than becoming a 0-1 fraction.
+            revenue_gap_high=(rev_gap or 0) > config.revenue_gap_warning_threshold_pct,
+        )
+
+    # ── Not-available (observed-only) branch ─────────────────────────────────
+    by_role_in: Dict[str, int] = defaultdict(int)
+    total_in = 0
+    for t in canon_tagged:
+        if t["amount_cents"] > 0 and t["role"] in CASHFLOW_INFLOW_ROLES:
+            by_role_in[t["role"]] += t["amount_cents"]
+            total_in += t["amount_cents"]
+    op_in = sum(v for k, v in by_role_in.items() if k in _REVENUE_ROLES)
+    income_quality_raw = (op_in / total_in * 100) if total_in else 0
+
+    repay_months: Dict[str, int] = defaultdict(int)
+    for t in txns:
+        if t["role"] == "loan_repayment" and t["signed"] < 0:
+            m = (t["txn_date"] or "")[:7]
+            if in_active_period(m):
+                repay_months[m] += 1
+    loan_freq = sum(repay_months.values()) / len(repay_months) if repay_months else 0
+    loan_repayment_txn_count = sum(
+        1 for t in txns if t["role"] == "loan_repayment" and t["signed"] < 0
+    )
+
+    bal_txns = sorted(
+        [t for t in txns if t.get("balance") is not None],
+        key=lambda x: x["txn_date"] or "",
+    )
+    if bal_txns:
+        first_bal = bal_txns[0]["balance"]
+        last_bal = bal_txns[-1]["balance"]
+        yoy_pct = ((last_bal - first_bal) / abs(first_bal) * 100) if first_bal else None
+        cash_trend = CashTrend(
+            yoy=Percent(value=yoy_pct / 100) if yoy_pct is not None else None,
+            yoy_positive=(yoy_pct is not None and yoy_pct >= 0),
+            first_balance=Money(cents=first_bal, currency=currency),
+            last_balance=Money(cents=last_bal, currency=currency),
+        )
+    else:
+        cash_trend = CashTrend()
+
+    return KeyMetrics(
+        available=False,
+        avg_monthly_revenue=avg_monthly_revenue,
+        income_quality=Percent(value=income_quality_raw / 100),
+        income_quality_high=income_quality_raw >= config.income_quality_threshold * 100,
+        loan_repayment_freq_per_month=loan_freq,
+        loan_repayment_txn_count=loan_repayment_txn_count,
+        cash_trend=cash_trend,
+    )
+
+
+def _build_observed_patterns(
+    txns: List[Dict],
+    canon_tagged: List[Dict],
+    in_active_period,
+    credit_scoring_inputs_list: List[Dict],
+) -> ObservedPatterns:
+    """
+    Observed Patterns (PAR-189 Stage 11), transcribed from the original
+    inline "Pattern cards" block in render_snapshot_html().
+
+    Every raw aggregate this reads (by_role_in/total_in for M-Pesa
+    concentration, monthly_merged/period_months/neg_months for net-negative
+    months, payroll_stability_live/n_payroll_months/n_total_months for
+    irregular payroll, needs_review_count) is recomputed independently here
+    from the same canon_tagged/txns/in_active_period single sources Key
+    Metrics and Monthly Cashflow also derive from — this section reads no
+    other section's finished dataclass output. Same accepted-duplication
+    pattern used throughout PAR-189 rather than threading extra return
+    values between builders.
+
+    mpesa_pct is a live ratio (mpesa inflow cents / total inflow cents),
+    recomputed fresh here, not a pre-rounded upstream value — no round-trip
+    risk, and the >40 threshold decision is made directly on the raw
+    percentage, same discipline as Key Metrics' thresholds.
+    """
+    by_role_in: Dict[str, int] = defaultdict(int)
+    total_in = 0
+    for t in canon_tagged:
+        if t["amount_cents"] > 0 and t["role"] in CASHFLOW_INFLOW_ROLES:
+            by_role_in[t["role"]] += t["amount_cents"]
+            total_in += t["amount_cents"]
+    mpesa_cents = by_role_in.get("mpesa_inflow", 0)
+    mpesa_pct = (mpesa_cents / total_in * 100) if total_in else 0
+
+    monthly_merged: Dict[str, Dict[str, int]] = {
+        row["month"]: {"inflow_cents": row["inflow_cents"], "outflow_cents": row["outflow_cents"]}
+        for row in _monthly_cashflow(canon_tagged)
+    }
+    period_months = sorted(m for m in monthly_merged if in_active_period(m))
+    neg_months = sorted(
+        m for m in period_months
+        if (monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]) < 0
+    )
+
+    all_months_active: set = set()
+    payroll_months_active: set = set()
+    for t in txns:
+        m = (t["txn_date"] or "")[:7]
+        if t["txn_date"] and in_active_period(m):
+            all_months_active.add(m)
+            if t["role"] == "payroll":
+                payroll_months_active.add(m)
+    n_total_months = len(all_months_active)
+    n_payroll_months = len(payroll_months_active)
+    if n_total_months == 0 or n_payroll_months == 0:
+        payroll_stability_live = "NOT_DETECTED"
+    elif n_payroll_months == n_total_months:
+        payroll_stability_live = "CONSISTENT"
+    elif n_payroll_months >= n_total_months * 8 // 10:
+        payroll_stability_live = "MOSTLY_CONSISTENT"
+    else:
+        payroll_stability_live = "IRREGULAR"
+
+    needs_review_count = sum(1 for t in txns if t["role"] == "needs_review")
+
+    patterns: List[ObservedPattern] = []
+
+    if mpesa_pct > 40:
+        patterns.append(ObservedPattern(
+            key="mpesa_concentration",
+            name="M-Pesa concentration",
+            tag="Watch",
+            data_statement=f"M-Pesa inflows represent {mpesa_pct:.1f}% of total observed inflows",
+            check_prompt="→ Review: consistent with declared customer mix and B2B model?",
+        ))
+
+    for cs in credit_scoring_inputs_list:
+        if cs.get("kra_compliance") == "GAPS_DETECTED":
+            patterns.append(ObservedPattern(
+                key="tax_payment_gap",
+                name="Tax payment gap",
+                tag="Observed",
+                data_statement=cs.get("kra_note") or "Tax payment gaps detected",
+                check_prompt="→ Review: gap months explained by filing schedule or missed payments?",
+            ))
+            break
+
+    if payroll_stability_live == "IRREGULAR":
+        patterns.append(ObservedPattern(
+            key="irregular_payroll",
+            name="Irregular payroll",
+            tag="Pattern",
+            data_statement=f"Payroll detected in {n_payroll_months} of {n_total_months} months",
+            check_prompt="→ Review: casual workforce or payroll routed off-statement?",
+        ))
+
+    if len(neg_months) > 2:
+        label_months = ", ".join(
+            _MONTH_ABBR.get(m[5:7], m[5:7]) for m in neg_months[:3]
+        ) + ("..." if len(neg_months) > 3 else "")
+        patterns.append(ObservedPattern(
+            key="net_negative_months",
+            name="Net-negative months",
+            tag="Pattern",
+            data_statement=f"{len(neg_months)} of {len(period_months)} months net-negative: {label_months}",
+            check_prompt="→ Review: seasonal pattern or sustained cash drain?",
+        ))
+
+    if needs_review_count > 100:
+        patterns.append(ObservedPattern(
+            key="analyst_classification_pending",
+            name="Analyst classification pending",
+            tag="Coverage",
+            data_statement=f"{needs_review_count} transactions flagged needs_review",
+            check_prompt="→ Review: resolve in Parity dashboard before finalising snapshot.",
+        ))
+
+    return ObservedPatterns(patterns=patterns[:5])
 
 
 def _resolve_recon_status(status_raw: Optional[str], coverage_incomplete: bool) -> ReconStatus:
@@ -1554,7 +1900,7 @@ def build_snapshot_context(
     recon_check_config: ReconCheckConfig = DEFAULT_RECON_CHECK_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 10 of PAR-189. Returns:
+    Stage 11 of PAR-189 — the last stage. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
          "tax_payment_pattern": TaxPaymentPattern,
@@ -1563,19 +1909,22 @@ def build_snapshot_context(
          "inter_account_transfer": InterAccountTransfer,
          "account_coverage": AccountCoverage,
          "four_point_reconciliation": FourPointReconciliation,
-         "monthly_cashflow": MonthlyCashflow}
-    NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
-    Everything else render_snapshot_html() needs is still computed inline there —
-    including a small residual fragment of what used to be the Tax Compliance
-    Analysis loop (payroll_stability_live / n_payroll_months / n_total_months),
-    and the renderer's own period_months/neg_months, kept inline because the
-    not-yet-extracted Observed Patterns section reads those same local
-    variables. See the PAR-189 Stage 2 and Stage 10 reports for detail.
+         "monthly_cashflow": MonthlyCashflow,
+         "key_metrics": KeyMetrics,
+         "observed_patterns": ObservedPatterns}
+    All ~19 sections render_snapshot_html() renders are now covered by this
+    function or genuinely need no extraction (the locked reconciliation
+    section is pure static markup — see the Stage 9 report). This is NOT yet
+    the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md
+    — some of the ~60 individual context keys the template reads (report
+    metadata, tier badge, doc pills, period label, QR code) are still
+    presentation-only or genuinely renderer-local and were never in scope for
+    this extraction; see the PAR-189 Stage 11 report for the final accounting.
 
     This function does its own independent deal/txn/recon fetch rather than
     being fed data already fetched by render_snapshot_html() — see the
-    PAR-189 report for why that duplication exists at this stage and what it
-    means for the remaining sections.
+    PAR-189 report for why that duplication exists and what it means for
+    render_snapshot_html() itself (a separate, not-yet-started piece of work).
     """
     sb = _get_supabase()
 
@@ -1592,7 +1941,10 @@ def build_snapshot_context(
 
     af_result = (
         sb.table("pds_audited_financials")
-        .select("financial_year, inventory_cents, cost_of_sales_cents, extraction_confidence, loan_breakdown")
+        .select(
+            "financial_year, inventory_cents, cost_of_sales_cents, extraction_confidence, "
+            "loan_breakdown, turnover_cents, profit_before_tax_cents"
+        )
         .eq("deal_id", deal_id)
         .execute()
         .data or []
@@ -1660,10 +2012,11 @@ def build_snapshot_context(
     # PAR-189 Stage 7 — Inter-Account Transfer Analysis. Needs two fetches no
     # earlier stage required: pds_transfer_links (system-detected pairs) and
     # pds_documents (to name each side of a pair by its detected bank label).
-    # The document fetch deliberately selects only the three columns this
-    # section reads; render_snapshot_html() still does its own wider
-    # pds_documents fetch for doc pills / credit-scoring inputs, which are
-    # not yet extracted.
+    # Stage 11 widened the document select to add "analytics" — Observed
+    # Patterns' "Tax payment gap" card needs each document's cached
+    # credit_scoring_inputs blob, and this fetch is already deal-scoped and
+    # unfiltered, so extending it here avoids a second pds_documents round
+    # trip rather than adding one.
     transfer_link_rows: List[Dict] = (
         sb.table("pds_transfer_links")
         .select("txn_out_id, txn_in_id, abs_amount_cents")
@@ -1673,12 +2026,13 @@ def build_snapshot_context(
     )
     transfer_doc_rows: List[Dict] = (
         sb.table("pds_documents")
-        .select("id, storage_url, source_files")
+        .select("id, storage_url, source_files, analytics")
         .eq("deal_id", deal_id)
         .execute()
         .data or []
     )
     doc_bank_by_id: Dict[Optional[str], Optional[str]] = {}
+    credit_scoring_inputs_list: List[Dict] = []
     for doc in transfer_doc_rows:
         bank_name = _bank_label(doc.get("storage_url") or "")
         if not bank_name:
@@ -1687,6 +2041,10 @@ def build_snapshot_context(
                 if bank_name:
                     break
         doc_bank_by_id[doc.get("id")] = bank_name
+
+        cs = (doc.get("analytics") or {}).get("credit_scoring_inputs") or {}
+        if cs:
+            credit_scoring_inputs_list.append(cs)
 
     inter_account_transfer = _build_inter_account_transfer(
         txns, transfer_link_rows, doc_bank_by_id, currency,
@@ -1719,6 +2077,22 @@ def build_snapshot_context(
         txns, recon_tier, acct_cov_raw, transaction_patterns.critical_count, supplier_config,
     )
 
+    # PAR-189 Stage 11 — Key Metrics. No new fetch: txns/canon_tagged/
+    # in_active_period/af/recon_section/currency are all already resolved
+    # above (af now widened to include turnover_cents/profit_before_tax_cents,
+    # which no earlier stage needed).
+    key_metrics = _build_key_metrics(
+        txns, canon_tagged, in_active_period, recon_available, af, recon_section, currency,
+    )
+
+    # PAR-189 Stage 11 — Observed Patterns, the last section. No new fetch:
+    # txns/canon_tagged/in_active_period are already resolved above, and
+    # credit_scoring_inputs_list now comes from the same pds_documents fetch
+    # Inter-Account Transfer Analysis already does (widened this stage).
+    observed_patterns = _build_observed_patterns(
+        txns, canon_tagged, in_active_period, credit_scoring_inputs_list,
+    )
+
     return {
         "risk": risk,
         "loans": loans,
@@ -1734,4 +2108,6 @@ def build_snapshot_context(
         "account_coverage": account_coverage,
         "four_point_reconciliation": four_point_recon,
         "monthly_cashflow": monthly_cashflow,
+        "key_metrics": key_metrics,
+        "observed_patterns": observed_patterns,
     }
