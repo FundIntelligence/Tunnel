@@ -95,7 +95,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 
-from ..analytics import CASHFLOW_INFLOW_ROLES
+from ..analytics import CASHFLOW_INFLOW_ROLES, monthly_cashflow as _monthly_cashflow
 from ..core.snapshot_engine import decompress_canonical_json_if_needed
 from .snapshot_generator import generate_reconciliation_section
 from ._snapshot_fetch_helpers import _bank_label, _get_supabase, _paginate
@@ -321,6 +321,23 @@ class SupplierPayments:
     top_share: Optional[Percent] = None
     concentration: Optional[SupplierConcentration] = None
     narrative: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CashflowMonthRow:
+    month: str            # "YYYY-MM"
+    inflow: Money
+    outflow: Money
+    net: Money             # signed, inflow - outflow
+    bar_share: Percent     # 0-1 fraction of this period's max abs(net) — for bar width, not a business metric
+
+
+@dataclass(frozen=True)
+class MonthlyCashflow:
+    note: str               # "N of M months net-negative..." / "All M months net-positive." / "No cashflow data available."
+    trend_note: str         # "" | one-month caveat | net POSITIVE/NEGATIVE/stable clause (>=2 months only)
+    peak_trough_note: str   # "" | "Trough of X in <month>; peak of Y in <month>." (>=2 months only)
+    rows: List[CashflowMonthRow]
 
 
 @dataclass(frozen=True)
@@ -759,6 +776,121 @@ def _build_composition(canon_tagged: List[Dict], currency: str) -> Tuple[Composi
     inflow = Composition(total=Money(cents=total_in, currency=currency), segments=inflow_segments, advisory=inflow_advisory)
     outflow = Composition(total=Money(cents=total_out, currency=currency), segments=outflow_segments, advisory=outflow_advisory)
     return inflow, outflow
+
+
+_MONTH_ABBR = {
+    "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr",
+    "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
+    "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
+}  # duplicated from snapshot_html_renderer.MONTH_ABBR — same accepted-duplication
+   # pattern as _build_canon_tagged; kept local so a prose sentence can be
+   # fully assembled here rather than templated in the renderer.
+
+
+def _build_monthly_cashflow(
+    canon_tagged: List[Dict],
+    in_active_period,
+    currency: str,
+) -> MonthlyCashflow:
+    """
+    Monthly Cashflow (PAR-189 Stage 10), transcribed from three previously-
+    separate inline blocks in render_snapshot_html() — "Cashflow net-negative
+    months" (cashflow_note), "Monthly Cashflow Pattern (PAR-63)"
+    (trend_note/peak_trough_note), and "Monthly cashflow chart rows" (rows).
+    All three read the same monthly_merged/period_months derived from
+    _monthly_cashflow(canon_tagged) — the original's own comment confirms
+    single source, no independent recompute — so they move together here.
+
+    period_months/neg_months are cheap to recompute; the renderer still does
+    so locally for Observed Patterns (not yet extracted this stage), same
+    accepted-duplication precedent as Stage 9's kms/recon_rows finding — this
+    is not a hidden coupling back onto this function.
+
+    No percentage field in this section's original scope is a pre-rounded
+    hundredths value being round-tripped through a 0-1 fraction (the
+    Stage 8/9 bug pattern) — checked explicitly. bar_pct/bar_share is a
+    live ratio (abs(net)/max(abs(net))) computed fresh here every time, never
+    stored-then-reformatted elsewhere, and the original's `int(...)`
+    truncation (not round()) is preserved exactly in the renderer's
+    _monthly_cashflow_ctx_from() to avoid introducing any new rounding
+    divergence.
+    """
+    monthly_merged: Dict[str, Dict[str, int]] = {
+        row["month"]: {"inflow_cents": row["inflow_cents"], "outflow_cents": row["outflow_cents"]}
+        for row in _monthly_cashflow(canon_tagged)
+    }
+    period_months = sorted(m for m in monthly_merged if in_active_period(m))
+
+    neg_months = sorted(
+        m for m in period_months
+        if (monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]) < 0
+    )
+    if neg_months:
+        worst = min(
+            neg_months,
+            key=lambda m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"],
+        )
+        note = (
+            f"{len(neg_months)} of {len(period_months)} months net-negative. "
+            f"Largest deficit in {_MONTH_ABBR.get(worst[5:7], worst[5:7])} {worst[:4]}."
+        )
+    elif period_months:
+        note = f"All {len(period_months)} months net-positive."
+    else:
+        note = "No cashflow data available."
+
+    if len(period_months) < 2:
+        trend_note = (
+            "Only one month of data is available — a trend cannot yet be established."
+            if period_months else ""
+        )
+        peak_trough_note = ""
+    else:
+        nets_by_month = {
+            m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]
+            for m in period_months
+        }
+        trough_month = min(nets_by_month, key=lambda m: nets_by_month[m])
+        peak_month = max(nets_by_month, key=lambda m: nets_by_month[m])
+        first_net = nets_by_month[period_months[0]]
+        last_net = nets_by_month[period_months[-1]]
+        if last_net > first_net:
+            trend_note = "The trend over the observed period is net POSITIVE."
+        elif last_net < first_net:
+            trend_note = "The trend over the observed period is net NEGATIVE — recent months show declining net position."
+        else:
+            trend_note = "Net position is broadly stable with no clear directional trend."
+        peak_trough_note = (
+            f"Trough of {_fmt_kes(nets_by_month[trough_month])} in "
+            f"{_MONTH_ABBR.get(trough_month[5:7], trough_month[5:7])} {trough_month[:4]}; "
+            f"peak of {_fmt_kes(nets_by_month[peak_month])} in "
+            f"{_MONTH_ABBR.get(peak_month[5:7], peak_month[5:7])} {peak_month[:4]}."
+        )
+
+    max_abs_net = (
+        max(abs(monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"])
+            for m in period_months)
+        if period_months else 1
+    ) or 1
+
+    rows: List[CashflowMonthRow] = []
+    for m in period_months:
+        v = monthly_merged[m]
+        net = v["inflow_cents"] - v["outflow_cents"]
+        rows.append(CashflowMonthRow(
+            month=m,
+            inflow=Money(cents=v["inflow_cents"], currency=currency),
+            outflow=Money(cents=v["outflow_cents"], currency=currency),
+            net=Money(cents=net, currency=currency),
+            bar_share=Percent(value=min(abs(net) / max_abs_net, 1.0)),
+        ))
+
+    return MonthlyCashflow(
+        note=note,
+        trend_note=trend_note,
+        peak_trough_note=peak_trough_note,
+        rows=rows,
+    )
 
 
 def _resolve_recon_status(status_raw: Optional[str], coverage_incomplete: bool) -> ReconStatus:
@@ -1422,7 +1554,7 @@ def build_snapshot_context(
     recon_check_config: ReconCheckConfig = DEFAULT_RECON_CHECK_CONFIG,
 ) -> Dict[str, object]:
     """
-    PARTIAL — Stage 9 of PAR-189. Returns:
+    PARTIAL — Stage 10 of PAR-189. Returns:
         {"risk": RiskAssessment, "supplier_payments": SupplierPayments,
          "transaction_patterns": TransactionPatterns, "tax_compliance": TaxCompliance,
          "tax_payment_pattern": TaxPaymentPattern,
@@ -1430,13 +1562,15 @@ def build_snapshot_context(
          "inflow": Composition, "outflow": Composition,
          "inter_account_transfer": InterAccountTransfer,
          "account_coverage": AccountCoverage,
-         "four_point_reconciliation": FourPointReconciliation}
+         "four_point_reconciliation": FourPointReconciliation,
+         "monthly_cashflow": MonthlyCashflow}
     NOT the full 57-key SnapshotContext from docs/PAR-189-shared-context-schema.md.
     Everything else render_snapshot_html() needs is still computed inline there —
     including a small residual fragment of what used to be the Tax Compliance
     Analysis loop (payroll_stability_live / n_payroll_months / n_total_months),
-    kept inline because the not-yet-extracted Observed Patterns section reads
-    those same local variables. See the PAR-189 Stage 2 report for detail.
+    and the renderer's own period_months/neg_months, kept inline because the
+    not-yet-extracted Observed Patterns section reads those same local
+    variables. See the PAR-189 Stage 2 and Stage 10 reports for detail.
 
     This function does its own independent deal/txn/recon fetch rather than
     being fed data already fetched by render_snapshot_html() — see the
@@ -1514,6 +1648,7 @@ def build_snapshot_context(
 
     canon_tagged = _build_canon_tagged(canonical)
     inflow, outflow = _build_composition(canon_tagged, currency)
+    monthly_cashflow = _build_monthly_cashflow(canon_tagged, in_active_period, currency)
 
     txns = _fetch_txns_for_context(sb, deal_id)
 
@@ -1598,4 +1733,5 @@ def build_snapshot_context(
         "inter_account_transfer": inter_account_transfer,
         "account_coverage": account_coverage,
         "four_point_reconciliation": four_point_recon,
+        "monthly_cashflow": monthly_cashflow,
     }

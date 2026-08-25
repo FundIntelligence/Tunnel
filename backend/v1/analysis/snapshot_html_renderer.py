@@ -27,6 +27,7 @@ from .snapshot_context import (
     Inventory as _Inventory,
     LoanActivity as _LoanActivity,
     Money as _Money,
+    MonthlyCashflow as _MonthlyCashflow,
     Percent as _Percent,
     RiskAssessment as _RiskAssessment,
     SupplierPayments as _SupplierPayments,
@@ -453,6 +454,33 @@ def _composition_ctx_from(comp: _Composition) -> Dict[str, Any]:
     }
 
 
+def _monthly_cashflow_ctx_from(mc: _MonthlyCashflow) -> Dict[str, Any]:
+    # bar_pct: int() truncation (NOT round()) preserved deliberately — matches
+    # the original inline `min(int(abs_net / max_abs_net * 100), 100)` exactly.
+    # The 100-cap is defensive parity with the original; mathematically
+    # bar_share.value is already <= 1.0 (it's a ratio against this same
+    # period's own max), so int(...*100) can't exceed 100 here, but the min()
+    # is kept anyway rather than silently dropping a belt-and-braces guard.
+    rows = [
+        {
+            "month_label": MONTH_ABBR.get(row.month[5:7], row.month[5:7]),
+            "inflow_str":  f"{row.inflow.cents / 100:,.0f}",
+            "outflow_str": f"{row.outflow.cents / 100:,.0f}",
+            "net_str":     f"{'+' if row.net.cents >= 0 else '−'}{abs(row.net.cents) / 100:,.0f}",
+            "net_color_class": "pos" if row.net.cents >= 0 else "neg",
+            "positive":    row.net.cents >= 0,
+            "bar_pct":     min(int(row.bar_share.value * 100), 100),
+        }
+        for row in mc.rows
+    ]
+    return {
+        "cashflow_note": mc.note,
+        "cashflow_trend_note": mc.trend_note,
+        "cashflow_peak_trough_note": mc.peak_trough_note,
+        "cashflow_rows_ctx": rows,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -745,58 +773,28 @@ def render_snapshot_html(
     # Tax Payment Pattern (PAR-189 Stage 6: computation now lives in
     # build_snapshot_context() — see _tax_payment_pattern_ctx_from() above).
 
-    # Cashflow net-negative months
+    # ── Monthly Cashflow (PAR-63 + PAR-189 Stage 10) ──────────────────────────
+    # cashflow_note / cashflow_trend_note / cashflow_peak_trough_note /
+    # cashflow_rows_ctx now come from build_snapshot_context() — see
+    # _build_monthly_cashflow() in snapshot_context.py and
+    # _monthly_cashflow_ctx_from() above.
+    #
+    # period_months / neg_months stay computed locally (unchanged formula) —
+    # the not-yet-extracted Observed Patterns section below still reads both
+    # directly. Cheap re-derivation from the same monthly_merged/canon_tagged
+    # single source, same accepted-duplication precedent as Stage 9's
+    # kms/recon_rows finding — not a hidden coupling back onto Monthly
+    # Cashflow's shared-context builder.
     period_months = sorted(m for m in monthly_merged if _in_active_period(m))
     neg_months = sorted(
         m for m in period_months
         if (monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]) < 0
     )
-    if neg_months:
-        worst = min(
-            neg_months,
-            key=lambda m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"],
-        )
-        cashflow_note = (
-            f"{len(neg_months)} of {len(period_months)} months net-negative. "
-            f"Largest deficit in {MONTH_ABBR.get(worst[5:7], worst[5:7])} {worst[:4]}."
-        )
-    elif period_months:
-        cashflow_note = f"All {len(period_months)} months net-positive."
-    else:
-        cashflow_note = "No cashflow data available."
-
-    # ── Monthly Cashflow Pattern (PAR-63) ─────────────────────────────────────
-    # Peak/trough + trend summary over the same monthly_merged/period_months
-    # already used above for cashflow_note/neg_months — single source
-    # (canonical_json via canon_tagged), confirmed self-consistent (no
-    # numerator/denominator split across sources, unlike the bug fixed in
-    # Tax Compliance Analysis). No new computation beyond what this file
-    # already tracks; this is a one-time summary sentence, not a new series.
-    if len(period_months) < 2:
-        cashflow_trend_note = "Only one month of data is available — a trend cannot yet be established." if period_months else ""
-        cashflow_peak_trough_note = ""
-    else:
-        nets_by_month = {
-            m: monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"]
-            for m in period_months
-        }
-        trough_month = min(nets_by_month, key=lambda m: nets_by_month[m])
-        peak_month   = max(nets_by_month, key=lambda m: nets_by_month[m])
-        first_net = nets_by_month[period_months[0]]
-        last_net  = nets_by_month[period_months[-1]]
-        if last_net > first_net:
-            trend_clause = "The trend over the observed period is net POSITIVE."
-        elif last_net < first_net:
-            trend_clause = "The trend over the observed period is net NEGATIVE — recent months show declining net position."
-        else:
-            trend_clause = "Net position is broadly stable with no clear directional trend."
-        cashflow_peak_trough_note = (
-            f"Trough of {_fmt_kes(nets_by_month[trough_month])} in "
-            f"{MONTH_ABBR.get(trough_month[5:7], trough_month[5:7])} {trough_month[:4]}; "
-            f"peak of {_fmt_kes(nets_by_month[peak_month])} in "
-            f"{MONTH_ABBR.get(peak_month[5:7], peak_month[5:7])} {peak_month[:4]}."
-        )
-        cashflow_trend_note = trend_clause
+    monthly_cashflow_ctx = _monthly_cashflow_ctx_from(shared_ctx["monthly_cashflow"])
+    cashflow_note = monthly_cashflow_ctx["cashflow_note"]
+    cashflow_trend_note = monthly_cashflow_ctx["cashflow_trend_note"]
+    cashflow_peak_trough_note = monthly_cashflow_ctx["cashflow_peak_trough_note"]
+    cashflow_rows_ctx = monthly_cashflow_ctx["cashflow_rows_ctx"]
 
     # ── Period label ────────────────────────────────────────────────────────
     fy = str(af.get("financial_year") or "") if recon_available else ""
@@ -919,31 +917,6 @@ def render_snapshot_html(
                 "color_class": "positive" if cash_trend_str.startswith("+") else "warning",
             },
         ]
-
-    # ── Monthly cashflow chart rows ──────────────────────────────────────────
-    active_months = period_months
-    max_abs_net = (
-        max(abs(monthly_merged[m]["inflow_cents"] - monthly_merged[m]["outflow_cents"])
-            for m in active_months)
-        if active_months else 1
-    ) or 1
-
-    cashflow_rows_ctx = []
-    for m in active_months:
-        v = monthly_merged[m]
-        net     = v["inflow_cents"] - v["outflow_cents"]
-        abs_net = abs(net)
-        bar_pct = min(int(abs_net / max_abs_net * 100), 100)
-        sign    = "+" if net >= 0 else "−"
-        cashflow_rows_ctx.append({
-            "month_label":    MONTH_ABBR.get(m[5:7], m[5:7]),
-            "inflow_str":     f"{v['inflow_cents'] / 100:,.0f}",
-            "outflow_str":    f"{v['outflow_cents'] / 100:,.0f}",
-            "net_str":        f"{sign}{abs_net / 100:,.0f}",
-            "net_color_class": "pos" if net >= 0 else "neg",
-            "positive":       net >= 0,
-            "bar_pct":        bar_pct,
-        })
 
     # ── Composition segments ─────────────────────────────────────────────────
     # PAR-189 Stage 5: computation now lives in build_snapshot_context() — see
