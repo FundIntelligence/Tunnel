@@ -1460,6 +1460,145 @@ def get_snapshot_pdf(request: Request, deal_id: str, _auth: None = Depends(_requ
     )
 
 
+# ---------------------------------------------------------------------------
+# PAR-192 — interim async PDF jobs (render -> job row -> authenticated fetch)
+#
+# Tactical, additive-only: the sync endpoint above is completely untouched.
+# These three endpoints are a NEW, opt-in path -- existing callers (including
+# Musa's current integration) keep working exactly as before unless they
+# switch to calling POST .../jobs. See core/pdf_jobs.py's module docstring
+# for the full design rationale (Cloud Run Job execution, not BackgroundTasks;
+# bytes-in-row, not a Storage bucket).
+#
+# Interim measure per PAR-192 -- expected to be replaced by PAR-191's
+# hash-based freshness-policy mechanism. Do not extend this scope (no
+# per-partner freshness branching, no build_snapshot_context() dependency)
+# without checking PAR-191's status first.
+# ---------------------------------------------------------------------------
+
+@router.post("/deals/{deal_id}/snapshot/pdf/jobs", status_code=202)
+def create_snapshot_pdf_job(
+    request: Request,
+    deal_id: str,
+    variant: str = "snapshot",
+    _auth: None = Depends(_require_snapshot_access),
+):
+    """
+    Trigger an async render, off the synchronous request path. Returns
+    immediately (202) with a job_id and poll_url -- does NOT wait for the
+    render to complete. See GET .../jobs/{job_id} for status and
+    .../jobs/{job_id}/content for the finished PDF.
+
+    Reuses an existing DONE job for the same (deal, variant, snapshot_id)
+    instead of re-rendering, per the deterministic-cache idea already used
+    by the export short-circuit above (api.py:1039) -- a rendered PDF is
+    fully determined by that triple.
+    """
+    from .core import pdf_jobs
+
+    if variant not in ("snapshot", "enriched", "report"):
+        _error("BAD_REQUEST", f"Unknown variant: {variant!r}. Must be one of: snapshot, enriched, report.")
+
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
+    if not snapshot:
+        _error("NOT_FOUND", "No snapshot found for this deal. Run POST /export first.")
+    snapshot_id = snapshot.get("id")
+
+    cached = pdf_jobs.find_cached_done_job(deal_id, variant, snapshot_id)
+    if cached:
+        base_url = str(request.base_url).rstrip("/")
+        job_id = cached["job_id"]
+        return {
+            "job_id": job_id,
+            "status": "done",
+            "poll_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}",
+            "content_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content",
+            "cached": True,
+        }
+
+    requested_by = _extract_user_id_from_request(request) or "api_key_caller"
+    job = pdf_jobs.create_job(deal_id, variant, snapshot_id, requested_by)
+    job_id = job["job_id"]
+
+    try:
+        pdf_jobs.trigger_render_job(job_id, deal_id, variant)
+    except Exception as exc:  # noqa: BLE001 — job row already exists; report the failure on it
+        logger.exception("[PAR-192] Failed to trigger render job_id=%s deal_id=%s", job_id, deal_id)
+        pdf_jobs.mark_failed(job_id, f"Failed to start render: {exc!r}")
+
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "poll_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}",
+        "content_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content",
+        "cached": False,
+    }
+
+
+@router.get("/deals/{deal_id}/snapshot/pdf/jobs/{job_id}")
+def get_snapshot_pdf_job_status(
+    deal_id: str,
+    job_id: str,
+    _auth: None = Depends(_require_snapshot_access),
+):
+    from .core import pdf_jobs
+
+    job = pdf_jobs.get_job(job_id)
+    if not job or job.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"PDF job {job_id} not found for deal {deal_id}")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "variant": job["variant"],
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "byte_size": job.get("byte_size"),
+        "error_message": job.get("error_message"),
+    }
+
+
+@router.get("/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content")
+def get_snapshot_pdf_job_content(
+    deal_id: str,
+    job_id: str,
+    _auth: None = Depends(_require_snapshot_access),
+):
+    """
+    Serve the finished PDF directly from the job row, freshly authenticated
+    on every call via _require_snapshot_access -- the same "sign fresh on
+    each read, never persist a stale link" principle as the existing
+    admin/lib/parser-requests-signed-urls.ts pattern (PAR-145), adapted here
+    to an authenticated-fetch URL instead of a bucket-signed one (see
+    core/pdf_jobs.py's module docstring for why).
+    """
+    from .core import pdf_jobs
+
+    job = pdf_jobs.get_job(job_id)
+    if not job or job.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"PDF job {job_id} not found for deal {deal_id}")
+    if job["status"] == "failed":
+        _error("INTERNAL", f"PDF render failed: {job.get('error_message') or 'unknown error'}")
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"PDF job {job_id} is {job['status']}, not ready yet")
+
+    pdf_bytes = pdf_jobs.get_job_bytes(job_id)
+    if pdf_bytes is None:
+        _error("INTERNAL", f"PDF job {job_id} is marked done but has no stored bytes")
+
+    filename = f"parity_snapshot_{deal_id}.pdf"
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/deals/{deal_id}/snapshot/pdf/enriched")
 def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str] = None):
     """
