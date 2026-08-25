@@ -273,6 +273,16 @@ _RECON_STATUS_BADGE = {
 
 
 def _loan_activity_ctx_from(loans: _LoanActivity) -> Dict[str, Any]:
+    # loans.variance is sourced from recon_section["loan_activity"]["variance_pct"]
+    # (reconciliation_engine.py: round(variance_cents / declared_net_borrowing_cents
+    # * 100, 2)) -- the same pre-rounded-to-hundredths class of field as
+    # coverage_pct (Stage 8) and the 4-Point Reconciliation variances (Stage 9),
+    # including this exact field's OTHER consumer (4-Point Reconciliation's own
+    # loan row, fixed in Stage 9). This Loan Activity Detected / Loan Facilities
+    # consumer of the same field was missed at the time -- found during Stage 11
+    # review, fixed here. Must use _fmt_pct_1dp(), not a naive f-string on the
+    # round-tripped Percent (measured: 748/100,001 divergent inputs over the
+    # -500%..+500% domain, identical count to Stage 9's reconciliation variances).
     loan_facilities = []
     for fac in loans.facilities:
         match_class, match_label = _RECON_STATUS_BADGE[fac.status]
@@ -293,7 +303,7 @@ def _loan_activity_ctx_from(loans: _LoanActivity) -> Dict[str, Any]:
         "loan_recon_status":     loans.status_raw or "",
         "loan_bank_net_str":     _fmt_money_kes(loans.bank_net),
         "loan_declared_net_str": _fmt_money_kes(loans.declared_net),
-        "loan_variance_str":     f"{loans.variance.value * 100:.1f}%" if loans.variance is not None else "0%",
+        "loan_variance_str":     f"{_fmt_pct_1dp(loans.variance)}%" if loans.variance is not None else "0%",
     }
 
 
