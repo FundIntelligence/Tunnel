@@ -62,4 +62,15 @@ jobs:
           set -euo pipefail
           DEPLOY_URL="$(vercel deploy --prod --yes --token=${{ secrets.VERCEL_TOKEN }})"
           echo "Deployed: $DEPLOY_URL"
-          vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }}
+          # `vercel promote` can 409 with "already the current production
+          # deployment" -- a benign race (see deploy-admin.yml's identical
+          # promote step for the same reasoning), not a real failure; only a
+          # different error should fail the job.
+          set +e
+          PROMOTE_OUTPUT="$(vercel promote "$DEPLOY_URL" --yes --scope=mbaks-projects --token=${{ secrets.VERCEL_TOKEN }} 2>&1)"
+          PROMOTE_EXIT=$?
+          set -e
+          echo "$PROMOTE_OUTPUT"
+          if [ "$PROMOTE_EXIT" -ne 0 ] && ! echo "$PROMOTE_OUTPUT" | grep -q "already the current production deployment"; then
+            exit "$PROMOTE_EXIT"
+          fi

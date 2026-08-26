@@ -186,7 +186,14 @@ def mark_done(job_id: str, pdf_bytes: bytes) -> None:
     sb = get_supabase()
     sb.table("pds_pdf_jobs").update({
         "status": "done",
-        "pdf_bytes": pdf_bytes,
+        # postgrest-py's .update() serializes this dict via httpx's json=
+        # (json.dumps under the hood) -- raw bytes are not JSON-serializable
+        # and this raised TypeError on every real render (confirmed via a
+        # live Cloud Run Job execution, 2026-08-26). PostgREST's actual wire
+        # format for a bytea column is a "\x"-prefixed hex string -- the
+        # same format get_job_bytes() below already reads back -- so encode
+        # to match, rather than pass Python bytes through.
+        "pdf_bytes": "\\x" + pdf_bytes.hex(),
         "byte_size": len(pdf_bytes),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }).eq("job_id", job_id).execute()
