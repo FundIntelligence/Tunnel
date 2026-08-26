@@ -63,9 +63,18 @@ logger = logging.getLogger(__name__)
 # ~2 weeks per Uzo's suggestion on PAR-192 (scope item 5).
 PDF_JOB_RETENTION_DAYS = 14
 
+# NOTE the plural "service-accounts" and the explicit "default" account id.
+# Both are load-bearing and were wrong here until PAR-192's live trigger test
+# (2026-08-26): "instance/service-account/token" returns a bare 404 from Cloud
+# Run's "Metadata Server for Serverless", because the node under instance/ is
+# service-accountS/, and each entry under it is keyed by account id ("default"
+# or the SA email) with token/email/scopes beneath THAT. Verified empirically
+# from inside a real Cloud Run execution: instance/ lists
+# "id|region|service-accounts/|zone", and service-accounts/ lists
+# "121148713552-compute@developer.gserviceaccount.com/|default/".
 _METADATA_TOKEN_URL = (
     "http://metadata.google.internal/computeMetadata/v1/"
-    "instance/service-account/token"
+    "instance/service-accounts/default/token"
 )
 _CLOUD_RUN_JOB_NAME = os.getenv("PDF_RENDER_CLOUD_RUN_JOB_NAME", "parity-pdf-render")
 _CLOUD_RUN_PROJECT = os.getenv("PDF_RENDER_CLOUD_RUN_PROJECT")
