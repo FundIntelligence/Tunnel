@@ -269,6 +269,47 @@ class TriggerRenderJobTests(unittest.TestCase):
         self.assertIn("403", fetched["error_message"])
 
 
+class MetadataTokenUrlTests(unittest.TestCase):
+    """
+    Regression guard for the PAR-192 live-trigger failure of 2026-08-26.
+
+    The first real POST to .../snapshot/pdf/jobs on parity-backend-prod
+    (rev 00035-tms) died with a bare `404 Not Found` from the metadata
+    server because the URL said `instance/service-account/token`. Two
+    things were wrong and either alone is fatal:
+
+      * the node under `instance/` is `service-accounts` (PLURAL), and
+      * each entry beneath it is keyed by account id, so the token lives
+        at `service-accounts/<account>/token`, not `service-accounts/token`.
+
+    Both were confirmed empirically from inside a real Cloud Run execution,
+    not from documentation. These asserts are deliberately literal — the
+    whole failure was a URL typo that no amount of mocking would surface.
+    """
+
+    def test_url_uses_plural_service_accounts_with_explicit_account_id(self):
+        self.assertTrue(
+            pdf_jobs._METADATA_TOKEN_URL.endswith(
+                "/computeMetadata/v1/instance/service-accounts/default/token"
+            ),
+            f"metadata token URL has drifted: {pdf_jobs._METADATA_TOKEN_URL}",
+        )
+
+    def test_url_does_not_regress_to_singular_service_account(self):
+        self.assertNotIn("/service-account/", pdf_jobs._METADATA_TOKEN_URL)
+
+    def test_fetch_sends_metadata_flavor_header_and_parses_access_token(self):
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"access_token": "tok-123", "expires_in": 3599}
+        fake_resp.raise_for_status.return_value = None
+        with patch("backend.v1.core.pdf_jobs.httpx.get", return_value=fake_resp) as fake_get:
+            token = pdf_jobs._fetch_metadata_server_token()
+        self.assertEqual(token, "tok-123")
+        args, kwargs = fake_get.call_args
+        self.assertEqual(args[0], pdf_jobs._METADATA_TOKEN_URL)
+        self.assertEqual(kwargs["headers"]["Metadata-Flavor"], "Google")
+
+
 class SweepScheduleClassTests(unittest.TestCase):
     def test_sweeper_start_stop_does_not_raise(self):
         """Smoke test only — the real loop body (sweep_expired) is covered
