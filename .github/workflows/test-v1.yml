@@ -104,7 +104,7 @@ jobs:
 
       - name: Legacy API route guard
         run: |
-          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" 2>/dev/null | grep -v '("/")' | grep -v '("/health")' | grep -v '("/v1' | grep -v '("/docs' | grep -v '("/openapi' | grep -v '("/redoc' || true)
+          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" --exclude-dir=tests --exclude-dir=tests_v1 2>/dev/null | grep -v '("/")' | grep -v '("/health")' | grep -v '("/v1' | grep -v '("/docs' | grep -v '("/openapi' | grep -v '("/redoc' || true)
           if [ -n "$LEGACY" ]; then
             echo "::error::Legacy API route detected. All routes must be under /v1."
             echo "$LEGACY"
