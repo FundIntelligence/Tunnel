@@ -251,6 +251,26 @@ async def _send_webhook(
     # (already sent above) or bubble up past this function.
     try:
         attempted_at = datetime.now(timezone.utc).isoformat()
+        if status_code == 200:
+            # webhook_delivered_at (set below) is deliberately "most recent
+            # success" — every resend overwrites it, which is the behaviour the
+            # admin UI wants and which existing tests pin. The side effect is
+            # that the FIRST delivery time is destroyed by the first resend, so
+            # stamp it once into its own column here.
+            #
+            # The .is_(..., "null") filter IS the once-only guard: the first
+            # successful delivery matches and writes, every later one matches
+            # zero rows and is a no-op. Done as its own statement rather than
+            # reading the row first and deciding in Python — _send_webhook has
+            # no prior row state in scope on either call path, so that would
+            # mean an extra round-trip AND a read-then-write race. Runs before
+            # the main persist so the outcome write below stays the last word.
+            get_supabase().table("musa_sessions").update(
+                {"webhook_first_delivered_at": attempted_at}
+            ).eq("session_id", session_id).is_(
+                "webhook_first_delivered_at", "null"
+            ).execute()
+
         update_fields = {
             "webhook_last_status_code": status_code,
             "webhook_last_attempted_at": attempted_at,

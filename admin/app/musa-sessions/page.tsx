@@ -20,6 +20,7 @@ interface MusaSession {
   webhook_last_attempted_at: string | null
   webhook_last_error: string | null
   webhook_delivered_at: string | null
+  webhook_first_delivered_at: string | null
   webhook_resend_count: number
 }
 
@@ -362,6 +363,11 @@ export default function MusaSessionsPage() {
                                       <>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                                           <span style={{ color: wh.color, fontWeight: 500 }}>{wh.text}</span>
+                                          {row.webhook_first_delivered_at && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              first delivered {toEAT(row.webhook_first_delivered_at)}
+                                            </span>
+                                          )}
                                           {row.webhook_last_attempted_at && (
                                             <span style={{ color: 'var(--t2)', fontSize: 12 }}>
                                               last attempt {toEAT(row.webhook_last_attempted_at)}
