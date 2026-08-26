@@ -310,6 +310,97 @@ class MetadataTokenUrlTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Metadata-Flavor"], "Google")
 
 
+class MarkDoneEncodingTests(unittest.TestCase):
+    """
+    Regression guard for the PAR-192 live-render failure of 2026-08-26:
+    mark_done() passed raw Python bytes straight into postgrest-py's
+    .update(), which serializes its payload via httpx's json= (json.dumps
+    under the hood). Raw bytes are not JSON-serializable, so this raised
+    `TypeError: Object of type bytes is not JSON serializable` on every
+    single real render -- confirmed via a live Cloud Run Job execution
+    (execution parity-pdf-render-5rwzr, job_id
+    758392c7-5a74-414c-b036-8ef504ec2359, full traceback captured), never
+    by any test, because...
+
+    ...the existing _FakeSupabase-based tests in this file did NOT catch
+    this. _FakeQuery.update() just stores whatever Python object it's
+    handed and merges it into a plain dict -- it never simulates
+    JSON-serializability at all, so a round trip through the fake alone
+    cannot distinguish correct output from broken output. These tests
+    assert on the actual payload dict (and, separately, on real
+    json.dumps()) rather than trusting "no exception raised from the fake."
+    """
+
+    def test_mark_done_writes_hex_prefixed_string_not_raw_bytes(self):
+        mock_supabase = MagicMock()
+        pdf_bytes = b"%PDF-1.4 fake bytes \x00\xff\xfe"
+        with patch("backend.v1.core.pdf_jobs.get_supabase", return_value=mock_supabase):
+            pdf_jobs.mark_done("job-1", pdf_bytes)
+
+        mock_supabase.table.assert_called_with("pds_pdf_jobs")
+        update_mock = mock_supabase.table.return_value.update
+        update_mock.assert_called_once()
+        payload = update_mock.call_args[0][0]
+
+        self.assertIsInstance(
+            payload["pdf_bytes"], str,
+            "pdf_bytes must be a JSON-serializable str -- raw bytes are not "
+            "JSON-serializable via postgrest-py's .update()",
+        )
+        self.assertTrue(
+            payload["pdf_bytes"].startswith("\\x"),
+            f"pdf_bytes must be \\x-prefixed hex (PostgREST's bytea wire "
+            f"format), got: {payload['pdf_bytes'][:20]!r}",
+        )
+        self.assertEqual(payload["pdf_bytes"], "\\x" + pdf_bytes.hex())
+        update_mock.return_value.eq.return_value.execute.assert_called_once()
+
+    def test_mark_done_payload_is_actually_json_serializable(self):
+        """
+        Directly exercises the real failure mode: json.dumps() on the exact
+        payload dict mark_done() builds must not raise. This is what
+        postgrest-py's httpx json= does internally on every .update() call --
+        if this test ever fails again, the live-render bug is back.
+        """
+        import json
+
+        mock_supabase = MagicMock()
+        with patch("backend.v1.core.pdf_jobs.get_supabase", return_value=mock_supabase):
+            pdf_jobs.mark_done("job-1", b"\x00\x01\x02\xff\xfe real pdf bytes")
+
+        payload = mock_supabase.table.return_value.update.call_args[0][0]
+        json.dumps(payload)  # must not raise TypeError
+
+    def test_mark_done_then_get_job_bytes_round_trips_exact_bytes(self):
+        """
+        Symmetry check: what mark_done() writes, get_job_bytes() must read
+        back byte-identical. This alone would have caught the original bug
+        even without ever hitting a real Cloud Run Job -- if mark_done()
+        stored raw bytes instead of a hex string, get_job_bytes()'s own
+        isinstance(raw, (bytes, bytearray)) branch would silently "work" in
+        this in-process fake and mask the real wire-format bug, so this test
+        also independently inspects the fake table's stored representation
+        rather than relying on the round trip alone.
+        """
+        original = bytes(range(256))  # every byte value, not just ASCII
+        fake = _FakeSupabase()
+        with patch("backend.v1.core.pdf_jobs.get_supabase", return_value=fake):
+            job = pdf_jobs.create_job("deal-1", "snapshot", "snap-1", None)
+            pdf_jobs.mark_done(job["job_id"], original)
+            roundtripped = pdf_jobs.get_job_bytes(job["job_id"])
+
+        self.assertEqual(roundtripped, original)
+
+        stored = fake._tables["pds_pdf_jobs"].rows[0]["pdf_bytes"]
+        self.assertIsInstance(
+            stored, str,
+            "stored pdf_bytes must be the hex-string wire format, not raw "
+            "bytes -- get_job_bytes()'s bytes branch exists for defensive "
+            "client-version handling, not as the intended write path",
+        )
+        self.assertTrue(stored.startswith("\\x"))
+
+
 class SweepScheduleClassTests(unittest.TestCase):
     def test_sweeper_start_stop_does_not_raise(self):
         """Smoke test only — the real loop body (sweep_expired) is covered
