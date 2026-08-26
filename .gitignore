@@ -165,3 +165,4 @@ fix_*.sql
 # Legacy frontend app (not used)
 frontend/
 supabase/.temp/
+.env*.local
