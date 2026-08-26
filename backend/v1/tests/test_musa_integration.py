@@ -1427,3 +1427,135 @@ class TestSendWebhookIdempotencyFieldsAndPersistence:
         assert "webhook_resend_count" not in update_fields
         assert update_fields["webhook_last_status_code"] == 500
         assert "webhook_delivered_at" not in update_fields  # non-200 → not delivered
+
+    # -- PAR-174 follow-up: webhook_first_delivered_at ----------------------
+    #
+    # webhook_delivered_at intentionally tracks the MOST RECENT success (see
+    # test_payload_includes_is_retry_and_resend_count above, which pins that).
+    # webhook_first_delivered_at is the separate, write-once audit fact.
+
+    class _FakeSessionsTable:
+        """Minimal postgrest stand-in that actually honours .eq()/.is_().
+
+        The once-only behaviour is enforced by a DB-side filter, so asserting
+        on mock call internals alone would not prove it. This applies the
+        filters to a real dict row, so the test fails if the guard is dropped.
+        """
+
+        def __init__(self, row):
+            self.row = row
+            self._pending = {}
+            self._filters = []
+
+        def table(self, _name):
+            return self
+
+        def update(self, fields):
+            self._pending = dict(fields)
+            self._filters = []
+            return self
+
+        def eq(self, col, val):
+            self._filters.append(("eq", col, val))
+            return self
+
+        def is_(self, col, val):
+            self._filters.append(("is", col, val))
+            return self
+
+        def execute(self):
+            for kind, col, val in self._filters:
+                if kind == "eq" and self.row.get(col) != val:
+                    return self
+                if kind == "is" and val == "null" and self.row.get(col) is not None:
+                    return self
+            self.row.update(self._pending)
+            return self
+
+    def _run_send(self, monkeypatch, sb, status_code, session_id="sid-fd"):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=status_code, text="")
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = AsyncMock(return_value=mock_response)
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: sb)
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id=session_id,
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="complete",
+                status_url="https://parity.io/status",
+                pdf_url="https://parity.io/pdf",
+            ))
+
+    def test_first_success_stamps_first_delivered_at(self, monkeypatch):
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 200)
+
+        assert sb.row["webhook_first_delivered_at"] is not None
+        # First success: both columns describe the same moment.
+        assert sb.row["webhook_first_delivered_at"] == sb.row["webhook_delivered_at"]
+
+    def test_resend_advances_delivered_at_but_never_first_delivered_at(self, monkeypatch):
+        """The actual regression guard for PAR-174's audit-history gap."""
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 200)
+        first = sb.row["webhook_first_delivered_at"]
+        original_delivered = sb.row["webhook_delivered_at"]
+        assert first is not None
+
+        self._run_send(monkeypatch, sb, 200)
+
+        # webhook_delivered_at still moves — existing behaviour preserved.
+        assert sb.row["webhook_delivered_at"] != original_delivered
+        # ...but the original delivery time survives the resend. Without the
+        # null guard this would have been overwritten, which is exactly the
+        # data loss found on session 2847fbf0 on 2026-08-26.
+        assert sb.row["webhook_first_delivered_at"] == first
+
+    def test_failed_delivery_does_not_stamp_first_delivered_at(self, monkeypatch):
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 500)
+
+        assert sb.row["webhook_first_delivered_at"] is None
+        assert sb.row["webhook_delivered_at"] is None
+
+    def test_first_delivered_write_is_guarded_and_separate_from_outcome_write(self, monkeypatch):
+        """The once-only write must be its own null-filtered statement, and
+        must never leak into the main outcome update (which is unconditional
+        and would overwrite on every resend)."""
+        mock_sb = MagicMock()
+        self._run_send(monkeypatch, mock_sb, 200)
+
+        update_calls = mock_sb.table.return_value.update.call_args_list
+        assert len(update_calls) == 2
+        assert "webhook_first_delivered_at" in update_calls[0].args[0]
+        # The outcome write is last and must not carry the first-delivered key.
+        outcome_fields = update_calls[1].args[0]
+        assert "webhook_first_delivered_at" not in outcome_fields
+        assert outcome_fields["webhook_delivered_at"] is not None
+
+        is_call = mock_sb.table.return_value.update.return_value.eq.return_value.is_.call_args
+        assert is_call.args == ("webhook_first_delivered_at", "null")
