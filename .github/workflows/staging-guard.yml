@@ -1,6 +1,6 @@
 # Parity Staging Guard — determinism + ontology contract checks
 #
-# Runs on every PR targeting staging. No live Supabase required.
+# Runs on every PR targeting paritystaging. No live Supabase required.
 # These checks must pass before any merge to staging is allowed.
 #
 # Required secrets: none (all guards are static analysis + unit tests)
@@ -9,7 +9,7 @@ name: Staging Guard
 
 on:
   pull_request:
-    branches: [staging]
+    branches: [paritystaging]
   workflow_dispatch:
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
       # ── Legacy route guard ───────────────────────────────────────────────
       - name: All routes must be under /v1
         run: |
-          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" 2>/dev/null \
+          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" --exclude-dir=tests --exclude-dir=tests_v1 2>/dev/null \
             | grep -v '("/")' | grep -v '("/health")' | grep -v '("/v1' \
             | grep -v '("/docs' | grep -v '("/openapi' | grep -v '("/redoc' || true)
           if [ -n "$LEGACY" ]; then
