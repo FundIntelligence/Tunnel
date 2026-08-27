@@ -264,7 +264,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         AnalysisRunsRepo, SnapshotsRepo,
         EnrichmentsRepo, ClassificationOverridesRepo, CustomFlagsRepo,
         AccountCoverageRepo, OverrideLogRepo, IntelligenceLogRepo,
-        ExportPersistenceRepo,
+        ReviewThresholdLogRepo, ExportPersistenceRepo,
     )
     return {
         "deals": DealsRepo(),
@@ -276,6 +276,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         "overrides": OverridesRepo(),
         "override_log": OverrideLogRepo(),
         "intelligence_log": IntelligenceLogRepo(),
+        "review_threshold_log": ReviewThresholdLogRepo(),
         "runs": AnalysisRunsRepo(),
         "snapshots": SnapshotsRepo(),
         "export_persistence": ExportPersistenceRepo(),
@@ -1089,6 +1090,7 @@ def export(request: Request, deal_id: str, force: bool = False):
         logger.info("[EXPORT] deal=%s config_version mismatch snap=%s current=%s — bypassing cache", deal_id, snap_config_version, CONFIG_VERSION)
 
     stage = "PIPELINE_START"
+    review_threshold_log_entries: List[Dict] = []
     run, links, entities, txn_map = run_pipeline(
         deal_id=deal_id,
         raw_transactions=raw,
@@ -1098,6 +1100,7 @@ def export(request: Request, deal_id: str, force: bool = False):
             "accrual_period_start": deal.get("accrual_period_start"),
             "accrual_period_end": deal.get("accrual_period_end"),
         },
+        review_threshold_log_out=review_threshold_log_entries,
     )
     stage = "PIPELINE_DONE"
     logger.info("[EXPORT] stage=%s", stage)
@@ -1107,6 +1110,14 @@ def export(request: Request, deal_id: str, force: bool = False):
         text_tid = rec["txn_id"]
         if text_tid in txn_id_to_uuid:
             rec["txn_id"] = txn_id_to_uuid[text_tid]
+
+    # PAR-89 part B: same hash-id -> real-UUID remap as txn_map above, so
+    # review_threshold_log rows are joinable against pds_override_log
+    # (deal_id + txn_id) for later false-positive/negative analysis.
+    for entry in review_threshold_log_entries:
+        text_tid = entry["txn_id"]
+        if text_tid in txn_id_to_uuid:
+            entry["txn_id"] = txn_id_to_uuid[text_tid]
 
     # PAR-77: run_pipeline reclassifies every transaction from scratch on each
     # export, which would otherwise silently discard a Review Queue analyst's
@@ -1163,6 +1174,19 @@ def export(request: Request, deal_id: str, force: bool = False):
             exc_info=True,
         )
         raise
+
+    # PAR-89 part B: best-effort diagnostics log, mirroring the
+    # pds_intelligence_log write pattern — never let a logging failure affect
+    # the export that already succeeded above.
+    if review_threshold_log_entries and repos.get("review_threshold_log"):
+        try:
+            repos["review_threshold_log"].insert_log_many(review_threshold_log_entries)
+        except Exception:
+            logger.warning(
+                "[EXPORT] deal=%s review_threshold_log insert failed (non-fatal, diagnostics only)",
+                deal_id,
+                exc_info=True,
+            )
 
     stage = "SNAPSHOT_BUILD_DONE"
     logger.info("[EXPORT] stage=%s", stage)
