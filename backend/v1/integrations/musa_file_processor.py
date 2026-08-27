@@ -22,7 +22,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -407,7 +407,7 @@ async def _record_unrecognized_document(
     document_url: Optional[str],
     file_bytes: Optional[bytes],
     file_name: Optional[str],
-    exc: Exception,
+    error_message: str,
 ) -> None:
     """
     Record one document's unrecognized-format failure: persist its sample
@@ -416,6 +416,11 @@ async def _record_unrecognized_document(
     within a batch — PAR-61: a batch can contain several unrecognized
     files alongside recognizable ones, each tracked and retried
     independently rather than one bad file failing the whole batch.
+
+    Takes the failure reason as a plain string rather than an Exception
+    (PAR-200): process_document_background never raises on a genuine parse
+    failure, so its caller has a real error_message string from the
+    document's own row, not a caught exception object, in the common case.
     """
     storage_path = _persist_failed_sample(session_id, file_bytes, file_name)
     try:
@@ -425,7 +430,7 @@ async def _record_unrecognized_document(
             "document_url": document_url,
             "session_id": str(session_id),
             "deal_id": deal_id,
-            "error_message": str(exc),
+            "error_message": error_message,
             "status": "pending",
             "storage_path": storage_path,
         }).execute()
@@ -440,7 +445,7 @@ async def _record_unrecognized_document(
         deal_id=deal_id,
         venture_country=venture_country,
         document_url=document_url,
-        error_message=str(exc),
+        error_message=error_message,
     )
 
 
@@ -516,6 +521,12 @@ async def process_musa_session(
         session_id, deal_id, len(documents),
     )
 
+    # PAR-200: declared before anything in the try below can raise, so the
+    # outer except (a genuine setup-phase failure, e.g. get_supabase()
+    # itself failing) can always reference it safely rather than risking a
+    # NameError masked as a "failed to persist" log line.
+    document_failures: List[Dict[str, Any]] = []
+
     try:
         supabase = get_supabase()
         deal_currency = country_to_currency(venture_country)
@@ -589,13 +600,73 @@ async def process_musa_session(
                     file_type=file_type,
                     deal_currency=deal_currency,
                 )
-                succeeded_count += 1
+
+                # PAR-200: process_document_background never raises on a
+                # genuine per-document parse failure — it catches every
+                # exception internally (CurrencyMismatchError,
+                # InvalidSchemaError, IngestionTimeoutError, and a trailing
+                # bare Exception) and records the real outcome on the
+                # document's own row via _update_failed(). Its return type
+                # is -> None either way, so a clean return here does NOT
+                # mean success. Query the row it just wrote instead of
+                # assuming one — this is the actual bug: succeeded_count
+                # used to increment unconditionally at this point.
+                doc_rows = docs_repo.select_eq("id", document_id)
+                doc_row = doc_rows[0] if doc_rows else {}
+                doc_status = doc_row.get("status")
+
+                if doc_status == "completed":
+                    succeeded_count += 1
+                else:
+                    doc_next_action = doc_row.get("next_action")
+                    doc_error_message = doc_row.get("error_message") or (
+                        f"Document ended in status={doc_status!r} with no "
+                        f"recorded error_message"
+                    )
+                    document_failures.append({
+                        "filename": file_name or url,
+                        "error_type": doc_row.get("error_type"),
+                        "error_message": doc_error_message,
+                        "next_action": doc_next_action,
+                    })
+                    # Same request_parser vs. everything-else split the old
+                    # except-block below used, now driven by the real
+                    # next_action _update_failed already computed (it
+                    # already distinguishes unsupported-format from
+                    # currency/CSV/timeout issues) instead of re-guessing
+                    # from exception text that was never reachable here.
+                    if doc_next_action == "request_parser":
+                        unrecognized_count += 1
+                        await _record_unrecognized_document(
+                            session_id=session_id,
+                            deal_id=deal_id,
+                            venture_country=venture_country,
+                            document_url=url,
+                            file_bytes=file_bytes,
+                            file_name=file_name,
+                            error_message=doc_error_message,
+                        )
+                    elif other_failure is None:
+                        other_failure = RuntimeError(doc_error_message)
 
             except Exception as doc_exc:
+                # Unlike the branch above, this except block catches a
+                # genuine exception from the orchestrator's OWN code around
+                # process_document_background (e.g. _download_file network
+                # errors, docs_repo.create_document failing) — not a parse
+                # failure, since that path never raises here (see above).
+                # Unreachable for parse/format failures; kept for these
+                # real, different failure modes, unchanged in behavior.
                 logger.warning(
                     "[MUSA] doc %d/%d failed session=%s url=%.60s: %s",
                     i + 1, len(documents), session_id, url, doc_exc,
                 )
+                document_failures.append({
+                    "filename": file_name or url,
+                    "error_type": doc_exc.__class__.__name__,
+                    "error_message": str(doc_exc),
+                    "next_action": None,
+                })
                 doc_error_str = str(doc_exc).lower()
                 if "no transactions" in doc_error_str or "unsupported" in doc_error_str:
                     unrecognized_count += 1
@@ -606,7 +677,7 @@ async def process_musa_session(
                         document_url=url,
                         file_bytes=file_bytes,
                         file_name=file_name,
-                        exc=doc_exc,
+                        error_message=str(doc_exc),
                     )
                 elif other_failure is None:
                     other_failure = doc_exc
@@ -622,7 +693,20 @@ async def process_musa_session(
             # each already recorded above (parser_requests + sample +
             # notify). Defer the whole session to the SLA sweep exactly
             # like the single-document case (PAR-62) — no immediate
-            # failure webhook.
+            # failure webhook. status/completed_at deliberately untouched
+            # (still "processing") — that timing is PAR-62's design, not
+            # changed here. PAR-200: still write the real per-document
+            # detail now, purely additive, so the admin UI has something
+            # during the 24h window instead of nothing until force-close.
+            if document_failures:
+                try:
+                    supabase.table("musa_sessions").update(
+                        {"document_failures": document_failures}
+                    ).eq("session_id", session_id).execute()
+                except Exception:
+                    logger.exception(
+                        "[MUSA] Failed to persist document_failures session=%s", session_id
+                    )
             logger.info(
                 "[MUSA] session=%s all %d document(s) deferred to 24h SLA window",
                 session_id, len(documents),
@@ -646,7 +730,16 @@ async def process_musa_session(
             )
 
         supabase.table("musa_sessions").update(
-            {"status": "complete", "completed_at": completed_at, "error_message": partial_note}
+            {
+                "status": "complete",
+                "completed_at": completed_at,
+                "error_message": partial_note,
+                # PAR-200: real per-document reasons behind partial_note's
+                # count, not just the count itself. None (not []) when
+                # nothing failed, so a fully-successful session reads as
+                # "no failure detail" rather than "checked, found none".
+                "document_failures": document_failures or None,
+            }
         ).eq("session_id", session_id).execute()
 
         pdf_url = f"{API_BASE_URL}/v1/deals/{deal_id}/snapshot/pdf"
@@ -697,6 +790,12 @@ async def process_musa_session(
                     "status": "failed",
                     "completed_at": completed_at,
                     "error_message": error_message,
+                    # PAR-200: real per-document reasons, if this failure
+                    # came from the loop (other_failure re-raised, or
+                    # request_parser-classified documents that still left
+                    # the whole batch at 0 successes). Empty/undefined for
+                    # a genuine setup-phase failure before the loop ran.
+                    "document_failures": document_failures or None,
                 }
             ).eq("session_id", session_id).execute()
         except Exception:
