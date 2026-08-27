@@ -895,6 +895,43 @@ class TestParserRequestSlaSweep:
 # 6e. Partial-batch processing (PAR-61)
 # ===========================================================================
 
+class _FakeDocsRepo:
+    """
+    Minimal real-shaped stand-in for DocumentsRepo (PAR-200). The
+    orchestrator now queries the document's row via select_eq("id", ...)
+    right after process_document_background returns, to check its actual
+    resulting status — a bare MagicMock() silently "succeeds" at every
+    attribute/subscript access (MagicMock auto-configures magic methods
+    like __getitem__), which previously masked exactly this gap in tests.
+    This fake requires the row to genuinely exist and reflect whatever the
+    test's mocked process_document_background actually did.
+    """
+
+    def __init__(self):
+        self.rows: Dict[str, Dict[str, Any]] = {}
+
+    def create_document(self, row):
+        self.rows[row["id"]] = dict(row)
+        return row
+
+    def select_eq(self, column, value):
+        if column != "id":
+            return []
+        row = self.rows.get(value)
+        return [row] if row else []
+
+    def mark_completed(self, document_id):
+        self.rows[document_id]["status"] = "completed"
+
+    def mark_failed(self, document_id, *, error_type, error_message, next_action):
+        self.rows[document_id].update({
+            "status": "failed",
+            "error_type": error_type,
+            "error_message": error_message,
+            "next_action": next_action,
+        })
+
+
 class TestPartialBatchProcessing:
     def _mock_supabase(self):
         session_updates = []
@@ -932,16 +969,24 @@ class TestPartialBatchProcessing:
         from v1.integrations.musa_file_processor import process_musa_session
 
         mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
 
         async def _fake_download(url, timeout=300):
             return b"raw-bytes"
 
         call_count = {"n": 0}
 
-        def _ingest_side_effect(*, file_name, **kwargs):
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
             call_count["n"] += 1
             if "bad" in file_name:
+                fake_docs_repo.mark_failed(
+                    document_id,
+                    error_type="InvalidSchemaError",
+                    error_message="Unsupported bank format — no recognisable transactions",
+                    next_action="request_parser",
+                )
                 raise ValueError("Unsupported bank format — no recognisable transactions")
+            fake_docs_repo.mark_completed(document_id)
             return None
 
         webhook_calls = []
@@ -966,7 +1011,7 @@ class TestPartialBatchProcessing:
             AsyncMock(side_effect=_fake_download),
         ), patch(
             "v1.integrations.musa_file_processor.DocumentsRepo",
-            return_value=MagicMock(),
+            return_value=fake_docs_repo,
         ), patch(
             "v1.integrations.musa_file_processor.IngestionService.process_document_background",
             side_effect=_ingest_side_effect,
@@ -1126,6 +1171,278 @@ class TestPartialBatchProcessing:
         failed_updates = [u for u in session_updates if u.get("status") == "failed"]
         assert len(failed_updates) == 1
 
+
+# ===========================================================================
+# 6b. PAR-200: orchestrator consumes the REAL per-document outcome
+# ===========================================================================
+
+class TestOrchestratorConsumesRealDocumentOutcome:
+    """
+    PAR-200: process_document_background's real contract is `-> None` and it
+    NEVER raises for a genuine per-document parse failure -- it catches
+    everything internally (CurrencyMismatchError, InvalidSchemaError,
+    IngestionTimeoutError, and a trailing bare Exception) and records the
+    outcome on the document's own row via _update_failed(). These tests
+    simulate that REAL contract -- unlike TestPartialBatchProcessing above,
+    which mocks it as *raising*, a fictional premise that is exactly why the
+    real bug went uncaught by that test class. These fail against the
+    pre-fix orchestrator, which incremented succeeded_count unconditionally
+    right after the awaited call regardless of the document's real
+    resulting status.
+    """
+
+    def _mock_supabase(self):
+        session_updates = []
+        parser_request_inserts = []
+
+        def _fake_table(name):
+            tbl = MagicMock()
+            if name == "musa_sessions":
+                def _update(payload):
+                    session_updates.append(payload)
+                    return MagicMock(eq=MagicMock(
+                        return_value=MagicMock(execute=MagicMock(return_value=MagicMock()))
+                    ))
+                tbl.update.side_effect = _update
+            elif name == "parser_requests":
+                def _insert(row):
+                    parser_request_inserts.append(row)
+                    return MagicMock(execute=MagicMock(return_value=MagicMock()))
+                tbl.insert.side_effect = _insert
+            return tbl
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.side_effect = _fake_table
+        mock_supabase.storage.from_.return_value.upload.return_value = MagicMock()
+        return mock_supabase, session_updates, parser_request_inserts
+
+    def test_succeeded_count_reflects_real_status_not_clean_return(self, monkeypatch):
+        """
+        4 documents: 1 genuinely completes, 3 fail for 3 DIFFERENT real
+        reasons -- none of them ever raise. The pre-fix orchestrator would
+        have counted all 4 as succeeded_count and reported "4 of 4
+        processed successfully". The fix must report exactly 1 of 4, and
+        the two request_parser-classified failures must each produce their
+        own parser_requests row (PAR-125's previously-dead auto-request
+        path, confirmed reachable now that real failures are visible).
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import process_musa_session
+
+        mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
+
+        async def _fake_download(url, timeout=300):
+            return b"raw-bytes"
+
+        # Real per-document outcomes, applied to the fake repo exactly like
+        # the real process_document_background would -- write to the row,
+        # return None, never raise.
+        outcomes = {
+            "good.pdf": ("completed", None, None, None),
+            "unsupported_bank.pdf": (
+                "failed", "InvalidSchemaError",
+                "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+                "request_parser",
+            ),
+            "empty_statement.pdf": (
+                "failed", "InvalidSchemaError",
+                "No valid transactions extracted via parity-ingestion",
+                "request_parser",
+            ),
+            "wrong_currency.pdf": (
+                "failed", "CurrencyMismatchError",
+                "Statement currency USD does not match deal currency KES",
+                "fix_currency",
+            ),
+        }
+
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
+            status, error_type, error_message, next_action = outcomes[file_name]
+            if status == "completed":
+                fake_docs_repo.mark_completed(document_id)
+            else:
+                fake_docs_repo.mark_failed(
+                    document_id, error_type=error_type,
+                    error_message=error_message, next_action=next_action,
+                )
+            return None  # real contract: never raises
+
+        webhook_calls = []
+
+        async def _fake_send_webhook(**kwargs):
+            webhook_calls.append(kwargs)
+
+        documents = [{"url": f"https://example.com/signed/{name}"} for name in outcomes]
+
+        with patch(
+            "v1.integrations.musa_file_processor.get_supabase",
+            return_value=mock_supabase,
+        ), patch(
+            "v1.db.supabase_repositories.get_supabase",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._download_file",
+            AsyncMock(side_effect=_fake_download),
+        ), patch(
+            "v1.integrations.musa_file_processor.DocumentsRepo",
+            return_value=fake_docs_repo,
+        ), patch(
+            "v1.integrations.musa_file_processor.IngestionService.process_document_background",
+            side_effect=_ingest_side_effect,
+        ), patch(
+            "v1.integrations.musa_file_processor._run_export",
+            return_value={},
+        ), patch(
+            "v1.integrations.musa_file_processor._send_webhook",
+            AsyncMock(side_effect=_fake_send_webhook),
+        ), patch(
+            "v1.integrations.musa_file_processor._notify_parser_request",
+            AsyncMock(),
+        ):
+            asyncio.run(process_musa_session(
+                session_id="test-sid-real-outcome",
+                deal_id=str(uuid.uuid4()),
+                venture_name="Acme",
+                venture_country="Kenya",
+                documents=documents,
+                status_url="https://parity.io/status",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        complete_updates = [u for u in session_updates if u.get("status") == "complete"]
+        assert len(complete_updates) == 1, "session should complete (1 real success out of 4)"
+        assert "1 of 4 document(s) processed successfully" in (
+            complete_updates[0].get("error_message") or ""
+        ), complete_updates[0].get("error_message")
+
+        assert len(webhook_calls) == 1
+        assert webhook_calls[0]["status"] == "complete"
+
+        assert len(parser_request_inserts) == 2, (
+            "both request_parser-classified failures must each write their "
+            "own parser_requests row"
+        )
+        pr_messages = {row["error_message"] for row in parser_request_inserts}
+        assert pr_messages == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "No valid transactions extracted via parity-ingestion",
+        }, "parser_requests rows must carry the real, distinct per-document reasons"
+
+        doc_failures = complete_updates[0].get("document_failures")
+        assert doc_failures is not None and len(doc_failures) == 3, doc_failures
+        reasons = {f["error_message"] for f in doc_failures}
+        assert reasons == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "No valid transactions extracted via parity-ingestion",
+            "Statement currency USD does not match deal currency KES",
+        }, f"expected 3 distinct real reasons, got: {reasons}"
+        next_actions = {f["next_action"] for f in doc_failures}
+        assert next_actions == {"request_parser", "fix_currency"}
+
+    def test_all_documents_fail_for_distinct_reasons_session_gets_real_detail(self, monkeypatch):
+        """
+        The real-world shape from the June session (PAR-174/PAR-200): every
+        document fails, none raise, and the reasons are genuinely
+        different. Historically this collapsed into ONE generic
+        "No transactions for deal ... ingestion may have failed" message
+        with the real per-file reasons discarded. The fix must surface the
+        real, distinct reasons on the session record — additively, during
+        the 24h SLA window — even when nothing succeeds and PAR-62's
+        deferred-webhook timing stays unchanged.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import process_musa_session
+
+        mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
+
+        async def _fake_download(url, timeout=300):
+            return b"raw-bytes"
+
+        outcomes = {
+            "not_a_bank_statement.pdf": (
+                "InvalidSchemaError",
+                "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+                "request_parser",
+            ),
+            "unsupported_bank.pdf": (
+                "InvalidSchemaError",
+                "415: Bank format not recognised by parity-ingestion.",
+                "request_parser",
+            ),
+            "empty_statement.pdf": (
+                "InvalidSchemaError",
+                "No valid transactions extracted via parity-ingestion",
+                "request_parser",
+            ),
+        }
+
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
+            error_type, error_message, next_action = outcomes[file_name]
+            fake_docs_repo.mark_failed(
+                document_id, error_type=error_type,
+                error_message=error_message, next_action=next_action,
+            )
+            return None
+
+        webhook_calls = []
+
+        async def _fake_send_webhook(**kwargs):
+            webhook_calls.append(kwargs)
+
+        documents = [{"url": f"https://example.com/signed/{name}"} for name in outcomes]
+
+        with patch(
+            "v1.integrations.musa_file_processor.get_supabase",
+            return_value=mock_supabase,
+        ), patch(
+            "v1.db.supabase_repositories.get_supabase",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._download_file",
+            AsyncMock(side_effect=_fake_download),
+        ), patch(
+            "v1.integrations.musa_file_processor.DocumentsRepo",
+            return_value=fake_docs_repo,
+        ), patch(
+            "v1.integrations.musa_file_processor.IngestionService.process_document_background",
+            side_effect=_ingest_side_effect,
+        ), patch(
+            "v1.integrations.musa_file_processor._send_webhook",
+            AsyncMock(side_effect=_fake_send_webhook),
+        ), patch(
+            "v1.integrations.musa_file_processor._notify_parser_request",
+            AsyncMock(),
+        ):
+            asyncio.run(process_musa_session(
+                session_id="test-sid-all-fail-distinct",
+                deal_id=str(uuid.uuid4()),
+                venture_name="Acme",
+                venture_country="Kenya",
+                documents=documents,
+                status_url="https://parity.io/status",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        # All 3 are request_parser-classified -> deferred to the 24h SLA
+        # sweep, no immediate webhook or failed status (PAR-62, unchanged).
+        assert webhook_calls == []
+        assert not any(u.get("status") == "failed" for u in session_updates)
+        assert len(parser_request_inserts) == 3
+
+        detail_updates = [u for u in session_updates if u.get("document_failures")]
+        assert len(detail_updates) == 1
+        doc_failures = detail_updates[0]["document_failures"]
+        assert len(doc_failures) == 3
+        reasons = {f["error_message"] for f in doc_failures}
+        assert reasons == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "415: Bank format not recognised by parity-ingestion.",
+            "No valid transactions extracted via parity-ingestion",
+        }, f"expected 3 distinct real reasons, got: {reasons}"
 
 # ===========================================================================
 # 7. POST/GET shape parity (structural)
