@@ -1663,27 +1663,11 @@ def _build_four_point_reconciliation(
 
     checks: List[ReconCheck] = []
 
-    # ── Cash position — deliberately NOT coverage-softened (point 1) ─────────
-    cash_var = cash_r.get("variance_pct")
-    cash_status_raw = cash_r.get("status") or "SKIPPED"
-    cash_status = _resolve_recon_status(cash_status_raw, False)
-    if cash_status_raw == "EXACT_MATCH":
-        cash_assessment = "On submitted accounts: KES 0 variance."
-    elif cash_var is not None:
-        cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
-    else:
-        cash_assessment = cash_r.get("reason") or "Insufficient data."
-    checks.append(ReconCheck(
-        key="cash_position",
-        label="Cash position",
-        observed=_kes_to_money(cash_r.get("total_bank_kes", 0), currency),
-        observed_sub="Bank accounts at fiscal year-end",
-        declared=_kes_to_money(cash_r.get("total_declared_kes", 0), currency),
-        declared_sub="Note 11 · cash and equivalents",
-        variance=Percent(cash_var / 100) if cash_var is not None else None,
-        status=cash_status,
-        assessment=cash_assessment,
-    ))
+    # PAR-116: row ORDER is Revenue, Expenses, Loan activity, Cash position —
+    # per the ontology's own framing of revenue as the central signal of
+    # business health (four-act restructure, Act 2). Each block below still
+    # computes its status/assessment exactly as before (point 2's per-row
+    # derivation differences are untouched); only the append order changed.
 
     # ── Revenue — status parsed out of the free-text assessment (point 2) ────
     rev_gap = rev_r.get("gap_pct")
@@ -1743,6 +1727,28 @@ def _build_four_point_reconciliation(
         variance=Percent(loan_var / 100) if loan_var is not None else None,
         status=loan_status,
         assessment=_with_missing_note(loan_assessment, loan_status),
+    ))
+
+    # ── Cash position — deliberately NOT coverage-softened (point 1) ─────────
+    cash_var = cash_r.get("variance_pct")
+    cash_status_raw = cash_r.get("status") or "SKIPPED"
+    cash_status = _resolve_recon_status(cash_status_raw, False)
+    if cash_status_raw == "EXACT_MATCH":
+        cash_assessment = "On submitted accounts: KES 0 variance."
+    elif cash_var is not None:
+        cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
+    else:
+        cash_assessment = cash_r.get("reason") or "Insufficient data."
+    checks.append(ReconCheck(
+        key="cash_position",
+        label="Cash position",
+        observed=_kes_to_money(cash_r.get("total_bank_kes", 0), currency),
+        observed_sub="Bank accounts at fiscal year-end",
+        declared=_kes_to_money(cash_r.get("total_declared_kes", 0), currency),
+        declared_sub="Note 11 · cash and equivalents",
+        variance=Percent(cash_var / 100) if cash_var is not None else None,
+        status=cash_status,
+        assessment=cash_assessment,
     ))
 
     return FourPointReconciliation(available=True, checks=checks, fiscal_note=fiscal_note)

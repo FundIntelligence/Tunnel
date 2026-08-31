@@ -109,6 +109,7 @@
   --t1:  #374151;        /* Secondary text */
   --t2:  #6B7280;        /* Muted / labels */
   --t3:  #9CA3AF;        /* Hints / footnotes */
+  --navy: #080C18;       /* PAR-116: act-level heading color, Parity design system */
 
   /* Fonts */
   --serif: 'IBM Plex Serif', Georgia, serif;
@@ -354,6 +355,16 @@ body {
   margin-top: 4px;
   padding-top: 8px;
   border-top: 1px solid var(--border);
+}
+
+/* ── ACT-LEVEL HEADINGS (PAR-116) — one per act, above its first .sec ── */
+.act-title {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--navy);
+  letter-spacing: -.015em;
+  margin: 2px 0 6px;
 }
 
 /* ── PAGE BODY ── */
@@ -1056,18 +1067,12 @@ body {
     </div>
   </div>
 
-  <!-- DATA SUBMITTED -->
-  <div class="submitted-bar">
-    <span class="submitted-label">Data Submitted</span>
-    {% for pill in data_source_pills | default([]) %}
-    <span class="pill"><span class="pill-icon {{ '' if pill.active else 'missing' }}"></span>{{ pill.label | default('--') }}</span>
-    {% endfor %}
-    <div class="submitted-note">{{ data_source_note | default('') }}</div>
-  </div>
-
   <div class="page-body">
 
-    <!-- KEY METRICS -->
+    <!-- ═══ ACT 1 — ORIENTATION (PAR-116) ═══ -->
+    <div class="act-title">Act 1 — Orientation</div>
+
+    <!-- KEY METRICS (closest existing analog to an executive summary — leads Act 1) -->
     <div class="sec">
       <div class="sec-label">Key Metrics <span class="sec-label-badge">Observed · {{ total_txn_count | default(0) }} Classified Transactions</span></div>
       <div class="metrics-grid">
@@ -1081,50 +1086,83 @@ body {
       </div>
     </div>
 
-    <!-- MONTHLY CASHFLOW -->
+    <!-- DATA SUBMITTED — formalized into a proper Act 1 .sec component (PAR-116);
+         was previously an informal bar sitting between the page header and body. -->
     <div class="sec">
-      <div class="sec-label">Monthly Cashflow · Bank Operating Accounts <span class="sec-label-badge">Observed</span></div>
-      <table class="cf-table">
-        <colgroup>
-          <col style="width:72px">
-          <col style="width:22%">
-          <col style="width:22%">
-          <col style="width:22%">
-          <col>
-        </colgroup>
-        <thead>
-          <tr>
-            <th class="cf-th cf-th-left">Month</th>
-            <th class="cf-th">Inflow KES</th>
-            <th class="cf-th">Outflow KES</th>
-            <th class="cf-th cf-th-left" style="padding-left:8px">Net direction</th>
-            <th class="cf-th">Net KES</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in cashflow_rows | default([]) %}
-          <tr class="cf-row">
-            <td class="cf-month">{{ row.month_label | default('') }}</td>
-            <td class="cf-inflow">{{ row.inflow_str | default('--') }}</td>
-            <td class="cf-outflow">{{ row.outflow_str | default('--') }}</td>
-            <td class="cf-bar-cell">
-              <div class="cf-track">
-                <div class="cf-midline"></div>
-                <div class="{{ 'cf-bar-pos' if row.net_color_class == 'pos' else 'cf-bar-neg' }}" style="width:{{ row.bar_pct | default(0) }}%"></div>
-              </div>
-            </td>
-            <td class="{{ 'cf-net-pos' if row.net_color_class == 'pos' else 'cf-net-neg' }}">{{ row.net_str | default('--') }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-        <tfoot>
-          <tr><td colspan="5" class="cf-foot">{{ cashflow_note | default('') }}</td></tr>
-          {% if cashflow_peak_trough_note or cashflow_trend_note %}
-          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }} {{ cashflow_trend_note | default('') }}</td></tr>
-          {% endif %}
-        </tfoot>
-      </table>
+      <div class="sec-label">Data Submitted</div>
+      <div class="submitted-bar">
+        {% for pill in data_source_pills | default([]) %}
+        <span class="pill"><span class="pill-icon {{ '' if pill.active else 'missing' }}"></span>{{ pill.label | default('--') }}</span>
+        {% endfor %}
+        <div class="submitted-note">{{ data_source_note | default('') }}</div>
+      </div>
     </div>
+
+    <!-- ACCOUNT COVERAGE — moved up from page 3 into Act 1 (PAR-116); renders in both states -->
+    <div class="sec">
+      <div class="sec-label">Account Coverage — Declared vs Submitted
+        {% if account_coverage.available %}<span class="sec-label-badge">Advisory · {{ account_coverage.advisory_tier | default('--') }}</span>{% else %}<span class="sec-label-badge">Locked · Submit Audited Financials</span>{% endif %}
+      </div>
+      {% if account_coverage.available %}
+      <div>
+        <div class="coverage-header">
+          <div class="coverage-stat">
+            <div class="coverage-stat-label">Coverage</div>
+            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.coverage_pct | default('--') }}%</div>
+            <div class="coverage-stat-sub">Of declared accounts</div>
+          </div>
+          <div class="coverage-stat">
+            <div class="coverage-stat-label">Accounts submitted</div>
+            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.submitted_count | default(0) }} / {{ account_coverage.declared_count | default(0) }}</div>
+            <div class="coverage-stat-sub">Submitted vs declared</div>
+          </div>
+          <div class="coverage-stat">
+            <div class="coverage-stat-label">Missing balance</div>
+            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.missing_balance_str | default('--') }}</div>
+            <div class="coverage-stat-sub">Unverified</div>
+          </div>
+          <div class="coverage-stat">
+            <div class="coverage-stat-label">Advisory</div>
+            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.advisory_tier | default('--') }}</div>
+            <div class="coverage-stat-sub">Upload missing statements</div>
+          </div>
+        </div>
+        <table class="coverage-table">
+          <thead>
+            <tr><th>Declared account (Note 11)</th><th>Declared balance</th><th>Status</th><th>Materiality</th></tr>
+          </thead>
+          <tbody>
+            {% for a in account_coverage.accounts | default([]) %}
+            <tr>
+              <td>{{ a.bank_name | default('--') }}</td>
+              <td class="rt-figure">{{ a.declared_str | default('--') }}</td>
+              <td><span class="status-pill {{ a.status_class | default('status-missing') }}">{{ a.status_label | default('--') }}</span></td>
+              <td><span class="status-pill {{ a.materiality_class | default('status-missing') }}">{{ a.materiality | default('--') }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <div class="coverage-unlock">{{ account_coverage.recommendation | default('') }}</div>
+      </div>
+      {% else %}
+      <div class="analyst-notes">
+        <div class="analyst-notes-body" style="font-style:normal">{{ account_coverage.note | default('') }}</div>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if not recon_available %}
+    <!-- RECONCILIATION LOCKED notice — moved up from page 3 into Act 1, immediately
+         after Account Coverage (same family: a data-completeness message, not
+         reconciliation content itself) (PAR-116) -->
+    <div class="sec">
+      <div class="sec-label">Reconciliation <span class="sec-label-badge">Locked · Submit Audited Financials</span></div>
+      <div class="analyst-notes">
+        <div class="analyst-notes-header">Submit audited financials or management accounts to run reconciliation</div>
+        <div class="analyst-notes-body">Parity will compare what is observed in the bank data against what has been declared — producing a 4-point reconciliation with confidence tier and gap explanations.<br><br>Cash position vs Note 11 · Revenue vs declared turnover · Expenses vs cost of sales · Loan activity vs Note 14</div>
+      </div>
+    </div>
+    {% endif %}
 
   </div><!-- end page-body -->
 
@@ -1165,8 +1203,10 @@ body {
 
   <div class="page-body">
 
+    <div class="act-title">Act 2 — Core Reconciliation</div>
+
     {% if recon_available %}
-    <!-- RECONCILED STATE: 4-point recon table -->
+    <!-- RECONCILED STATE: 4-point recon table, part 1 — Revenue, Expenses (PAR-116 order) -->
     <div class="sec">
       <div class="sec-label">4-Point Reconciliation — Declared vs Observed <span class="sec-label-badge">Audited Financials + Bank{{ ' · ' + recon_fiscal_note if recon_fiscal_note else '' }}</span></div>
       <table class="recon-table">
@@ -1174,7 +1214,7 @@ body {
           <tr><th>Check</th><th>Observed (Bank)</th><th>Declared (Audit)</th><th>Variance</th><th>Assessment</th></tr>
         </thead>
         <tbody>
-          {% for row in recon_rows | default([]) %}
+          {% for row in (recon_rows | default([]))[:2] %}
           <tr>
             <td class="rt-check">{{ row.check | default('--') }}</td>
             <td>
@@ -1196,7 +1236,8 @@ body {
       </table>
     </div>
 
-    <!-- RECONCILED STATE: compact composition -->
+    <!-- RECONCILED STATE: compact composition — breakdown of the Revenue/Expenses
+         rows immediately above (PAR-116: positioned here, not after the full table) -->
     <div class="sec">
       <div class="sec-label">Inflow + Outflow Composition <span class="sec-label-badge">Observed · Classified</span></div>
       <div class="composition-grid">
@@ -1217,6 +1258,36 @@ body {
           {% if outflow_warn %}<div style="font-family:var(--mono);font-size:9px;color:var(--amber);background:var(--amber-d);border:1px solid rgba(200,150,12,.25);border-radius:3px;padding:7px 10px;margin-top:8px;line-height:1.5">⚠ {{ outflow_warn }}</div>{% endif %}
         </div>
       </div>
+    </div>
+
+    <!-- RECONCILED STATE: 4-point recon table, part 2 — Loan Activity, Cash Position (PAR-116 order) -->
+    <div class="sec">
+      <div class="sec-label">4-Point Reconciliation — Declared vs Observed <span class="sec-label-badge">Audited Financials + Bank{{ ' · ' + recon_fiscal_note if recon_fiscal_note else '' }}</span></div>
+      <table class="recon-table">
+        <thead>
+          <tr><th>Check</th><th>Observed (Bank)</th><th>Declared (Audit)</th><th>Variance</th><th>Assessment</th></tr>
+        </thead>
+        <tbody>
+          {% for row in (recon_rows | default([]))[2:] %}
+          <tr>
+            <td class="rt-check">{{ row.check | default('--') }}</td>
+            <td>
+              <div class="rt-figure">{{ row.observed_str | default('--') }}</div>
+              <div class="rt-sub">{{ row.observed_sub | default('') }}</div>
+            </td>
+            <td>
+              <div class="rt-figure">{{ row.declared_str | default('--') }}</div>
+              <div class="rt-sub">{{ row.declared_sub | default('') }}</div>
+            </td>
+            <td>
+              <div class="rt-variance {{ row.variance_class | default('bad') }}">{{ row.variance_str | default('--') }}</div>
+              <div class="rt-badge {{ row.badge_class | default('b-variance') }}" style="margin-top:4px">{{ row.badge_label | default('--') }}</div>
+            </td>
+            <td class="rt-assess">{{ row.assessment | default('--') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
 
     <!-- RECONCILED STATE: loan facilities -->
@@ -1241,25 +1312,6 @@ body {
         <span>Declared net borrowing: <strong style="color:var(--t1)">{{ loan_declared_net_str | default('--') }}</strong></span>
         <span>Variance: <strong style="color:var(--t1)">{{ loan_variance_str | default('--') }}</strong></span>
       </div>
-    </div>
-
-    <!-- RECONCILED STATE: inventory analysis (PAR-63) -->
-    <div class="sec">
-      <div class="sec-label">Inventory Analysis <span class="sec-label-badge">Audited Financials{{ ' · FY' + inventory.financial_year if inventory.financial_year else '' }}</span></div>
-      {% if inventory.available %}
-      <table class="loan-table">
-        <tbody>
-          <tr><td>Inventory</td><td class="rt-figure" style="text-align:right">{{ inventory.inventory_str }}</td></tr>
-          <tr><td>Cost of sales</td><td class="rt-figure" style="text-align:right">{{ inventory.cogs_str }}</td></tr>
-          <tr><td>Inventory turnover</td><td class="rt-figure" style="text-align:right">{{ inventory.turnover_str }}</td></tr>
-          <tr><td>Days Inventory Outstanding</td><td class="rt-figure" style="text-align:right">{{ inventory.dio_str }}</td></tr>
-          <tr><td>Extraction confidence</td><td class="rt-figure" style="text-align:right">{{ inventory.confidence_str }}</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ inventory.clause }}</div>
-      {% else %}
-      <div class="cashflow-note" style="border-top:none">{{ inventory.note }}</div>
-      {% endif %}
     </div>
 
     {% else %}
@@ -1314,96 +1366,7 @@ body {
       <div class="cashflow-note" style="border-top:none">{{ loan_facility_count | default(0) }} loan-related transaction patterns detected · Submit audited financials to see declared facility breakdown and reconcile Note 14</div>
     </div>
 
-    <!-- OBSERVED STATE: tax pattern -->
-    <div class="sec">
-      <div class="sec-label">Tax Payment Pattern <span class="sec-label-badge">Observed</span></div>
-      <table class="loan-table">
-        <tbody>
-          <tr><td>KRA payments detected</td><td class="rt-figure" style="text-align:right;color:var(--green)">{{ tax_count | default(0) }} transactions</td></tr>
-          <tr><td>Avg frequency</td><td class="rt-figure" style="text-align:right">{{ tax_freq_str | default('--') }}</td></tr>
-          <tr><td>Late payments / penalties detected</td><td class="rt-figure" style="text-align:right;color:{{ 'var(--red)' if (tax_penalty_count | default(0)) > 0 else 'var(--green)' }}">{{ tax_penalty_count | default(0) }}</td></tr>
-          {% if tax_jan_spike_str %}<tr><td>January spike</td><td class="rt-figure" style="text-align:right;color:var(--amber)">{{ tax_jan_spike_str }}</td></tr>{% endif %}
-          <tr><td>Total KRA payments</td><td class="rt-figure" style="text-align:right">{{ tax_total_str | default('--') }}</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ tax_note | default('') }}</div>
-    </div>
     {% endif %}
-
-    <!-- SUPPLIER PAYMENT ANALYSIS (PAR-63) — renders in both states -->
-    <div class="sec">
-      <div class="sec-label">Supplier Payment Analysis <span class="sec-label-badge">Observed · Classified</span></div>
-      {% if supplier_payments.available %}
-      <table class="loan-table">
-        <tbody>
-          <tr><td>Total supplier payments</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.total_str }}</td></tr>
-          <tr><td>Transactions</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.txn_count }}</td></tr>
-          <tr><td>Counterparties</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.entity_count }}</td></tr>
-          <tr><td>Top supplier</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.top_name }} · {{ supplier_payments.top_pct_str }}</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ supplier_payments.clause }}</div>
-      {% else %}
-      <div class="cashflow-note" style="border-top:none">No supplier payments classified for this deal.</div>
-      {% endif %}
-    </div>
-
-    <!-- TAX COMPLIANCE ANALYSIS (PAR-63) — renders in both states -->
-    <div class="sec">
-      <div class="sec-label">Tax Compliance Analysis <span class="sec-label-badge">Observed · Live Recompute</span></div>
-      <table class="loan-table">
-        <tbody>
-          <tr><td>Total KRA/tax payments</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.total_str }}</td></tr>
-          <tr><td>Months with tax activity</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.n_tax_months }} of {{ tax_compliance.n_total_months }}</td></tr>
-          <tr><td>Compliance status</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.kra_compliance }}</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ tax_compliance.clause }}</div>
-    </div>
-
-    <!-- TRANSACTION PATTERN ANALYSIS (PAR-63) — renders in both states -->
-    <div class="sec">
-      <div class="sec-label">Transaction Pattern Analysis <span class="sec-label-badge">Sealed Snapshot · Deterministic</span></div>
-      <table class="loan-table">
-        <tbody>
-          <tr><td>Critical-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.critical_count }}</td></tr>
-          <tr><td>High-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.high_count }}</td></tr>
-          <tr><td>Total patterns flagged</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.total_flagged }} of {{ transaction_patterns.total_txn_count }} transactions</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ transaction_patterns.clause }}</div>
-    </div>
-
-    <!-- INTER-ACCOUNT TRANSFER ANALYSIS (PAR-63; live-checked per PAR-102) -->
-    <div class="sec">
-      <div class="sec-label">Inter-Account Transfer Analysis <span class="sec-label-badge">{{ inter_account_transfer.badge_label }}</span></div>
-      {% if inter_account_transfer.pairs %}
-      <table class="loan-table">
-        <tbody>
-          {% for pair in inter_account_transfer.pairs %}
-          <tr><td>{{ pair.label }}</td><td class="rt-figure" style="text-align:right">{{ pair.count }} txns, {{ pair.total_str }}</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% endif %}
-      <div class="cashflow-note" style="border-top:none">{{ inter_account_transfer.note }}</div>
-      <div class="cashflow-note">{{ inter_account_transfer.override_note }}</div>
-    </div>
-
-    <!-- RISK ASSESSMENT SUMMARY (PAR-63) -->
-    <div class="sec">
-      <div class="sec-label">Risk Assessment Summary <span class="sec-label-badge">Rollup</span></div>
-      <table class="loan-table">
-        <tbody>
-          <tr><td>Overall confidence tier</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.tier }}</td></tr>
-          <tr><td>Account coverage advisory</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.advisory_tier }}{{ ' (' + risk_assessment.missing_pct + '% coverage)' if risk_assessment.missing_pct != '--' else '' }}</td></tr>
-          <tr><td>Revenue concentration (largest entity)</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.largest_rev_pct_str }}</td></tr>
-        </tbody>
-      </table>
-      <div class="cashflow-note">{{ risk_assessment.anomaly_summary }}</div>
-      <div class="cashflow-note">{{ risk_assessment.conclusion }}</div>
-      <div class="cashflow-note">{{ risk_assessment.transfer_note }}</div>
-    </div>
 
   </div><!-- end page-body -->
 
@@ -1443,72 +1406,23 @@ body {
 
   <div class="page-body">
 
-    {% if not recon_available %}
-    <!-- OBSERVED STATE: locked reconciliation -->
-    <div class="sec">
-      <div class="sec-label">Reconciliation <span class="sec-label-badge">Locked · Submit Audited Financials</span></div>
-      <div class="analyst-notes">
-        <div class="analyst-notes-header">Submit audited financials or management accounts to run reconciliation</div>
-        <div class="analyst-notes-body">Parity will compare what is observed in the bank data against what has been declared — producing a 4-point reconciliation with confidence tier and gap explanations.<br><br>Cash position vs Note 11 · Revenue vs declared turnover · Expenses vs cost of sales · Loan activity vs Note 14</div>
-      </div>
-    </div>
-    {% endif %}
+    <!-- ═══ ACT 3 — SUPPORTING DIAGNOSTICS (PAR-116) ═══ -->
+    <div class="act-title">Act 3 — Supporting Diagnostics</div>
 
-    <!-- ACCOUNT COVERAGE — renders in both states -->
+    <!-- TRANSACTION PATTERN ANALYSIS + OBSERVED PATTERNS — merged into one
+         section per PAR-118: same evidence class, "flagged, not concluded" -->
     <div class="sec">
-      <div class="sec-label">Account Coverage — Declared vs Submitted
-        {% if account_coverage.available %}<span class="sec-label-badge">Advisory · {{ account_coverage.advisory_tier | default('--') }}</span>{% else %}<span class="sec-label-badge">Locked · Submit Audited Financials</span>{% endif %}
-      </div>
-      {% if account_coverage.available %}
-      <div>
-        <div class="coverage-header">
-          <div class="coverage-stat">
-            <div class="coverage-stat-label">Coverage</div>
-            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.coverage_pct | default('--') }}%</div>
-            <div class="coverage-stat-sub">Of declared accounts</div>
-          </div>
-          <div class="coverage-stat">
-            <div class="coverage-stat-label">Accounts submitted</div>
-            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.submitted_count | default(0) }} / {{ account_coverage.declared_count | default(0) }}</div>
-            <div class="coverage-stat-sub">Submitted vs declared</div>
-          </div>
-          <div class="coverage-stat">
-            <div class="coverage-stat-label">Missing balance</div>
-            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.missing_balance_str | default('--') }}</div>
-            <div class="coverage-stat-sub">Unverified</div>
-          </div>
-          <div class="coverage-stat">
-            <div class="coverage-stat-label">Advisory</div>
-            <div class="coverage-stat-value {{ account_coverage.coverage_color_class | default('') }}">{{ account_coverage.advisory_tier | default('--') }}</div>
-            <div class="coverage-stat-sub">Upload missing statements</div>
-          </div>
-        </div>
-        <table class="coverage-table">
-          <thead>
-            <tr><th>Declared account (Note 11)</th><th>Declared balance</th><th>Status</th><th>Materiality</th></tr>
-          </thead>
-          <tbody>
-            {% for a in account_coverage.accounts | default([]) %}
-            <tr>
-              <td>{{ a.bank_name | default('--') }}</td>
-              <td class="rt-figure">{{ a.declared_str | default('--') }}</td>
-              <td><span class="status-pill {{ a.status_class | default('status-missing') }}">{{ a.status_label | default('--') }}</span></td>
-              <td><span class="status-pill {{ a.materiality_class | default('status-missing') }}">{{ a.materiality | default('--') }}</span></td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        <div class="coverage-unlock">{{ account_coverage.recommendation | default('') }}</div>
-      </div>
-      {% else %}
-      <div class="analyst-notes">
-        <div class="analyst-notes-body" style="font-style:normal">{{ account_coverage.note | default('') }}</div>
-      </div>
-      {% endif %}
-    </div>
+      <div class="sec-label">Transaction Pattern Analysis <span class="sec-label-badge">Sealed Snapshot · Deterministic</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Critical-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.critical_count }}</td></tr>
+          <tr><td>High-severity patterns</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.high_count }}</td></tr>
+          <tr><td>Total patterns flagged</td><td class="rt-figure" style="text-align:right">{{ transaction_patterns.total_flagged }} of {{ transaction_patterns.total_txn_count }} transactions</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ transaction_patterns.clause }}</div>
 
-    <div class="sec">
-      <div class="sec-label">Observed Patterns — For Analyst Review <span class="sec-label-badge">Named · Not Concluded</span></div>
+      <div class="cashflow-note">Observed Patterns — For Analyst Review · Named · Not Concluded</div>
       {% if patterns | default([]) %}
       <div class="pattern-card">
         {% for pat in patterns %}
@@ -1526,6 +1440,144 @@ body {
       {% endif %}
     </div>
 
+    <!-- SUPPLIER PAYMENT ANALYSIS (PAR-63) — renders in both states -->
+    <div class="sec">
+      <div class="sec-label">Supplier Payment Analysis <span class="sec-label-badge">Observed · Classified</span></div>
+      {% if supplier_payments.available %}
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Total supplier payments</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.total_str }}</td></tr>
+          <tr><td>Transactions</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.txn_count }}</td></tr>
+          <tr><td>Counterparties</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.entity_count }}</td></tr>
+          <tr><td>Top supplier</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.top_name }} · {{ supplier_payments.top_pct_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ supplier_payments.clause }}</div>
+      {% else %}
+      <div class="cashflow-note" style="border-top:none">No supplier payments classified for this deal.</div>
+      {% endif %}
+    </div>
+
+    <!-- INTER-ACCOUNT TRANSFER ANALYSIS (PAR-63; live-checked per PAR-102) -->
+    <div class="sec">
+      <div class="sec-label">Inter-Account Transfer Analysis <span class="sec-label-badge">{{ inter_account_transfer.badge_label }}</span></div>
+      {% if inter_account_transfer.pairs %}
+      <table class="loan-table">
+        <tbody>
+          {% for pair in inter_account_transfer.pairs %}
+          <tr><td>{{ pair.label }}</td><td class="rt-figure" style="text-align:right">{{ pair.count }} txns, {{ pair.total_str }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      <div class="cashflow-note" style="border-top:none">{{ inter_account_transfer.note }}</div>
+      <div class="cashflow-note">{{ inter_account_transfer.override_note }}</div>
+    </div>
+
+    {% if not recon_available %}
+    <!-- OBSERVED STATE: tax pattern — same slot as Tax Compliance Analysis below,
+         preserving its original relative order (PAR-116) -->
+    <div class="sec">
+      <div class="sec-label">Tax Payment Pattern <span class="sec-label-badge">Observed</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>KRA payments detected</td><td class="rt-figure" style="text-align:right;color:var(--green)">{{ tax_count | default(0) }} transactions</td></tr>
+          <tr><td>Avg frequency</td><td class="rt-figure" style="text-align:right">{{ tax_freq_str | default('--') }}</td></tr>
+          <tr><td>Late payments / penalties detected</td><td class="rt-figure" style="text-align:right;color:{{ 'var(--red)' if (tax_penalty_count | default(0)) > 0 else 'var(--green)' }}">{{ tax_penalty_count | default(0) }}</td></tr>
+          {% if tax_jan_spike_str %}<tr><td>January spike</td><td class="rt-figure" style="text-align:right;color:var(--amber)">{{ tax_jan_spike_str }}</td></tr>{% endif %}
+          <tr><td>Total KRA payments</td><td class="rt-figure" style="text-align:right">{{ tax_total_str | default('--') }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ tax_note | default('') }}</div>
+    </div>
+    {% endif %}
+
+    <!-- TAX COMPLIANCE ANALYSIS (PAR-63) — renders in both states -->
+    <div class="sec">
+      <div class="sec-label">Tax Compliance Analysis <span class="sec-label-badge">Observed · Live Recompute</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Total KRA/tax payments</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.total_str }}</td></tr>
+          <tr><td>Months with tax activity</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.n_tax_months }} of {{ tax_compliance.n_total_months }}</td></tr>
+          <tr><td>Compliance status</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.kra_compliance }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ tax_compliance.clause }}</div>
+    </div>
+
+    <!-- MONTHLY CASHFLOW — moved from page 1 (PAR-116) -->
+    <div class="sec">
+      <div class="sec-label">Monthly Cashflow · Bank Operating Accounts <span class="sec-label-badge">Observed</span></div>
+      <table class="cf-table">
+        <colgroup>
+          <col style="width:72px">
+          <col style="width:22%">
+          <col style="width:22%">
+          <col style="width:22%">
+          <col>
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="cf-th cf-th-left">Month</th>
+            <th class="cf-th">Inflow KES</th>
+            <th class="cf-th">Outflow KES</th>
+            <th class="cf-th cf-th-left" style="padding-left:8px">Net direction</th>
+            <th class="cf-th">Net KES</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in cashflow_rows | default([]) %}
+          <tr class="cf-row">
+            <td class="cf-month">{{ row.month_label | default('') }}</td>
+            <td class="cf-inflow">{{ row.inflow_str | default('--') }}</td>
+            <td class="cf-outflow">{{ row.outflow_str | default('--') }}</td>
+            <td class="cf-bar-cell">
+              <div class="cf-track">
+                <div class="cf-midline"></div>
+                <div class="{{ 'cf-bar-pos' if row.net_color_class == 'pos' else 'cf-bar-neg' }}" style="width:{{ row.bar_pct | default(0) }}%"></div>
+              </div>
+            </td>
+            <td class="{{ 'cf-net-pos' if row.net_color_class == 'pos' else 'cf-net-neg' }}">{{ row.net_str | default('--') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+        <tfoot>
+          <tr><td colspan="5" class="cf-foot">{{ cashflow_note | default('') }}</td></tr>
+          {% if cashflow_peak_trough_note or cashflow_trend_note %}
+          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }} {{ cashflow_trend_note | default('') }}</td></tr>
+          {% endif %}
+        </tfoot>
+      </table>
+    </div>
+
+    {% if recon_available %}
+    <!-- INVENTORY ANALYSIS (PAR-63) — moved from Act 2 to end of Act 3 (PAR-116);
+         unconditional-in-act, but content itself stays recon_available-only,
+         unchanged from its original gating -->
+    <div class="sec">
+      <div class="sec-label">Inventory Analysis <span class="sec-label-badge">Audited Financials{{ ' · FY' + inventory.financial_year if inventory.financial_year else '' }}</span></div>
+      {% if inventory.available %}
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Inventory</td><td class="rt-figure" style="text-align:right">{{ inventory.inventory_str }}</td></tr>
+          <tr><td>Cost of sales</td><td class="rt-figure" style="text-align:right">{{ inventory.cogs_str }}</td></tr>
+          <tr><td>Inventory turnover</td><td class="rt-figure" style="text-align:right">{{ inventory.turnover_str }}</td></tr>
+          <tr><td>Days Inventory Outstanding</td><td class="rt-figure" style="text-align:right">{{ inventory.dio_str }}</td></tr>
+          <tr><td>Extraction confidence</td><td class="rt-figure" style="text-align:right">{{ inventory.confidence_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ inventory.clause }}</div>
+      {% else %}
+      <div class="cashflow-note" style="border-top:none">{{ inventory.note }}</div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- ═══ ACT 4 — SYNTHESIS (PAR-116) ═══ -->
+    <div class="act-title">Act 4 — Synthesis</div>
+
+    <!-- ANALYST NOTES — moved immediately before Risk Assessment Summary:
+         field intelligence context belongs just ahead of the final rollup -->
     <div class="sec">
       <div class="sec-label">Analyst Notes <span class="sec-label-badge">Field Intelligence · Analyst Context</span></div>
       <div class="analyst-notes">
@@ -1536,6 +1588,21 @@ body {
         <div class="analyst-notes-body">No notes added. Add site visit observations, business model context, field intelligence — clearly separated from system-observed patterns above.</div>
         {% endif %}
       </div>
+    </div>
+
+    <!-- RISK ASSESSMENT SUMMARY (PAR-63) — genuinely last -->
+    <div class="sec">
+      <div class="sec-label">Risk Assessment Summary <span class="sec-label-badge">Rollup</span></div>
+      <table class="loan-table">
+        <tbody>
+          <tr><td>Overall confidence tier</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.tier }}</td></tr>
+          <tr><td>Account coverage advisory</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.advisory_tier }}{{ ' (' + risk_assessment.missing_pct + '% coverage)' if risk_assessment.missing_pct != '--' else '' }}</td></tr>
+          <tr><td>Revenue concentration (largest entity)</td><td class="rt-figure" style="text-align:right">{{ risk_assessment.largest_rev_pct_str }}</td></tr>
+        </tbody>
+      </table>
+      <div class="cashflow-note">{{ risk_assessment.anomaly_summary }}</div>
+      <div class="cashflow-note">{{ risk_assessment.conclusion }}</div>
+      <div class="cashflow-note">{{ risk_assessment.transfer_note }}</div>
     </div>
 
   </div><!-- end page-body -->
