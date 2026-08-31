@@ -5,6 +5,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..config import COMPUTATION_FINGERPRINT
 from ..parsing.common import canonical_hash, sort_rows
 from .declared_financials import DeclaredFinancials
 from .reconciliation import compute_reconciliation
@@ -261,6 +262,27 @@ def export_snapshot(
     canonical_json, sha = canonicalize_payload(payload)
     existing = snapshot_repo.get_by_hash(sha)
     if existing:
+        # PAR-219: an identical hash means the recomputed figures are
+        # byte-identical, so the row is still correct and must be reused (the
+        # hash is a unique key). But it may have been sealed by older code and
+        # carry a stale/NULL computation_fingerprint, which would make
+        # export()'s short-circuit re-compute it again on every single call.
+        # Stamp the current fingerprint so the work converges instead of
+        # repeating forever. Non-fatal: a repo without this capability (or a
+        # DB that hasn't run migration 040 yet) just keeps the old behaviour.
+        if existing.get("computation_fingerprint") != COMPUTATION_FINGERPRINT:
+            try:
+                snapshot_repo.set_computation_fingerprint(
+                    existing["id"], COMPUTATION_FINGERPRINT
+                )
+                existing = dict(existing)
+                existing["computation_fingerprint"] = COMPUTATION_FINGERPRINT
+            except Exception:  # pragma: no cover - defensive, never fatal
+                logger.warning(
+                    "[SNAPSHOT] could not stamp computation_fingerprint on %s",
+                    existing.get("id"),
+                    exc_info=True,
+                )
         return existing
     stored_cj = compress_canonical_json_if_large(canonical_json)
     snapshot = {
@@ -273,5 +295,9 @@ def export_snapshot(
         "sha256_hash": sha,
         "canonical_json": stored_cj,
         "created_by": created_by,
+        # PAR-219: provenance only — deliberately NOT in `payload`, so it never
+        # reaches canonicalize_payload() and never affects sha256_hash or
+        # financial_state_hash.
+        "computation_fingerprint": COMPUTATION_FINGERPRINT,
     }
     return snapshot_repo.insert_snapshot(snapshot)

@@ -28,7 +28,7 @@ from .utils.pdf_merge import validate_pdf_count
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 
-from .config import SCHEMA_VERSION, CONFIG_VERSION, GIT_COMMIT, BUILD_TIMESTAMP, DETERMINISTIC_MODE, MAX_PDF_FILES, MAX_BATCH_UPLOADS
+from .config import SCHEMA_VERSION, CONFIG_VERSION, COMPUTATION_FINGERPRINT, GIT_COMMIT, BUILD_TIMESTAMP, DETERMINISTIC_MODE, MAX_PDF_FILES, MAX_BATCH_UPLOADS
 from .ingestion.service import IngestionService
 from .parsing.errors import CurrencyMismatchError, InvalidSchemaError
 from .core.pipeline import run_pipeline
@@ -1061,12 +1061,23 @@ def export(request: Request, deal_id: str, force: bool = False):
     )
     snap_created_at = (latest_snapshot or {}).get("created_at") or ""
     snap_config_version = (latest_snapshot or {}).get("config_version")
+    # PAR-219: a backend code deploy was not previously an invalidation signal,
+    # so a shipped computation-logic fix never reached already-sealed deals —
+    # PAR-217's corrected reconciliation figure was live at 100% traffic while
+    # every sealed deal kept serving the pre-fix number. Comparing the snapshot's
+    # recorded computation fingerprint against the running one closes that gap
+    # automatically, with no version constant for anyone to remember to bump.
+    # NULL (pre-migration-040 rows, i.e. every snapshot sealed before this
+    # mechanism existed) deliberately never matches, so those re-compute once and
+    # then carry a real fingerprint.
+    snap_fingerprint = (latest_snapshot or {}).get("computation_fingerprint")
     if not force and (
         latest_snapshot
         and snap_created_at
         and (not latest_doc_at or snap_created_at >= latest_doc_at)
         and snap_created_at > latest_override_at
         and snap_config_version == CONFIG_VERSION
+        and snap_fingerprint == COMPUTATION_FINGERPRINT
     ):
         latest_run = repos["runs"].get_latest_run(deal_id)
         if latest_run and latest_run.get("id") == latest_snapshot.get("analysis_run_id"):
@@ -1087,6 +1098,16 @@ def export(request: Request, deal_id: str, force: bool = False):
             }
     if latest_snapshot and snap_config_version != CONFIG_VERSION:
         logger.info("[EXPORT] deal=%s config_version mismatch snap=%s current=%s — bypassing cache", deal_id, snap_config_version, CONFIG_VERSION)
+    elif latest_snapshot and snap_fingerprint != COMPUTATION_FINGERPRINT:
+        # PAR-219: distinct log line from the config_version case so a deploy-
+        # driven recompute is attributable in logs rather than looking like a
+        # mystery cache miss.
+        logger.info(
+            "[EXPORT] deal=%s computation_fingerprint mismatch snap=%s current=%s — bypassing cache",
+            deal_id,
+            snap_fingerprint,
+            COMPUTATION_FINGERPRINT,
+        )
 
     stage = "PIPELINE_START"
     run, links, entities, txn_map = run_pipeline(

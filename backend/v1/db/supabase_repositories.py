@@ -638,8 +638,19 @@ class SnapshotsRepo(SnapshotsRepository, BaseRepo):
     # 500 (PAR-33). List/metadata consumers never read it, so we never fetch it here.
     _METADATA_COLUMNS = (
         "id, deal_id, analysis_run_id, schema_version, config_version, "
-        "sha256_hash, created_by, created_at, financial_state_hash"
+        "sha256_hash, created_by, created_at, financial_state_hash, "
+        "computation_fingerprint"
     )
+
+    def set_computation_fingerprint(self, snapshot_id: str, fingerprint: str) -> None:
+        """PAR-219: stamp provenance on an existing row. Used when a recompute
+        produces a byte-identical hash (so the existing row is reused) but that
+        row was sealed by older code — without this the short-circuit would
+        re-compute the same deal on every subsequent call instead of
+        converging. Never touches any hashed field."""
+        self.client.table(self.table).update(
+            {"computation_fingerprint": fingerprint}
+        ).eq("id", snapshot_id).execute()
 
     def list_snapshots(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         # Metadata only — no canonical_json. Callers (GET /deals/{id},
