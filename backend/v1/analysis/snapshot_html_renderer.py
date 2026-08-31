@@ -319,6 +319,15 @@ def _inter_account_transfer_ctx_from(iat: _InterAccountTransfer) -> Dict[str, An
     }[iat.state]
     return {
         "badge_label":   badge_label,
+        # PAR-208 — the raw semantic state, passed through so the methodology
+        # appendix can state whether transfer matching is actually running for
+        # this deal rather than hardcoding "not active". Verified against live
+        # prod 2026-08-31: this is UNAVAILABLE on every deal (PAR-102 open —
+        # 0 transfer-tagged txns, 0 pds_transfer_links rows, exactly 1 distinct
+        # account_id across all 193,327 rows). Driving the wording off the real
+        # state means the appendix corrects itself if PAR-102 ships, instead of
+        # silently describing a rule that is not running.
+        "state":         iat.state,
         "pairs": [
             {"label": p.label, "count": p.count, "total_str": _fmt_money_kes(p.total)}
             for p in iat.pairs

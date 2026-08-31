@@ -357,6 +357,87 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* ── METHODOLOGY APPENDIX (PAR-208) — closes Act 4 ──
+   Documentation only: describes HOW figures were computed, never what they
+   mean for a deal. No existing class matched this content, so these are new;
+   they reuse only weights the document already self-hosts (verified: IBM Plex
+   Serif 400 and IBM Plex Sans 300 are both among the embedded faces above —
+   test_pdf_font_selfhost.py counts those declarations by literal string match,
+   so do not name that token in a comment or the count breaks).
+   Heading is serif 400 — not bold, not all-caps, matching .company-name's
+   established serif-400 precedent rather than .act-title's heavier 600.
+   Semantic --green/--amber/--red are unused: an appendix states method, it
+   carries no status. */
+.appendix {
+  border-top: 1px solid var(--border-md);
+  padding-top: 12px;
+  margin-top: 2px;
+}
+
+.appendix-title {
+  font-family: var(--serif);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--t0);
+  letter-spacing: -.01em;
+  margin-bottom: 3px;
+}
+
+.appendix-intro {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 10px;
+  color: var(--t2);
+  line-height: 1.6;
+  margin-bottom: 10px;
+}
+
+.appendix-item { margin-bottom: 9px; }
+
+.appendix-term {
+  font-family: var(--sans);
+  font-weight: 500;
+  font-size: 10.5px;
+  color: var(--t1);
+  margin-bottom: 2px;
+}
+
+/* Body prose is IBM Plex Sans 300 per the design system. */
+.appendix-body {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 10.5px;
+  color: var(--t1);
+  line-height: 1.65;
+}
+
+/* Mono is used ONLY where an actual parameter, field name or value appears —
+   never for the surrounding sentence. */
+.appendix-val {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--t0);
+}
+
+/* A load-bearing statement of fact about what is and isn't running. Weight 500
+   is the document's emphasis ceiling — <strong>/<b> would render bold via the
+   UA stylesheet and break the type rules, so the emphasis is a class, not a tag. */
+.appendix-flag {
+  font-family: var(--sans);
+  font-weight: 500;
+  color: var(--t0);
+}
+
+.appendix-foot {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  color: var(--t2);
+  line-height: 1.55;
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 7px;
+}
+
 /* ── GAP WATERFALL (PAR-207) — per-row declared/observed breakdown ──
    No waterfall pattern existed in this template before this ticket (the
    Expenses row's "gap explanation" is a single sentence with no per-component
@@ -1722,6 +1803,102 @@ body {
       <div class="cashflow-note">{{ risk_assessment.anomaly_summary }}</div>
       <div class="cashflow-note">{{ risk_assessment.conclusion }}</div>
       <div class="cashflow-note">{{ risk_assessment.transfer_note }}</div>
+    </div>
+
+    {# ── METHODOLOGY APPENDIX (PAR-208) — closes Act 4 ──
+       Static disclosure of computation logic that already exists in the
+       pipeline. Every claim below was checked against the actual code on
+       2026-08-31, not against intended behaviour:
+         · fiscal window       reconciliation_engine.py _get_fiscal_year_transactions()
+                               + calculate_cash_position_reconciliation()
+         · entity resolution   core/entities.py build_entities() / _clean_display_name()
+         · transfer matching   core/transfer_matcher.py match_transfers()
+         · classification      core/classifier.py classify_with_reason()
+       The transfer paragraph branches on the deal's REAL detection state
+       rather than hardcoding "not active", so it corrects itself if PAR-102
+       ships. Describes HOW a figure was computed only — no sentence here
+       evaluates what any figure means for this deal. #}
+    <div class="sec">
+      <div class="sec-label">Methodology <span class="sec-label-badge">How these figures were computed</span></div>
+      <div class="appendix">
+        <div class="appendix-title">Methodology appendix</div>
+        <div class="appendix-intro">
+          How the figures in this report were derived. This section describes computation only; it makes no assessment of this business.
+        </div>
+
+        <div class="appendix-item">
+          <div class="appendix-term">Fiscal-year date filtering</div>
+          <div class="appendix-body">
+            The comparison window is the fiscal year declared in the audited financials
+            (<span class="appendix-val">financial_year_start</span> to <span class="appendix-val">financial_year_end</span>), not the date range of the bank statements themselves.
+            Bank statements often extend past the declared year-end; transactions dated outside the
+            declared fiscal year are excluded from the revenue, expense and loan-activity comparisons
+            rather than truncating or rescaling the statement. Cash position is compared at the declared
+            fiscal year-end date for the same reason — taking each statement's own closing date instead
+            would compare balances struck on different days.
+          </div>
+        </div>
+
+        <div class="appendix-item">
+          <div class="appendix-term">Entity resolution</div>
+          <div class="appendix-body">
+            Counterparty names are derived from each transaction's raw bank descriptor by an ordered set
+            of normalisation rules, first match wins, falling back to a truncated descriptor when no rule
+            applies. Names are then lower-cased and whitespace-collapsed, and transactions resolving to the
+            same normalised name are grouped as one counterparty — this is what collapses repeated rows for
+            the same payer or supplier into a single named entity. Entities are scoped to this deal only;
+            no counterparty identity is carried across deals.
+          </div>
+        </div>
+
+        <div class="appendix-item">
+          <div class="appendix-term">Inter-account transfer matching</div>
+          <div class="appendix-body">
+            {% if inter_account_transfer.state == 'UNAVAILABLE' %}
+            A transfer between two of the company's own accounts is intended to be identified by pairing a
+            debit against a credit of the same amount, opposite sign, dated within
+            <span class="appendix-val">2 calendar days</span>, drawn from two different accounts, where each side is the
+            other's only candidate. <span class="appendix-flag">This check is not currently active for any deal.</span> It requires each
+            statement to carry a distinct account identifier, and that identifier is not currently populated
+            during ingestion, so no pair can ever satisfy the different-account condition. Figures described
+            in this report as operational inflows or outflows are therefore gross — any transfer between the
+            company's own accounts remains counted in them. See the Inter-Account Transfer Analysis section
+            for this deal's status.
+            {% elif inter_account_transfer.state == 'NO_TRANSFERS_FOUND' %}
+            Transfers between two of the company's own accounts are identified by pairing a debit against a
+            credit of the same amount, opposite sign, dated within <span class="appendix-val">2 calendar days</span>, drawn from two
+            different accounts, where each side is the other's only candidate; a transaction with more than
+            one possible match is left unpaired rather than guessed. This check ran for this deal and
+            returned no pairs. See the Inter-Account Transfer Analysis section.
+            {% else %}
+            Transfers between two of the company's own accounts are identified by pairing a debit against a
+            credit of the same amount, opposite sign, dated within <span class="appendix-val">2 calendar days</span>, drawn from two
+            different accounts, where each side is the other's only candidate; a transaction with more than
+            one possible match is left unpaired rather than guessed. Matched pairs are excluded from
+            operational inflow and outflow figures. See the Inter-Account Transfer Analysis section for the
+            pairs found on this deal.
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="appendix-item">
+          <div class="appendix-term">Classification: classified, needs_review, and other</div>
+          <div class="appendix-body">
+            Every transaction is assigned exactly one role by deterministic rules applied in a fixed order —
+            transfer flag, then keyword match against the normalised descriptor, then an amount-based
+            fallback — and each carries a recorded reason for the role it received. A transaction is routed
+            to <span class="appendix-val">needs_review</span> rather than guessed when an unmatched credit is large relative to this
+            business's own transaction sizes, or when a matched role contradicts the direction of the
+            amount; <span class="appendix-val">other</span> covers transactions no rule claims. The role vocabulary and the conditions that
+            trigger review are fixed by Parity's published classification methodology and are not tuned
+            per deal or per report.
+          </div>
+        </div>
+
+        <div class="appendix-foot">
+          Figures are computed from integer cents throughout; currency amounts are rounded only for display. This report is generated deterministically — the same inputs always produce the same output and the same SHA-256 seal.
+        </div>
+      </div>
     </div>
 
   </div><!-- end page-body -->
