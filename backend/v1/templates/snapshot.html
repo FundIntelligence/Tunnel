@@ -357,6 +357,82 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* ── GAP WATERFALL (PAR-207) — per-row declared/observed breakdown ──
+   No waterfall pattern existed in this template before this ticket (the
+   Expenses row's "gap explanation" is a single sentence with no per-component
+   amounts), so these classes are new. They are built entirely from existing
+   design tokens and mirror .loan-summary's established mono/--page/--border-md
+   idiom rather than introducing a new visual language. Semantic colours
+   (--green/--amber/--red) are deliberately unused here: they are meaning-locked
+   to verified/warning/error, and a waterfall line is a stated amount, not a
+   status. Weight caps at 500 per the type rules — no bold anywhere. */
+.wf {
+  background: var(--page);
+  border-top: 1px solid var(--border-md);
+  padding: 10px 14px 4px;
+}
+
+.wf-title {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--t2);
+  margin-bottom: 7px;
+}
+
+.wf-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 0;
+}
+
+.wf-label {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  color: var(--t1);
+  line-height: 1.4;
+}
+
+.wf-sub {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  color: var(--t3);
+  margin-top: 1px;
+}
+
+/* Every amount is IBM Plex Mono per the design system — non-negotiable. */
+.wf-amount {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--t0);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.wf-total .wf-amount,
+.wf-total .wf-label { font-weight: 500; }
+.wf-total { border-top: 1px solid var(--border); margin-top: 2px; padding-top: 5px; }
+
+.wf-gap { border-top: 1px solid var(--border-md); margin-top: 2px; padding-top: 5px; }
+.wf-gap .wf-amount,
+.wf-gap .wf-label { font-weight: 500; }
+
+.wf-component { padding-top: 5px; }
+
+.wf-note {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  color: var(--t2);
+  line-height: 1.55;
+  border-top: 1px solid var(--border);
+  margin-top: 7px;
+  padding: 7px 0 6px;
+}
+
 /* ── ACT-LEVEL HEADINGS (PAR-116) — one per act, above its first .sec ── */
 .act-title {
   font-family: var(--serif);
@@ -1234,6 +1310,29 @@ body {
           {% endfor %}
         </tbody>
       </table>
+      {# PAR-207 — gap waterfall for any row in this half that carries one
+         (Revenue). Rendered beneath the table, following .loan-summary's
+         existing "summary strip appended below its table" idiom, rather than
+         as an extra <tr>: an injected row would shift .recon-table's
+         nth-child(even) striping for every row after it, silently changing the
+         Expenses row's appearance, which is out of this ticket's scope. #}
+      {% for row in (recon_rows | default([]))[:2] if row.waterfall %}
+      <div class="wf">
+        <div class="wf-title">{{ row.check | default('--') }} — declared vs observed breakdown</div>
+        {% for c in row.waterfall.components %}
+        <div class="wf-row {{ c.kind_class | default('wf-plain') }}">
+          <div>
+            <div class="wf-label">{{ c.label | default('--') }}</div>
+            {% if c.sub %}<div class="wf-sub">{{ c.sub }}</div>{% endif %}
+          </div>
+          <div class="wf-amount">{{ c.amount_str | default('--') }}</div>
+        </div>
+        {% endfor %}
+        {% for d in row.waterfall.disclosures %}
+        <div class="wf-note">{{ d }}</div>
+        {% endfor %}
+      </div>
+      {% endfor %}
     </div>
 
     <!-- RECONCILED STATE: compact composition — breakdown of the Revenue/Expenses
@@ -1288,6 +1387,26 @@ body {
           {% endfor %}
         </tbody>
       </table>
+      {# PAR-207 — gap waterfall for any row in this half that carries one
+         (Cash position). The Loan activity row deliberately has none until
+         PAR-211's scoping resolves — see _build_four_point_reconciliation(). #}
+      {% for row in (recon_rows | default([]))[2:] if row.waterfall %}
+      <div class="wf">
+        <div class="wf-title">{{ row.check | default('--') }} — declared vs observed breakdown</div>
+        {% for c in row.waterfall.components %}
+        <div class="wf-row {{ c.kind_class | default('wf-plain') }}">
+          <div>
+            <div class="wf-label">{{ c.label | default('--') }}</div>
+            {% if c.sub %}<div class="wf-sub">{{ c.sub }}</div>{% endif %}
+          </div>
+          <div class="wf-amount">{{ c.amount_str | default('--') }}</div>
+        </div>
+        {% endfor %}
+        {% for d in row.waterfall.disclosures %}
+        <div class="wf-note">{{ d }}</div>
+        {% endfor %}
+      </div>
+      {% endfor %}
     </div>
 
     <!-- RECONCILED STATE: loan facilities -->

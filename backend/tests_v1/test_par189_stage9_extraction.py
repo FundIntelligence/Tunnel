@@ -222,9 +222,23 @@ def _assert_equiv(section, acct_cov_raw=None, fy="2025", available=True):
     # rather than updating _original()'s row order to match, which would
     # destroy what it's for. recon_fiscal_note is unaffected by row order and
     # still compares directly.
+    #
+    # PAR-207 adds a `waterfall` key to each row that the pre-Stage-9 original
+    # never produced. It is additive presentation data, not a change to any
+    # field this oracle was written to protect, so it is dropped before the
+    # comparison for the same reason the row order is normalised above:
+    # _original() is a frozen record of 2026-era behaviour and editing it to
+    # add a key it never had would defeat its purpose. The waterfalls have
+    # their own direct coverage in test_par207_gap_waterfall.py.
     assert new["recon_fiscal_note"] == original["recon_fiscal_note"]
-    assert sorted(new["recon_rows"], key=lambda r: r["check"]) == \
-        sorted(original["recon_rows"], key=lambda r: r["check"])
+
+    def _without_waterfall(rows):
+        return sorted(
+            ({k: v for k, v in r.items() if k != "waterfall"} for r in rows),
+            key=lambda r: r["check"],
+        )
+
+    assert _without_waterfall(new["recon_rows"]) == _without_waterfall(original["recon_rows"])
     return new
 
 
