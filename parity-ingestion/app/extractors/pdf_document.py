@@ -32,20 +32,34 @@ WORD_Y_TOLERANCE = 3
 
 
 class NormalizedPage:
-    """One page of a single-parsed document. `text` is extracted eagerly
-    (cheap); `words`/`tables` are extracted lazily and cached, since only the
-    winning bank extractor needs word positions and only NCBA/Co-op
-    detection needs tables."""
+    """One page of a single-parsed document. `text`, `words`, and `tables`
+    are all extracted lazily and cached (PAR-216) -- format detection only
+    ever reads the first ~2 pages' `text` (`NormalizedDocument.text_upto`),
+    so eagerly running pdfplumber's `extract_text()` for every page at
+    parse time (the previous behavior, and the docstring's own claim that
+    doing so was "cheap") wasted real work and real memory on a large
+    document: confirmed as a real, measured factor in a production OOM on a
+    451-page statement (2Gi container limit, ~2076 MiB used) -- the other,
+    larger factor being the double-parse this same ticket also fixed
+    (`extract_equity_clms_pdf` no longer re-opens the file from scratch).
+    Only the page(s) actually read ever pay the `extract_text()` cost now."""
 
     def __init__(self, page_number: int, page: "pdfplumber.page.Page"):
         self.page_number = page_number  # 1-indexed
         self.rotation: int = page.rotation
         self.width: float = page.width
         self.height: float = page.height
-        self.text: str = page.extract_text() or ""
         self._page = page
+        self._text: Optional[str] = None
         self._words: Optional[List[dict]] = None
         self._tables: Optional[list] = None
+
+    @property
+    def text(self) -> str:
+        """Lazy, cached passthrough to pdfplumber's `extract_text()`."""
+        if self._text is None:
+            self._text = self._page.extract_text() or ""
+        return self._text
 
     @property
     def words(self) -> List[dict]:
@@ -67,6 +81,23 @@ class NormalizedPage:
         if self._tables is None:
             self._tables = self._page.extract_tables()
         return self._tables
+
+    def flush_cache(self) -> None:
+        """Release both the underlying pdfplumber page's internal layout
+        cache AND this page's own cached `text`/`words`/`tables` (PAR-216)
+        -- call after a page's data has been fully consumed inside a loop
+        over many pages, so a 400+ page document doesn't retain every
+        page's already-processed word list for the rest of the document's
+        lifetime (this, combined with the eager-`text`-for-every-page issue
+        `text` being made lazy above already fixes, was the direct cause of
+        a real production OOM on a 451-page statement). Safe to call even
+        mid-document: a later re-access of `.text`/`.words`/`.extract_tables()`
+        on this page just recomputes from the underlying pdfplumber page
+        (slower, not broken) rather than reusing a stale cache."""
+        self._page.flush_cache()
+        self._text = None
+        self._words = None
+        self._tables = None
 
 
 class NormalizedDocument:

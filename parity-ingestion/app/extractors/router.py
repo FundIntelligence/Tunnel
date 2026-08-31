@@ -122,7 +122,7 @@ def route_extract(file_path: str, password: Optional[str] = None) -> Union[Extra
             if detect_kcb_online(doc):
                 return extract_kcb_online_pdf(file_path)
             if detect_equity_clms(doc):
-                return extract_equity_clms_pdf(file_path)
+                return extract_equity_clms_pdf(doc)
             if detect_equity_f1(doc):
                 return extract_equity_f1_pdf(file_path)
             if detect_ncba_estatement(file_path, password=password):
