@@ -1,0 +1,21 @@
+-- Migration: fix deals INSERT policy's WITH CHECK clause on staging.
+--
+-- Found while investigating the RLS-disabled tables fix (see
+-- 20260621073026_enable_rls_disabled_tables.sql): the policy "Users can
+-- insert their own deals" on public.deals is named as ownership-scoped but
+-- its actual WITH CHECK clause is `true` on staging (kstuensfekanfberjubz)
+-- — any authenticated user could insert a deals row with any created_by
+-- value, not just their own. Confirmed via live pg_policies query that
+-- prod (ifcdbhbuucmjgtjkluna) already has the correct
+-- `created_by = auth.uid()` check on this same policy — this is
+-- staging-only drift, most likely from the policy having been created
+-- via the Supabase dashboard wizard rather than a tracked migration
+-- (this table predates this repo's migration history).
+--
+-- Safe to tighten: public.deals is dead code (retired 2026-03-03, commit
+-- 5aea748f) — grepped backend/, app/, lib/, admin/, parity-ingestion/ for
+-- any .table("deals")/.from('deals') call and found none. No live
+-- feature relies on the current loose behavior, so this can only reject
+-- spoofed inserts, not break anything working.
+ALTER POLICY "Users can insert their own deals" ON public.deals
+  WITH CHECK ((created_by)::text = (auth.uid())::text);
