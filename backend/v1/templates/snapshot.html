@@ -438,6 +438,100 @@ body {
   padding-top: 7px;
 }
 
+/* ── READER'S LEGEND (PAR-206) — Act 1 orientation panel ──
+   Explains the report's own vocabulary once, up front. Static content, no data
+   dependency. No existing class matched this, so these are new; they reuse
+   only weights the document already embeds (IBM Plex Serif 400, Sans 300).
+   The status-tag swatches deliberately reuse the REAL .rt-badge/.b-* classes
+   from the reconciliation table rather than restyling them — a legend that
+   renders a different-looking badge than the table it explains is worse than
+   no legend. That also keeps the semantic colours used strictly per their
+   meaning-lock (green = matched, amber = gap, red = variance), which is what
+   they already signify in the table. */
+.legend {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.legend-intro {
+  padding: 9px 14px;
+  background: var(--page);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 10px;
+  color: var(--t2);
+  line-height: 1.55;
+}
+
+.legend-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 18px;
+  padding: 11px 14px 4px;
+}
+
+.legend-group { margin-bottom: 10px; }
+
+.legend-group-title {
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--t3);
+  margin-bottom: 5px;
+}
+
+.legend-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-bottom: 4px;
+  line-height: 1.45;
+}
+
+/* Fixed column so the definitions line up regardless of tag width. */
+.legend-key {
+  flex: 0 0 108px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  color: var(--t0);
+}
+
+.legend-def {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 9.5px;
+  color: var(--t1);
+}
+
+.legend-order {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 9.5px;
+  color: var(--t1);
+  line-height: 1.55;
+}
+
+.legend-order-step {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  color: var(--t0);
+}
+
+.legend-foot {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 9.5px;
+  color: var(--t2);
+  line-height: 1.55;
+  border-top: 1px solid var(--border);
+  padding: 8px 14px;
+  background: var(--page);
+}
+
 /* ── GAP WATERFALL (PAR-207) — per-row declared/observed breakdown ──
    No waterfall pattern existed in this template before this ticket (the
    Expenses row's "gap explanation" is a single sentence with no per-component
@@ -1240,6 +1334,109 @@ body {
           <div class="metric-sub">{{ km.sub | default('') }}</div>
         </div>
         {% endfor %}
+      </div>
+    </div>
+
+    {# ── READER'S LEGEND (PAR-206) — Act 1's second element ──
+       Static orientation panel: explains the report's own vocabulary and
+       structure once, up front. No data dependency — nothing here reads a
+       computed field, so it cannot go stale against a deal.
+
+       Every definition below is written from what the code actually computes,
+       verified 2026-08-31:
+         tiers        snapshot_generator._compute_tier() — HIGH requires cash AND
+                      loan both EXACT_MATCH; a CRITICAL coverage gap (>15% of
+                      declared cash unsubmitted) blocks HIGH; OBSERVED is the
+                      no-audited-financials case (snapshot_html_renderer:887).
+         status tags  snapshot_context._resolve_recon_status() + the
+                      EXACT_MATCH (KES 10) / ACCEPTABLE (5%) tolerances in
+                      reconciliation_engine.
+         needs_review core/classifier.classify_with_reason().
+       There is deliberately no citation to an external specification document:
+       a reader of this report cannot open one, so naming it would resolve to
+       nothing. Where the fuller specification lives is recorded on the ticket.
+
+       PAR-150 boundary: this defines the report's vocabulary. It must never
+       say what any figure means for this particular business. #}
+    <div class="sec">
+      <div class="sec-label">How to read this report <span class="sec-label-badge">Legend · Definitions Only</span></div>
+      <div class="legend">
+        <div class="legend-intro">
+          This panel explains the report's own labels and running order. It defines terms; it draws no conclusion about this business — that judgement belongs to the reviewer.
+        </div>
+
+        <div class="legend-grid">
+          <div class="legend-group">
+            <div class="legend-group-title">Confidence tier</div>
+            <div class="legend-row">
+              <span class="legend-key">HIGH_CONFIDENCE</span>
+              <span class="legend-def">Cash position and loan activity both reconcile exactly against the audited financials.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key">MEDIUM_CONFIDENCE</span>
+              <span class="legend-def">Both reconcile within tolerance, or an exact match is held back by a critical account-coverage gap.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key">LOW_CONFIDENCE</span>
+              <span class="legend-def">At least one of those two checks falls outside tolerance.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key">OBSERVED</span>
+              <span class="legend-def">No audited financials submitted, so there is nothing to reconcile against; bank data only.</span>
+            </div>
+          </div>
+
+          <div class="legend-group">
+            <div class="legend-group-title">Reconciliation status tags</div>
+            <div class="legend-row">
+              <span class="legend-key"><span class="rt-badge b-exact">Exact match</span></span>
+              <span class="legend-def">Declared and observed agree to within KES 10.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key"><span class="rt-badge b-ok">Acceptable</span></span>
+              <span class="legend-def">They differ by no more than 5%.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key"><span class="rt-badge b-warn">Gap · coverage incomplete</span></span>
+              <span class="legend-def">They differ, <em>and</em> at least one declared bank account has no statement submitted — so the difference may be missing data rather than a discrepancy.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key"><span class="rt-badge b-variance">Variance</span></span>
+              <span class="legend-def">They differ while every declared account was submitted — missing statements do not account for it.</span>
+            </div>
+          </div>
+
+          <div class="legend-group">
+            <div class="legend-group-title">Suggested reading order</div>
+            <div class="legend-order">
+              <span class="legend-order-step">Act 1</span> what was submitted and how complete it is &nbsp;·&nbsp;
+              <span class="legend-order-step">Act 2</span> declared figures against observed bank activity &nbsp;·&nbsp;
+              <span class="legend-order-step">Act 3</span> supporting patterns in the transaction data &nbsp;·&nbsp;
+              <span class="legend-order-step">Act 4</span> analyst context and the rollup.
+              Act 1 first: coverage determines how much weight the later sections can carry.
+            </div>
+          </div>
+
+          <div class="legend-group">
+            <div class="legend-group-title">Evidence types</div>
+            <div class="legend-row">
+              <span class="legend-key">classified</span>
+              <span class="legend-def">A rule matched the transaction and assigned it a role.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key">needs_review</span>
+              <span class="legend-def">No rule matched confidently, or the match contradicted the direction of the amount. Flagged for a person to decide — not a finding.</span>
+            </div>
+            <div class="legend-row">
+              <span class="legend-key">flagged</span>
+              <span class="legend-def">A named pattern was observed and recorded. Observation only; it asserts nothing about cause.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="legend-foot">
+          Sections state what was observed and what was declared. Where the two differ, the report shows the difference and its components; deciding what that means is the reviewer's call.
+        </div>
       </div>
     </div>
 
