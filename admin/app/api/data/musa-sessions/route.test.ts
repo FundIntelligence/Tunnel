@@ -14,6 +14,7 @@ const requireAdminSessionMock = vi.fn<() => Promise<AdminSession | NextResponse>
 
 vi.mock('@/lib/supabase', () => ({
   getSupabase: () => ({ from: fromMock }),
+  SUPABASE_ENV: 'prod',
 }))
 
 vi.mock('@/lib/require-admin-session', () => ({
@@ -42,5 +43,11 @@ describe('GET /api/data/musa-sessions', () => {
     const res = await GET()
     expect(fromMock).toHaveBeenCalledWith('musa_sessions')
     expect(await res.json()).toEqual(rows)
+  })
+
+  it('sets the x-data-environment header to prod (PAR-181)', async () => {
+    const { GET } = await import('./route')
+    const res = await GET()
+    expect(res.headers.get('x-data-environment')).toBe('prod')
   })
 })

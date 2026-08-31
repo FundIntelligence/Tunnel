@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { DataTable, Column } from '@/components/DataTable'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT, refreshedLabel } from './utils'
 
 interface Deal {
@@ -20,6 +22,7 @@ export default function DealsPage() {
   const [loading, setLoading] = useState(true)
   const [lastFetched, setLastFetched] = useState<string | null>(null)
   const [refreshedText, setRefreshedText] = useState('')
+  const [env, setEnv] = useState<string | null>(null)
   const router = useRouter()
 
   const load = useCallback(async () => {
@@ -27,6 +30,7 @@ export default function DealsPage() {
     const data = await res.json()
     const list = Array.isArray(data) ? data : (data?.deals ?? [])
     setRows(list)
+    setEnv(res.headers.get(ENV_HEADER))
     setLoading(false)
     setLastFetched(new Date().toISOString())
   }, [])
@@ -68,6 +72,7 @@ export default function DealsPage() {
           subtitle={loading ? 'Loading…' : `${rows.length} deals (last 100)`}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4 }}>
+          {env === 'prod' && <EnvBadge env="prod" />}
           {refreshedText && (
             <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: 'var(--t1)' }}>
               {refreshedText}
