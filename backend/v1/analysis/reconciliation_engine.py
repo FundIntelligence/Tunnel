@@ -517,6 +517,30 @@ def calculate_loan_activity_reconciliation(deal_id: str) -> Dict[str, Any]:
     else:
         status = "VARIANCE"
 
+    # A VARIANCE here can be a genuine classification defect, or it can be an
+    # artifact of incomplete bank data: declared bank accounts that were never
+    # submitted mean any loan disbursement routed through them is structurally
+    # invisible to the bank-side sum above, regardless of classifier accuracy.
+    # Surface the deal's own account_coverage advisory (already computed and
+    # trusted elsewhere for tier-gating, see snapshot_generator._compute_tier)
+    # on this row too, rather than reporting a bare, unexplained VARIANCE that
+    # reads as a formula bug when it may just be a known coverage gap. (PAR-209)
+    account_coverage_note: Optional[str] = None
+    if status == "VARIANCE":
+        try:
+            coverage = calculate_account_coverage(deal_id)
+        except Exception:
+            coverage = {}
+        advisory = coverage.get("advisory_tier")
+        if advisory in ("MATERIAL", "CRITICAL"):
+            account_coverage_note = (
+                f"{advisory} bank account coverage gap "
+                f"({coverage.get('coverage_pct')}% of declared accounts submitted, "
+                f"{coverage.get('missing_accounts_count')} missing) — this variance may "
+                "reflect loan activity in an unsubmitted account rather than a "
+                "classification error."
+            )
+
     return {
         "fiscal_period": f"{fiscal_start} to {fiscal_end}",
         "bank_disbursements_kes": round(disbursements_cents / 100, 2),
@@ -526,6 +550,7 @@ def calculate_loan_activity_reconciliation(deal_id: str) -> Dict[str, Any]:
         "variance_kes": round(variance_cents / 100, 2),
         "variance_pct": variance_pct,
         "status": status,
+        "account_coverage_note": account_coverage_note,
     }
 
 
