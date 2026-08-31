@@ -77,7 +77,7 @@ document does not state — never guess, never substitute zero for missing.
   "finance_costs_cents": integer or null (positive magnitude),
   "depreciation_expense_cents": integer or null (positive magnitude),
   "other_expenses_cents": integer or null (positive magnitude),
-  "total_expenses_cents": integer or null (the income statement's OWN stated total expenses / total operating expenses / total costs line, current year, positive magnitude — copy the figure the document actually prints on that total line; do NOT add up the sub-category fields above yourself, and return null if the document shows no such total line),
+  "total_expenses_cents": integer or null (see the strict rule under "Field-extraction rules" below — this field is easy to populate with the wrong number; when genuinely unsure, return null rather than guess),
   "profit_before_tax_cents": integer or null,
   "tax_expense_cents": integer or null (positive magnitude),
   "profit_after_tax_cents": integer or null,
@@ -125,10 +125,27 @@ Field-extraction rules:
 staff_costs_cents, finance_costs_cents, depreciation_expense_cents, other_expenses_cents, \
 tax_expense_cents) must be positive magnitudes even if the document shows them in \
 parentheses or as negative.
-- total_expenses_cents must be the single total-expenses figure the income statement itself \
-prints (e.g. a "Total expenses", "Total operating expenses", or "Total costs" line). Transcribe \
-that stated total verbatim; do not derive it by summing cost_of_sales_cents, operating_costs_cents, \
-etc. If no such total line is printed anywhere, return null — never substitute a self-computed sum.
+- total_expenses_cents is the single figure representing TRUE TOTAL EXPENSES — every cost of \
+running the business for the year, Cost of Sales included. On many income statements this is NOT \
+the same number as a printed "Total operating expenses" or "Total costs" line: when a statement \
+shows Cost of Sales separately and subtracts it from Turnover to reach a Gross Profit subtotal, \
+any further "total" line appearing AFTER that Gross Profit subtotal (summing only the remaining \
+categories, e.g. Operating/Administrative/Staff/Finance costs) explicitly EXCLUDES Cost of Sales — \
+that is a "total operating expenses" figure, not total expenses, and must NOT be used for this \
+field, even though it is a real total line the document genuinely prints.
+  - Populate total_expenses_cents ONLY when you can identify a figure that already includes Cost \
+    of Sales — e.g. the document prints a single "Total expenses" or "Total costs" line positioned \
+    BEFORE any Gross Profit subtotal (so it has not had Cost of Sales removed yet), or the \
+    statement has no separate Cost of Sales / Gross Profit line at all (e.g. a service business), \
+    so whatever total expenses line exists is already all-inclusive by construction.
+  - In every other case — including whenever you are uncertain whether a printed total line \
+    includes Cost of Sales — return null. Do not guess, and do not transcribe a post-Gross-Profit \
+    subtotal just because it is the only "total" the document prints. A null here is safe: the \
+    system falls back to summing the individual cost_of_sales_cents/operating_costs_cents/etc. \
+    fields above, which is correct whenever those are extracted accurately. A wrong non-null value \
+    is not safe — it silently overrides that correct fallback.
+  - Do not derive total_expenses_cents yourself by summing the sub-category fields — either \
+    transcribe a genuinely all-inclusive stated total, or return null.
 - cash_breakdown and loan_breakdown come from the notes to the accounts (the cash/bank note \
 and the borrowings/loans note), not from the face of the balance sheet — only populate them \
 if the document actually contains such a note with a breakdown.

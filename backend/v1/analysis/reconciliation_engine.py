@@ -457,6 +457,28 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
         else None
     )
 
+    # PAR-217: states what the declared figure is made of, not why the gap
+    # exists — a causal claim ("non-cash expenses, accrued payables...") is
+    # not something this function can actually know from the two totals it
+    # computes, and a fixed string can't reflect a value it never looks at.
+    # Matches the PAR-150 boundary the rest of this report follows: state
+    # components and amounts, not a verdict.
+    if declared_expenses_source == "stated_total":
+        explanation = (
+            f"Declared figure is the audited financials' own stated total "
+            f"expenses line: KES {declared_expenses_cents / 100:,.2f}."
+        )
+    else:
+        parts = "; ".join(
+            f"{field.replace('_cents', '').replace('_', ' ')} "
+            f"KES {int(af.get(field) or 0) / 100:,.2f}"
+            for field in cost_fields
+        )
+        explanation = (
+            "Declared figure sums the audited financials' individual cost "
+            f"lines (no single stated total was extracted): {parts}."
+        )
+
     return {
         "fiscal_period": f"{fiscal_start} to {fiscal_end}",
         "bank_outflows_kes": round(bank_outflow_cents / 100, 2),
@@ -464,10 +486,7 @@ def calculate_expense_reconciliation(deal_id: str) -> Dict[str, Any]:
         "declared_expenses_source": declared_expenses_source,
         "gap_kes": round(gap_cents / 100, 2),
         "gap_pct": gap_pct,
-        "explanation": (
-            "Gap explained by: non-cash expenses (depreciation, amortisation), "
-            "accrued payables, inventory build, and opening accruals"
-        ),
+        "explanation": explanation,
     }
 
 
