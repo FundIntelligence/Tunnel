@@ -177,6 +177,17 @@ def _supplier_payments_ctx_from(sp: _SupplierPayments) -> Dict[str, Any]:
         "top_name":     sp.top_counterparty,
         "top_pct_str":  f"{sp.top_share.value * 100:.1f}%",
         "clause":       sp.narrative,
+        # PAR-226: ranked table rows, name/count/amount — mirrors Loan
+        # Facilities' table shape. Already top-10 from _build_supplier_payments().
+        "rows": [
+            {
+                "name":      row.name,
+                "txn_count": row.txn_count,
+                "total_str": _fmt_money_kes(row.total),
+                "pct_str":   f"{row.share.value * 100:.1f}%",
+            }
+            for row in (sp.top_n or [])
+        ],
     }
 
 

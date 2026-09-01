@@ -1849,6 +1849,21 @@ body {
           <tr><td>Top supplier</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.top_name }} · {{ supplier_payments.top_pct_str }}</td></tr>
         </tbody>
       </table>
+      <!-- PAR-226: ranked supplier table, top-10 by total value, name/count/amount only -->
+      <table class="loan-table">
+        <thead>
+          <tr><th>Supplier</th><th>Transactions</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+          {% for row in supplier_payments.rows | default([]) %}
+          <tr>
+            <td><span class="loan-name">{{ row.name | default('--') }}</span></td>
+            <td class="rt-figure">{{ row.txn_count | default('--') }}</td>
+            <td class="rt-figure">{{ row.total_str | default('--') }} ({{ row.pct_str | default('--') }})</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
       <div class="cashflow-note">{{ supplier_payments.clause }}</div>
       {% else %}
       <div class="cashflow-note" style="border-top:none">No supplier payments classified for this deal.</div>

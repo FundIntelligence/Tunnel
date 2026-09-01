@@ -337,6 +337,17 @@ class Composition:
 
 
 @dataclass(frozen=True)
+class SupplierEntry:
+    """PAR-226: one row of the ranked supplier table. Same per-counterparty
+    data _build_supplier_payments() already aggregates into supplier_by_entity
+    — this just retains the top N instead of discarding all but the max()."""
+    name: str
+    txn_count: int
+    total: Money
+    share: Percent   # this entry's total / supplier_total_cents
+
+
+@dataclass(frozen=True)
 class SupplierPayments:
     available: bool
     total: Optional[Money] = None
@@ -346,6 +357,7 @@ class SupplierPayments:
     top_share: Optional[Percent] = None
     concentration: Optional[SupplierConcentration] = None
     narrative: Optional[str] = None
+    top_n: Optional[List[SupplierEntry]] = None   # PAR-226: top 10 by total, all deals
 
 
 @dataclass(frozen=True)
@@ -1571,8 +1583,34 @@ def _build_supplier_payments(
         concentration = "MODERATE"
         narrative = "This represents MODERATE supplier concentration."
     else:
+        # PAR-226: was "Supplier spend is well-diversified across
+        # counterparties." — interpretive language, not disclosure (PAR-150).
+        # Replaced with the same figure already shown in the table, stated as
+        # a plain fact — the reviewer decides what "diversified" means from
+        # the number, not from an adjective this system supplies for them.
         concentration = "DIVERSIFIED"
-        narrative = "Supplier spend is well-diversified across counterparties."
+        narrative = (
+            f"Top supplier accounts for {top_supplier_share * 100:.1f}% of "
+            f"total supplier spend across {supplier_entity_count} counterparties."
+        )
+
+    # PAR-226: top-10 by total value, for every deal regardless of size —
+    # confirmed as a safe default, not a large-deal-only safeguard, pending
+    # real data at materially larger supplier counts than observed so far.
+    ranked = sorted(supplier_by_entity.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    top_n = [
+        SupplierEntry(
+            name=(
+                entity_name_by_id.get(eid)
+                or (eid[:16] + "…" if len(eid) > 16 else eid)
+                or "--"
+            ),
+            txn_count=data["count"],
+            total=Money(cents=data["total"]),
+            share=Percent(value=data["total"] / supplier_total_cents),
+        )
+        for eid, data in ranked[:10]
+    ]
 
     return SupplierPayments(
         available=True,
@@ -1583,6 +1621,7 @@ def _build_supplier_payments(
         top_share=Percent(value=top_supplier_share),
         concentration=concentration,
         narrative=narrative,
+        top_n=top_n,
     )
 
 

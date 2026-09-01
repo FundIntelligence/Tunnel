@@ -251,8 +251,28 @@ def test_risk_and_supplier_extraction_matches_original(
     old_supplier = _original_supplier_payments_ctx(txns, entity_names)
     new_supplier_typed = _build_supplier_payments(txns, entity_names, DEFAULT_SUPPLIER_CONCENTRATION_CONFIG)
     new_supplier = _supplier_payments_ctx_from(new_supplier_typed)
-    assert new_supplier == old_supplier, (
-        f"Supplier Payment Analysis diverged.\nOLD: {old_supplier}\nNEW: {new_supplier}"
+
+    # PAR-226 intentionally diverges from the pre-extraction ORIGINAL in two
+    # ways, on top of Stage 1's extraction: (1) a "rows" key (top-10 ranked
+    # supplier table — the ORIGINAL never had this, it discarded everything
+    # but the max()); (2) the DIVERSIFIED-bucket clause replaced
+    # "Supplier spend is well-diversified across counterparties." (interpretive,
+    # PAR-150-violating) with a factual concentration-stat sentence. Apply
+    # both known, deliberate diffs to the OLD reference before comparing, so
+    # this test still catches any UNINTENDED divergence in every other field.
+    expected = dict(old_supplier)
+    if expected.get("available") and expected.get("clause") == "Supplier spend is well-diversified across counterparties.":
+        top_pct = new_supplier_typed.top_share.value * 100
+        expected["clause"] = (
+            f"Top supplier accounts for {top_pct:.1f}% of total supplier spend "
+            f"across {new_supplier_typed.counterparty_count} counterparties."
+        )
+    if expected.get("available"):
+        expected["rows"] = new_supplier.get("rows")
+
+    assert new_supplier == expected, (
+        f"Supplier Payment Analysis diverged beyond PAR-226's known changes.\n"
+        f"OLD: {old_supplier}\nEXPECTED (OLD + PAR-226 diff): {expected}\nNEW: {new_supplier}"
     )
 
     # ── Risk Assessment Summary ────────────────────────────────────────────
