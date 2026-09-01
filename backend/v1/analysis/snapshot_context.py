@@ -207,12 +207,26 @@ DEFAULT_TAX_COMPLIANCE_CONFIG = TaxComplianceConfig()
 
 
 @dataclass(frozen=True)
+class TaxKeywordGroup:
+    """PAR-229: one row of the matched-keyword breakdown. `keyword` is the
+    literal descriptor keyword the classifier matched (classifier.py's
+    _TAX_KEYWORDS), parsed from role_reason ("keyword_match:{kw}:tax_keywords")
+    — NOT a verified tax type. A single tax_payment transaction (e.g. a
+    bundled KRA remittance) is not provably one tax type; this states only
+    what matched, not what it means."""
+    keyword: str          # e.g. "vat", "paye", "kra" — or "(none recorded)" if role_reason is unset/unparseable
+    txn_count: int
+    total: Money
+
+
+@dataclass(frozen=True)
 class TaxCompliance:
     total: Money
     months_with_tax: int
     months_total: int
     status: KraStatus
     narrative: str
+    by_keyword: Optional[List[TaxKeywordGroup]] = None   # PAR-229
 
 
 @dataclass(frozen=True)
@@ -720,9 +734,13 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "balance_cents, account_id, document_id",
         deal_id,
     )
-    map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
+    # PAR-229 added role_reason (-> "role_reason") for Tax Compliance's
+    # matched-keyword breakdown — the only consumer; every other section
+    # ignores this key.
+    map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id, role_reason", deal_id)
     role_by_txn = {r["txn_id"]: r["role"] for r in map_rows}
     entity_id_by_txn = {r["txn_id"]: r.get("entity_id") for r in map_rows}
+    role_reason_by_txn = {r["txn_id"]: r.get("role_reason") for r in map_rows}
 
     return [{
         "id": t["id"],
@@ -735,6 +753,7 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "entity_id": entity_id_by_txn.get(t["id"]),
         "account_id": t.get("account_id"),
         "document_id": t.get("document_id"),
+        "role_reason": role_reason_by_txn.get(t["id"]),
     } for t in txn_rows]
 
 
@@ -1379,6 +1398,21 @@ def _build_loan_activity(
     )
 
 
+def _parse_tax_keyword(role_reason: Optional[str]) -> str:
+    """PAR-229: extract the matched keyword from a role_reason string of the
+    form "keyword_match:{kw}:tax_keywords" (classifier.py:349-351). Real
+    prod data confirmed (2026-09-01) this format is consistent — no
+    near-duplicate variants — across the 4 keywords actually observed
+    (kra, vat, paye, tax) out of classifier.py's 8-keyword _TAX_KEYWORDS set.
+    Returns "(none recorded)" for a null/legacy/unparseable role_reason
+    rather than guessing — this deal's version of "we don't know," not a
+    silently-dropped row."""
+    if not role_reason or not role_reason.startswith("keyword_match:"):
+        return "(none recorded)"
+    parts = role_reason.split(":")
+    return parts[1] if len(parts) >= 2 and parts[1] else "(none recorded)"
+
+
 def _build_tax_compliance(
     txns: List[Dict],
     in_active_period,
@@ -1388,6 +1422,10 @@ def _build_tax_compliance(
     tax_total_cents_active = 0
     tax_txn_count_active = 0
     all_months_active: set = set()
+    # PAR-229: same filter (active period, _TAX_ROLES, signed < 0) as the
+    # totals above, so by_keyword's totals reconcile with `total` exactly —
+    # not a separately-scoped recompute.
+    keyword_agg: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "count": 0})
     for t in txns:
         m = (t["txn_date"] or "")[:7]
         if t["txn_date"] and in_active_period(m):
@@ -1396,6 +1434,13 @@ def _build_tax_compliance(
                 tax_months_active.add(m)
                 tax_total_cents_active += t["abs"]
                 tax_txn_count_active += 1
+                keyword_agg[_parse_tax_keyword(t.get("role_reason"))]["total"] += t["abs"]
+                keyword_agg[_parse_tax_keyword(t.get("role_reason"))]["count"] += 1
+
+    by_keyword = [
+        TaxKeywordGroup(keyword=kw, txn_count=v["count"], total=Money(cents=v["total"]))
+        for kw, v in sorted(keyword_agg.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    ] or None
 
     n_tax_months = len(tax_months_active)
     n_total_months = len(all_months_active)
@@ -1433,6 +1478,7 @@ def _build_tax_compliance(
         months_total=n_total_months,
         status=status,
         narrative=narrative,
+        by_keyword=by_keyword,
     )
 
 
