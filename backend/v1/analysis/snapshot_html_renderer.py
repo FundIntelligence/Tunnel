@@ -223,6 +223,16 @@ def _tax_compliance_ctx_from(tc: _TaxCompliance) -> Dict[str, Any]:
         "n_total_months": tc.months_total,
         "kra_compliance": tc.status,
         "clause":         tc.narrative,
+        # PAR-229: matched-keyword breakdown — see TaxKeywordGroup's docstring
+        # for why "keyword" is never labeled "tax type" in the template.
+        "by_keyword": [
+            {
+                "keyword":   g.keyword,
+                "txn_count": g.txn_count,
+                "total_str": _fmt_money_kes(g.total),
+            }
+            for g in (tc.by_keyword or [])
+        ],
     }
 
 

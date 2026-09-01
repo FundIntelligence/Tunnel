@@ -1899,6 +1899,25 @@ body {
           <tr><td>Compliance status</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.kra_compliance }}</td></tr>
         </tbody>
       </table>
+      {% if tax_compliance.by_keyword %}
+      <!-- PAR-229: grouped by matched descriptor keyword, never "tax type" —
+           a keyword match is not a verified tax-type classification. -->
+      <table class="loan-table">
+        <thead>
+          <tr><th>Matched keyword</th><th>Transactions</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+          {% for row in tax_compliance.by_keyword %}
+          <tr>
+            <td><span class="loan-name">{{ row.keyword | default('--') }}</span></td>
+            <td class="rt-figure">{{ row.txn_count | default('--') }}</td>
+            <td class="rt-figure">{{ row.total_str | default('--') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="cashflow-note">Grouped by matched payment narration, not a verified tax category.</div>
+      {% endif %}
       <div class="cashflow-note">{{ tax_compliance.clause }}</div>
     </div>
 
