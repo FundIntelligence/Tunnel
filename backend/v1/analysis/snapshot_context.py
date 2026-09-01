@@ -2300,6 +2300,11 @@ def build_snapshot_context(
     analyst_notes: Optional[str] = deal_row.get("analyst_notes") or None
     currency: str = deal_row.get("currency") or "KES"
 
+    # PAR-228: deterministic row selection. Without an explicit order, a deal
+    # with 2+ years of audited financials (unique key is deal_id,financial_year
+    # per AuditedFinancialsRepo.upsert()) would have PostgREST return whichever
+    # row it pleases, not necessarily the most recent. Matches the pattern
+    # reconciliation_engine.py's _get_audited_financials() already uses.
     af_result = (
         sb.table("pds_audited_financials")
         .select(
@@ -2307,6 +2312,8 @@ def build_snapshot_context(
             "loan_breakdown, turnover_cents, profit_before_tax_cents"
         )
         .eq("deal_id", deal_id)
+        .order("financial_year", desc=True)
+        .limit(1)
         .execute()
         .data or []
     )
