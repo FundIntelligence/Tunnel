@@ -761,6 +761,9 @@ def render_snapshot_html(
         })
 
     # 4. Audited financials (optional — sets recon_available)
+    # PAR-228: deterministic row selection — see snapshot_context.py's
+    # identical fix for the full rationale (matches reconciliation_engine.py's
+    # existing _get_audited_financials() pattern).
     af_result = (
         sb.table("pds_audited_financials")
         # PAR-189 Stage 11: turnover_cents/profit_before_tax_cents dropped —
@@ -770,6 +773,8 @@ def render_snapshot_html(
             "inventory_cents, cost_of_sales_cents, extraction_confidence"
         )
         .eq("deal_id", deal_id)
+        .order("financial_year", desc=True)
+        .limit(1)
         .execute()
         .data or []
     )
