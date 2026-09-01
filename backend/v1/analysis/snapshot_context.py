@@ -118,6 +118,17 @@ TransferDetectionState = Literal["DETECTED", "NO_TRANSFERS_FOUND", "UNAVAILABLE"
 AccountSubmissionStatus = Literal["SUBMITTED", "MISSING"]
 ReconCheckKey = Literal["cash_position", "revenue", "expenses", "loan_activity"]
 
+# PAR-207 — gap-waterfall component roles. Semantic only; each renderer owns
+# its own kind -> styling map per PAR-189 ratified decision #5.
+#   declared  — a figure from the audited financials side
+#   observed  — a figure derived from submitted bank data
+#   subtotal  — a stated total of the preceding lines of the same side
+#   gap       — observed minus declared
+#   component — a named amount that bears on the gap, stated WITHOUT any claim
+#               that it explains the gap (PAR-150 Rule 4: record the amount,
+#               never attach a verdict)
+WaterfallKind = Literal["declared", "observed", "subtotal", "gap", "component"]
+
 # Prose shown when audited financials haven't been submitted, so
 # calculate_account_coverage() has nothing to compare against. Narrative stays
 # a pre-written string per PAR-189 ratified decision #2.
@@ -525,6 +536,47 @@ DEFAULT_RECON_CHECK_CONFIG = ReconCheckConfig()
 
 
 @dataclass(frozen=True)
+class WaterfallComponent:
+    """
+    One line of a gap waterfall (PAR-207).
+
+    `amount` is None only for a line that names something with no computable
+    figure; renderers show a dash rather than inventing a zero.
+
+    `sub` is a short factual qualifier ("not submitted", "fiscal-year net
+    movement") — never an evaluation. Per PAR-150 Rule 4 nothing in this
+    dataclass may carry a verdict about whether an amount is good or bad;
+    that judgment belongs to the human reader, matching PAR-206's boundary.
+    """
+    label: str
+    amount: Optional[Money]
+    kind: WaterfallKind
+    sub: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GapWaterfall:
+    """
+    A row's declared-vs-observed breakdown (PAR-207).
+
+    `disclosures` carries data-completeness limitations that bear on the
+    figures above them — following PAR-209's own precedent of attaching the
+    account-coverage advisory to the loan_activity result rather than leaving
+    a known gap implicit at the point where it affects a number. These are
+    statements of fact about data availability, not interpretations of the
+    deal.
+
+    `available=False` means there was not enough in the reconciliation
+    section to build a breakdown at all (e.g. an older sealed snapshot
+    predating the per-account fields) — the renderer omits the block
+    entirely rather than rendering an empty shell.
+    """
+    available: bool
+    components: List[WaterfallComponent] = field(default_factory=list)
+    disclosures: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class ReconCheck:
     """
     One row of the 4-Point Reconciliation table.
@@ -557,6 +609,10 @@ class ReconCheck:
     variance: Optional[Percent]
     status: ReconStatus
     assessment: str
+    # PAR-207 — per-row gap breakdown. None (not an empty GapWaterfall) on rows
+    # that have no breakdown, so a renderer can distinguish "this row has no
+    # waterfall" from "this row's waterfall came back empty".
+    waterfall: Optional["GapWaterfall"] = None
 
 
 @dataclass(frozen=True)
@@ -1597,6 +1653,239 @@ def _kes_to_money(kes_value, currency: str) -> Money:
     return Money(int((kes_value or 0) * 100), currency)
 
 
+def _money_from_entry(entry: Dict, cents_key: str, kes_key: str, currency: str) -> Money:
+    """
+    Prefer the exact integer-cents field; fall back to the KES float only when
+    an older sealed snapshot predates it. _kes_to_money()'s truncation is
+    deliberate (see its docstring) — reusing it keeps the fallback path
+    byte-identical to how every other KES float in this module is converted.
+    """
+    cents = entry.get(cents_key)
+    if cents is not None:
+        return Money(int(cents), currency)
+    return _kes_to_money(entry.get(kes_key), currency)
+
+
+def _build_cash_position_waterfall(
+    cash_r: Dict,
+    acct_cov_raw: Dict,
+    currency: str,
+) -> GapWaterfall:
+    """
+    Cash Position gap waterfall (PAR-207).
+
+    Reflects what `calculate_cash_position_reconciliation()` ACTUALLY computes
+    today, not the method its labels imply. Verified against live prod
+    2026-08-31: `balance_cents` is NULL on all 193,327 rows of
+    pds_raw_transactions, so the "balance_column" primary path — the last
+    statement balance on or before fiscal year-end — never executes for any
+    deal. Every deal falls through to `flow_derived`, whose per-statement
+    figure is the fiscal-year NET MOVEMENT, not a closing balance. That is
+    disclosed here rather than corrected: fixing it is a separate, unscoped
+    change (PAR-207 explicitly says disclose, don't fix).
+
+    Per-account submitted/missing status is read from the account-coverage
+    result that `generate_reconciliation_section()` already computed — this
+    builder never re-derives bank-name matching, so it cannot drift from the
+    Account Coverage section's own answer.
+    """
+    declared_entries = cash_r.get("declared_balances") or []
+    observed_entries = cash_r.get("bank_balances") or []
+    if not declared_entries and not observed_entries:
+        return GapWaterfall(available=False)
+
+    status_by_bank: Dict[str, str] = {
+        a.get("bank_name"): a.get("status")
+        for a in (acct_cov_raw.get("account_details") or [])
+        if a.get("bank_name")
+    }
+
+    components: List[WaterfallComponent] = []
+
+    for entry in declared_entries:
+        name = entry.get("account") or "--"
+        status = status_by_bank.get(name)
+        components.append(WaterfallComponent(
+            label=name,
+            amount=_money_from_entry(entry, "balance_cents", "balance_kes", currency),
+            kind="declared",
+            sub=({"SUBMITTED": "statement submitted",
+                  "MISSING": "no statement submitted"}.get(status)),
+        ))
+    declared_total_money: Optional[Money] = None
+    if cash_r.get("total_declared_kes") is not None:
+        declared_total_money = _kes_to_money(cash_r.get("total_declared_kes"), currency)
+        components.append(WaterfallComponent(
+            label="Declared total",
+            amount=declared_total_money,
+            kind="subtotal",
+            sub="Note 11 · cash and equivalents",
+        ))
+
+    for entry in observed_entries:
+        method = entry.get("method")
+        components.append(WaterfallComponent(
+            label=entry.get("source") or "--",
+            amount=_money_from_entry(entry, "balance_cents", "balance_kes", currency),
+            kind="observed",
+            sub=("fiscal-year net movement" if method == "flow_derived"
+                 else ("statement balance" if method == "balance_column" else None)),
+        ))
+    if cash_r.get("total_bank_kes") is not None:
+        components.append(WaterfallComponent(
+            label="Observed total",
+            amount=_kes_to_money(cash_r.get("total_bank_kes"), currency),
+            kind="subtotal",
+            sub="Submitted statements",
+        ))
+
+    if cash_r.get("variance_kes") is not None:
+        components.append(WaterfallComponent(
+            label="Observed less declared",
+            amount=_kes_to_money(cash_r.get("variance_kes"), currency),
+            kind="gap",
+        ))
+
+    # Attribute what IS attributable: the declared balance sitting in accounts
+    # for which no statement was provided. Stated as its own amount — NOT as
+    # "the cause of the gap", which would be a verdict and, on the real Buildex
+    # deal, factually wrong (missing accounts hold KES 266,473 declared while
+    # observed EXCEEDS declared by KES 24,238).
+    missing_cents = acct_cov_raw.get("missing_balance_cents")
+    missing_count = acct_cov_raw.get("missing_accounts_count") or 0
+    if missing_cents:
+        components.append(WaterfallComponent(
+            label="Declared balance in accounts with no statement submitted",
+            amount=Money(int(missing_cents), currency),
+            kind="component",
+            sub=f"{missing_count} of {acct_cov_raw.get('declared_accounts_count') or 0} declared accounts · not verified against bank data",
+        ))
+
+    disclosures: List[str] = []
+
+    # The per-account figures come from the audited financials' cash_breakdown
+    # note; the declared total comes from the cash-and-equivalents line. They
+    # are two separately extracted figures and can differ (on the real Buildex
+    # deal they differ by KES 1). Stating the difference keeps the block
+    # internally honest instead of showing lines that visibly do not sum.
+    if declared_total_money is not None and declared_entries:
+        per_account_total = sum(
+            (c.amount.cents for c in components
+             if c.kind == "declared" and c.amount is not None),
+            0,
+        )
+        drift = per_account_total - declared_total_money.cents
+        if drift:
+            disclosures.append(
+                f"Per-account declared balances sum to "
+                f"{_fmt_kes(per_account_total)}, against a declared total of "
+                f"{_fmt_kes(declared_total_money.cents)} — a difference of "
+                f"{_fmt_kes(abs(drift))}. The two are extracted from different "
+                f"lines of the audited financials."
+            )
+
+    if cash_r.get("method") == "flow_derived" or any(
+        e.get("method") == "flow_derived" for e in observed_entries
+    ):
+        disclosures.append(
+            "Observed figures are each statement's net movement across the fiscal "
+            "year, not its closing balance: per-transaction running balances are "
+            "not stored for this deal, so a closing balance cannot be read. A net "
+            "movement and a closing balance are different quantities."
+        )
+    if missing_cents:
+        disclosures.append(
+            "Accounts with no statement submitted contribute to the declared total "
+            "but cannot contribute to the observed total."
+        )
+    return GapWaterfall(available=True, components=components, disclosures=disclosures)
+
+
+def _build_revenue_waterfall(
+    rev_r: Dict,
+    af: Dict,
+    transfer_state: Optional[TransferDetectionState],
+    currency: str,
+) -> GapWaterfall:
+    """
+    Revenue gap waterfall (PAR-207).
+
+    Components are the accrual-timing figures the data model already holds
+    (trade and other receivables). They are stated as amounts standing beside
+    the gap — never as its explanation, per PAR-150 Rule 4.
+
+    The transfer disclosure is driven off the deal's REAL detection state
+    rather than hardcoded, so it stays accurate if PAR-102 is ever fixed.
+    Verified against live prod 2026-08-31: 0 transactions carry a
+    transfer/internal_transfer role, 0 rows exist in pds_transfer_links, and 0
+    deals have more than one distinct account_id — so this resolves to
+    UNAVAILABLE, and the disclosure renders, on every deal currently in the
+    system. That universality is exactly why it is disclosed at the point of
+    the number rather than left implicit (PAR-209's precedent).
+    """
+    declared_kes = rev_r.get("declared_revenue_kes")
+    observed_kes = rev_r.get("bank_inflows_kes")
+    if declared_kes is None and observed_kes is None:
+        return GapWaterfall(available=False)
+
+    components: List[WaterfallComponent] = [
+        WaterfallComponent(
+            label="Declared turnover",
+            amount=_kes_to_money(declared_kes, currency),
+            kind="declared",
+            sub="Audited income statement",
+        ),
+        WaterfallComponent(
+            label="Observed operational inflows",
+            amount=_kes_to_money(observed_kes, currency),
+            kind="observed",
+            sub="Bank credits classified as operational revenue",
+        ),
+    ]
+    if rev_r.get("gap_kes") is not None:
+        components.append(WaterfallComponent(
+            label="Declared less observed",
+            amount=_kes_to_money(rev_r.get("gap_kes"), currency),
+            kind="gap",
+        ))
+
+    for label, field_name, sub in (
+        ("Trade receivables outstanding at year-end", "trade_receivables_cents",
+         "Audited balance sheet · revenue recognised, cash not yet received"),
+        ("Other receivables at year-end", "other_receivables_cents",
+         "Audited balance sheet"),
+    ):
+        cents = af.get(field_name)
+        if cents:
+            components.append(WaterfallComponent(
+                label=label,
+                amount=Money(int(cents), currency),
+                kind="component",
+                sub=sub,
+            ))
+
+    disclosures: List[str] = []
+    if transfer_state == "UNAVAILABLE":
+        disclosures.append(
+            "Observed inflows are not net of inter-account transfers: transfer "
+            "detection cannot run for this deal, so a transfer between the "
+            "company's own accounts that was classified as operational revenue "
+            "remains counted here. See PAR-102."
+        )
+    elif transfer_state == "DETECTED":
+        disclosures.append(
+            "Observed inflows count bank credits classified as operational "
+            "revenue. Transfers detected between the company's own accounts are "
+            "classified separately and are not included in this figure."
+        )
+    elif transfer_state == "NO_TRANSFERS_FOUND":
+        disclosures.append(
+            "Transfer detection ran for this deal and found no transfers between "
+            "the company's own accounts."
+        )
+    return GapWaterfall(available=True, components=components, disclosures=disclosures)
+
+
 def _build_four_point_reconciliation(
     recon_section: Dict,
     recon_available: bool,
@@ -1605,6 +1894,14 @@ def _build_four_point_reconciliation(
     fy,
     currency: str,
     config: ReconCheckConfig = DEFAULT_RECON_CHECK_CONFIG,
+    # PAR-207 — inputs for the per-row gap waterfalls. Optional and trailing so
+    # every existing caller keeps working unchanged; when omitted, the rows
+    # simply carry waterfall=None and nothing new renders. Both are already
+    # resolved at the build_snapshot_context() call site, so wiring them
+    # through costs no additional fetch.
+    acct_cov_raw: Optional[Dict] = None,
+    af: Optional[Dict] = None,
+    transfer_state: Optional[TransferDetectionState] = None,
 ) -> FourPointReconciliation:
     """
     4-Point Reconciliation (PAR-189 Stage 9), transcribed from the original
@@ -1663,27 +1960,21 @@ def _build_four_point_reconciliation(
 
     checks: List[ReconCheck] = []
 
-    # ── Cash position — deliberately NOT coverage-softened (point 1) ─────────
-    cash_var = cash_r.get("variance_pct")
-    cash_status_raw = cash_r.get("status") or "SKIPPED"
-    cash_status = _resolve_recon_status(cash_status_raw, False)
-    if cash_status_raw == "EXACT_MATCH":
-        cash_assessment = "On submitted accounts: KES 0 variance."
-    elif cash_var is not None:
-        cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
-    else:
-        cash_assessment = cash_r.get("reason") or "Insufficient data."
-    checks.append(ReconCheck(
-        key="cash_position",
-        label="Cash position",
-        observed=_kes_to_money(cash_r.get("total_bank_kes", 0), currency),
-        observed_sub="Bank accounts at fiscal year-end",
-        declared=_kes_to_money(cash_r.get("total_declared_kes", 0), currency),
-        declared_sub="Note 11 · cash and equivalents",
-        variance=Percent(cash_var / 100) if cash_var is not None else None,
-        status=cash_status,
-        assessment=cash_assessment,
-    ))
+    # PAR-207: waterfalls are built for Revenue and Cash position only. The
+    # Loan activity row is deliberately left without one until PAR-211's
+    # Parity Science scoping resolves what that row is supposed to measure for
+    # asset-finance-heavy borrowers — building a detailed breakdown on a
+    # definition still under review would present an unresolved question as
+    # settled. Expenses is unchanged: its declared side is a single stated
+    # total with no per-component figures behind it in the data model.
+    _acct_cov_raw: Dict = acct_cov_raw or {}
+    _af: Dict = af or {}
+
+    # PAR-116: row ORDER is Revenue, Expenses, Loan activity, Cash position —
+    # per the ontology's own framing of revenue as the central signal of
+    # business health (four-act restructure, Act 2). Each block below still
+    # computes its status/assessment exactly as before (point 2's per-row
+    # derivation differences are untouched); only the append order changed.
 
     # ── Revenue — status parsed out of the free-text assessment (point 2) ────
     rev_gap = rev_r.get("gap_pct")
@@ -1703,6 +1994,7 @@ def _build_four_point_reconciliation(
         variance=Percent(rev_gap / 100) if rev_gap is not None else None,
         status=rev_status,
         assessment=_with_missing_note(rev_text or "--", rev_status),
+        waterfall=_build_revenue_waterfall(rev_r, _af, transfer_state, currency),
     ))
 
     # ── Expenses — status purely from gap magnitude vs config (point 2) ──────
@@ -1743,6 +2035,29 @@ def _build_four_point_reconciliation(
         variance=Percent(loan_var / 100) if loan_var is not None else None,
         status=loan_status,
         assessment=_with_missing_note(loan_assessment, loan_status),
+    ))
+
+    # ── Cash position — deliberately NOT coverage-softened (point 1) ─────────
+    cash_var = cash_r.get("variance_pct")
+    cash_status_raw = cash_r.get("status") or "SKIPPED"
+    cash_status = _resolve_recon_status(cash_status_raw, False)
+    if cash_status_raw == "EXACT_MATCH":
+        cash_assessment = "On submitted accounts: KES 0 variance."
+    elif cash_var is not None:
+        cash_assessment = f"{abs(cash_var):.1f}% variance on submitted accounts."
+    else:
+        cash_assessment = cash_r.get("reason") or "Insufficient data."
+    checks.append(ReconCheck(
+        key="cash_position",
+        label="Cash position",
+        observed=_kes_to_money(cash_r.get("total_bank_kes", 0), currency),
+        observed_sub="Bank accounts at fiscal year-end",
+        declared=_kes_to_money(cash_r.get("total_declared_kes", 0), currency),
+        declared_sub="Note 11 · cash and equivalents",
+        variance=Percent(cash_var / 100) if cash_var is not None else None,
+        status=cash_status,
+        assessment=cash_assessment,
+        waterfall=_build_cash_position_waterfall(cash_r, _acct_cov_raw, currency),
     ))
 
     return FourPointReconciliation(available=True, checks=checks, fiscal_note=fiscal_note)
@@ -2066,6 +2381,13 @@ def build_snapshot_context(
         str(af_financial_year or "") if recon_available else "",
         currency,
         recon_check_config,
+        # PAR-207 — gap-waterfall inputs. All three are already resolved above
+        # (acct_cov_raw at the top of this function, af from the audited-
+        # financials fetch, and inter_account_transfer built just above), so
+        # the waterfalls add no fetch of their own.
+        acct_cov_raw=acct_cov_raw,
+        af=af,
+        transfer_state=inter_account_transfer.state,
     )
 
     supplier_payments = _build_supplier_payments(txns, entity_name_by_id, supplier_config)

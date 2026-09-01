@@ -34,6 +34,7 @@ from .snapshot_context import (
     TaxCompliance as _TaxCompliance,
     TaxPaymentPattern as _TaxPaymentPattern,
     TransactionPatterns as _TransactionPatterns,
+    GapWaterfall as _GapWaterfall,
     build_snapshot_context,
 )
 from ._snapshot_fetch_helpers import _bank_label, _get_supabase, _paginate
@@ -318,6 +319,15 @@ def _inter_account_transfer_ctx_from(iat: _InterAccountTransfer) -> Dict[str, An
     }[iat.state]
     return {
         "badge_label":   badge_label,
+        # PAR-208 — the raw semantic state, passed through so the methodology
+        # appendix can state whether transfer matching is actually running for
+        # this deal rather than hardcoding "not active". Verified against live
+        # prod 2026-08-31: this is UNAVAILABLE on every deal (PAR-102 open —
+        # 0 transfer-tagged txns, 0 pds_transfer_links rows, exactly 1 distinct
+        # account_id across all 193,327 rows). Driving the wording off the real
+        # state means the appendix corrects itself if PAR-102 ships, instead of
+        # silently describing a rule that is not running.
+        "state":         iat.state,
         "pairs": [
             {"label": p.label, "count": p.count, "total_str": _fmt_money_kes(p.total)}
             for p in iat.pairs
@@ -349,6 +359,44 @@ _RECON_VARIANCE_FORMAT = {
 }
 
 
+# PAR-207 — WeasyPrint's own kind -> CSS-modifier map for gap-waterfall lines,
+# per PAR-189 ratified decision #5 (the shared context carries the semantic
+# WaterfallKind; each renderer owns its styling). Deliberately NOT keyed to the
+# semantic colour tokens: --green/--amber/--red are meaning-locked to
+# verified/warning/error and a waterfall line is none of those, it is a stated
+# amount. These modifiers vary weight and rule only.
+_WF_KIND_CLASS = {
+    "declared":  "wf-plain",
+    "observed":  "wf-plain",
+    "subtotal":  "wf-total",
+    "gap":       "wf-gap",
+    "component": "wf-component",
+}
+
+
+def _waterfall_ctx_from(wf: Optional[_GapWaterfall]) -> Optional[Dict[str, Any]]:
+    """
+    PAR-207. Returns None when a row has no waterfall (Expenses, Loan activity)
+    or when one could not be built (older sealed snapshot lacking the
+    per-account fields) — the template renders nothing at all in that case
+    rather than an empty block.
+    """
+    if wf is None or not wf.available:
+        return None
+    return {
+        "components": [
+            {
+                "label":      c.label,
+                "amount_str": _fmt_money_kes(c.amount) if c.amount is not None else "--",
+                "sub":        c.sub or "",
+                "kind_class": _WF_KIND_CLASS.get(c.kind, "wf-plain"),
+            }
+            for c in wf.components
+        ],
+        "disclosures": list(wf.disclosures),
+    }
+
+
 def _four_point_recon_ctx_from(fpr: _FourPointReconciliation) -> Dict[str, Any]:
     """
     PAR-189 Stage 9. Returns (recon_rows, recon_fiscal_note) as the template
@@ -373,6 +421,7 @@ def _four_point_recon_ctx_from(fpr: _FourPointReconciliation) -> Dict[str, Any]:
             "badge_class":    badge_class,
             "badge_label":    badge_label,
             "assessment":     c.assessment,
+            "waterfall":      _waterfall_ctx_from(c.waterfall),
         })
     return {
         "recon_rows": rows,

@@ -44,8 +44,19 @@ class BaseRepo:
             return
         self.client.table(self.table).insert(items).execute()
 
-    def select_eq(self, column: str, value: Any) -> List[Dict[str, Any]]:
+    def select_eq(self, column: str, value: Any, order_by: str = "id") -> List[Dict[str, Any]]:
         # Paginate: one .range(0, N) with a large N still hits the server max (~1000 rows).
+        #
+        # PAR-106 Bug 3: pagination here previously carried no .order(), and
+        # PostgREST/Postgres does not guarantee stable row order across separate
+        # query executions without one -- on deals with >1,000 rows (e.g. a
+        # 12,851-row deal -> 13 pages), unordered pagination could silently
+        # return the same row on two different pages. That duplicate then
+        # collided in a downstream upsert with "ON CONFLICT DO UPDATE command
+        # cannot affect row a second time" (21000) -- reproduced live during
+        # export on a real 2-bank-statement deal. `order_by` defaults to the
+        # `id` column every table except pds_entities/pds_txn_entity_map has;
+        # those two pass their own primary key (entity_id/txn_id) instead.
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:
@@ -54,6 +65,7 @@ class BaseRepo:
                 self.client.table(self.table)
                 .select("*")
                 .eq(column, value)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -71,8 +83,12 @@ class BaseRepo:
                 break
         return out
 
-    def select_eq2(self, col1: str, val1: Any, col2: str, val2: Any) -> List[Dict[str, Any]]:
-        """Same pagination as select_eq, with a second equality filter pushed to the DB."""
+    def select_eq2(
+        self, col1: str, val1: Any, col2: str, val2: Any, order_by: str = "id"
+    ) -> List[Dict[str, Any]]:
+        """Same pagination as select_eq, with a second equality filter pushed to
+        the DB. See select_eq's docstring (PAR-106 Bug 3) for why order_by
+        is required for pagination to be safe above ~1,000 rows."""
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:
@@ -82,6 +98,7 @@ class BaseRepo:
                 .select("*")
                 .eq(col1, val1)
                 .eq(col2, val2)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -404,7 +421,9 @@ class EntitiesRepo(EntitiesRepository, BaseRepo):
                 self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_entities has no plain `id` column -- entity_id is its primary
+        # key. See BaseRepo.select_eq's PAR-106 Bug 3 docstring.
+        return self.select_eq("deal_id", deal_id, order_by="entity_id")
 
 
 class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
@@ -420,18 +439,20 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
             self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_txn_entity_map has no plain `id` column -- txn_id is its
+        # primary key. See BaseRepo.select_eq's PAR-106 Bug 3 docstring.
+        return self.select_eq("deal_id", deal_id, order_by="txn_id")
 
     def list_needs_review_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         """Filters role='needs_review' in the DB query instead of pulling every
         mapping row for the deal and filtering in Python."""
-        return self.select_eq2("deal_id", deal_id, "role", "needs_review")
+        return self.select_eq2("deal_id", deal_id, "role", "needs_review", order_by="txn_id")
 
     def update_role(self, txn_uuid: str, new_role: str) -> None:
         self.client.table(self.table).update({"role": new_role}).eq("txn_id", txn_uuid).execute()
 
     def count_needs_review(self, deal_id: str) -> int:
-        rows = self.select_eq("deal_id", deal_id)
+        rows = self.select_eq("deal_id", deal_id, order_by="txn_id")
         return sum(1 for r in rows if (r.get("role") or "") == "needs_review")
 
     def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
@@ -617,8 +638,19 @@ class SnapshotsRepo(SnapshotsRepository, BaseRepo):
     # 500 (PAR-33). List/metadata consumers never read it, so we never fetch it here.
     _METADATA_COLUMNS = (
         "id, deal_id, analysis_run_id, schema_version, config_version, "
-        "sha256_hash, created_by, created_at, financial_state_hash"
+        "sha256_hash, created_by, created_at, financial_state_hash, "
+        "computation_fingerprint"
     )
+
+    def set_computation_fingerprint(self, snapshot_id: str, fingerprint: str) -> None:
+        """PAR-219: stamp provenance on an existing row. Used when a recompute
+        produces a byte-identical hash (so the existing row is reused) but that
+        row was sealed by older code — without this the short-circuit would
+        re-compute the same deal on every subsequent call instead of
+        converging. Never touches any hashed field."""
+        self.client.table(self.table).update(
+            {"computation_fingerprint": fingerprint}
+        ).eq("id", snapshot_id).execute()
 
     def list_snapshots(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         # Metadata only — no canonical_json. Callers (GET /deals/{id},

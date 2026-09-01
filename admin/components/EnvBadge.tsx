@@ -1,7 +1,18 @@
 'use client'
 
-export function EnvBadge({ env }: { env: 'prod' | 'staging' }) {
-  const isProd = env === 'prod'
+type Env = 'prod' | 'staging' | 'sandbox'
+
+const STYLES: Record<Env, { border: string; background: string; color: string; label: string }> = {
+  prod: { border: '#E24B4A44', background: '#2C1515', color: '#E24B4A', label: '● PROD' },
+  staging: { border: '#1D9E7544', background: '#122117', color: '#1D9E75', label: '● STAGING' },
+  // Sandbox is a third, distinct environment (ParitySandbox project) — not
+  // a point on the prod/staging binary, so it gets its own color rather
+  // than reusing either of theirs.
+  sandbox: { border: '#C9A22744', background: '#241D0D', color: '#C9A227', label: '● SANDBOX' },
+}
+
+export function EnvBadge({ env }: { env: Env }) {
+  const s = STYLES[env]
   return (
     <span style={{
       fontFamily: "'IBM Plex Mono', monospace",
@@ -9,12 +20,12 @@ export function EnvBadge({ env }: { env: 'prod' | 'staging' }) {
       fontWeight: 500,
       padding: '2px 8px',
       borderRadius: 3,
-      border: `1px solid ${isProd ? '#E24B4A44' : '#1D9E7544'}`,
-      background: isProd ? '#2C1515' : '#122117',
-      color: isProd ? '#E24B4A' : '#1D9E75',
+      border: `1px solid ${s.border}`,
+      background: s.background,
+      color: s.color,
       letterSpacing: '0.05em',
     }}>
-      {isProd ? '● PROD' : '● STAGING'}
+      {s.label}
     </span>
   )
 }

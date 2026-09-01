@@ -212,7 +212,33 @@ def _assert_equiv(section, acct_cov_raw=None, fy="2025", available=True):
         _build_four_point_reconciliation(
             section, available, coverage_incomplete, missing_note, fy, "KES")
     )
-    assert new == original
+    # PAR-116 intentionally reordered the four rows (Revenue, Expenses, Loan
+    # activity, Cash position — the ontology's own framing of revenue as the
+    # central signal of business health) instead of the original's Cash,
+    # Revenue, Expenses, Loan order. _original() above stays an untouched,
+    # byte-for-byte transcription of the pre-Stage-9 source (frozen historical
+    # reference for the Stage 9 refactor itself) — so the equivalence check
+    # here compares row *content* order-independently (sorted by "check"),
+    # rather than updating _original()'s row order to match, which would
+    # destroy what it's for. recon_fiscal_note is unaffected by row order and
+    # still compares directly.
+    #
+    # PAR-207 adds a `waterfall` key to each row that the pre-Stage-9 original
+    # never produced. It is additive presentation data, not a change to any
+    # field this oracle was written to protect, so it is dropped before the
+    # comparison for the same reason the row order is normalised above:
+    # _original() is a frozen record of 2026-era behaviour and editing it to
+    # add a key it never had would defeat its purpose. The waterfalls have
+    # their own direct coverage in test_par207_gap_waterfall.py.
+    assert new["recon_fiscal_note"] == original["recon_fiscal_note"]
+
+    def _without_waterfall(rows):
+        return sorted(
+            ({k: v for k, v in r.items() if k != "waterfall"} for r in rows),
+            key=lambda r: r["check"],
+        )
+
+    assert _without_waterfall(new["recon_rows"]) == _without_waterfall(original["recon_rows"])
     return new
 
 
@@ -426,8 +452,11 @@ def test_context_carries_no_css_classes_or_badge_labels():
 
 def test_checks_carry_semantic_status_and_typed_money():
     fpr = _build_four_point_reconciliation(_section(), True, False, "", "2025", "KES")
+    # PAR-116: Revenue, Expenses, Loan activity, Cash position — order changed
+    # deliberately from the original Cash-first order (see _assert_equiv's
+    # PAR-116 comment above for why this test file's oracle stays untouched).
     assert [c.key for c in fpr.checks] == [
-        "cash_position", "revenue", "expenses", "loan_activity"]
+        "revenue", "expenses", "loan_activity", "cash_position"]
     for c in fpr.checks:
         assert c.status in ("EXACT_MATCH", "ACCEPTABLE", "COVERAGE_GAP", "VARIANCE")
         assert isinstance(c.observed, Money) and isinstance(c.declared, Money)

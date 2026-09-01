@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { DataTable, Column } from '@/components/DataTable'
 import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT, timeSince, refreshedLabel, downloadCSV } from './utils'
 
 type Status = 'pending' | 'in_progress' | 'done'
@@ -136,6 +138,7 @@ export default function ParserRequestsPage() {
   const [partnerFilter, setPartnerFilter] = useState<typeof PARTNER_FILTERS[number]>('All')
   const [statusFilter, setStatusFilter] = useState<typeof STATUS_FILTERS[number]>('All')
   const [lastFetched, setLastFetched] = useState<string>(() => new Date().toISOString())
+  const [env, setEnv] = useState<string | null>(null)
   const [, setTick] = useState(0)
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const tickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -144,6 +147,7 @@ export default function ParserRequestsPage() {
     const res = await fetch('/api/data/parser-requests')
     const data: ApiResponse = await res.json()
     setRows(normalize(data))
+    setEnv(res.headers.get(ENV_HEADER))
     setLoading(false)
     setLastFetched(new Date().toISOString())
   }, [])
@@ -287,6 +291,7 @@ export default function ParserRequestsPage() {
           subtitle={loading ? 'Loading…' : summary}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+          {env === 'prod' && <EnvBadge env="prod" />}
           <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: 'var(--t2)' }}>
             {refreshedLabel(lastFetched)}
           </span>

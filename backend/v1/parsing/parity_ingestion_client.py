@@ -130,9 +130,14 @@ def parse_via_parity_ingestion(
     url = _ingest_upload_url(fname)
     files = {"file": (fname, file_bytes, _mime_for_upload(fname))}
 
+    # TEMPORARY (PAR-216 follow-up, 2026-08-31): 600 -> 900, matching
+    # parity-ingestion's own Cloud Run --timeout bump in cloudbuild.yaml.
+    # Both sides must move together -- extending only one just moves the
+    # failure point. Not a fix for PAR-216 itself (the double-parse is
+    # still there); revisit once that ships.
     t0 = time.perf_counter()
     try:
-        with httpx.Client(timeout=httpx.Timeout(600.0)) as client:
+        with httpx.Client(timeout=httpx.Timeout(900.0)) as client:
             try:
                 resp = client.post(url, files=files)
             except httpx.ReadTimeout as exc:

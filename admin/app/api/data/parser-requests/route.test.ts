@@ -31,6 +31,7 @@ vi.mock('@/lib/supabase', () => ({
     from: fromMock,
     storage: { from: () => ({ createSignedUrl: createSignedUrlMock }) },
   }),
+  SUPABASE_ENV: 'prod',
 }))
 
 vi.mock('@/lib/require-admin-session', () => ({
@@ -70,6 +71,12 @@ describe('GET /api/data/parser-requests', () => {
       ...manualRows[0],
       signed_url: 'https://staging.supabase.co/storage/v1/object/sign/parser-requests/m1/stanbic.pdf?token=fresh',
     }])
+  })
+
+  it('sets the x-data-environment header to prod (PAR-181)', async () => {
+    const { GET } = await import('./route')
+    const res = await GET()
+    expect(res.headers.get('x-data-environment')).toBe('prod')
   })
 
   it('returns 500 if the auto (parser_requests) query errors', async () => {

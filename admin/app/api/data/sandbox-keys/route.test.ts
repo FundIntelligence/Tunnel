@@ -15,6 +15,7 @@ const requireAdminSessionMock = vi.fn<() => Promise<AdminSession | NextResponse>
 
 vi.mock('@/lib/supabase-sandbox', () => ({
   getSupabaseSandbox: () => ({ from: fromMock }),
+  SUPABASE_ENV: 'sandbox',
 }))
 
 vi.mock('@/lib/require-admin-session', () => ({
@@ -60,6 +61,12 @@ describe('GET /api/data/sandbox-keys', () => {
     expect(fromMock).toHaveBeenCalledWith('api_keys')
     expect(selectMock).toHaveBeenCalledWith('id, partner_name, contact_email, calls_used, call_cap, status, created_at')
     expect(await res.json()).toEqual(rows)
+  })
+
+  it('sets the x-data-environment header to sandbox (PAR-181)', async () => {
+    const { GET } = await import('./route')
+    const res = await GET()
+    expect(res.headers.get('x-data-environment')).toBe('sandbox')
   })
 })
 

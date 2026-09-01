@@ -150,7 +150,16 @@ def _assert_equivalent(txns, links, doc_bank_by_id):
     new = _inter_account_transfer_ctx_from(
         _build_inter_account_transfer(txns, links, doc_bank_by_id, "KES")
     )
-    assert new == original
+    # PAR-208 adds a `state` key carrying the raw semantic detection state, so
+    # the methodology appendix can say whether transfer matching is actually
+    # running rather than hardcoding it. The pre-Stage-7 original never emitted
+    # that key. It is additive and changes none of the fields this oracle was
+    # written to protect, so it is dropped before the comparison —
+    # _original_inter_account_transfer() stays a frozen transcription of 2026-era
+    # behaviour, and editing it to add a key it never had would defeat its
+    # purpose. `state` has its own direct coverage in
+    # test_par208_methodology_appendix.py::test_renderer_passes_transfer_state_through.
+    assert {k: v for k, v in new.items() if k != "state"} == original
     return new
 
 
