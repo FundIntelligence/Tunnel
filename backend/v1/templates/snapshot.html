@@ -1974,8 +1974,18 @@ body {
         </tbody>
         <tfoot>
           <tr><td colspan="5" class="cf-foot">{{ cashflow_note | default('') }}</td></tr>
-          {% if cashflow_peak_trough_note or cashflow_trend_note %}
-          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }} {{ cashflow_trend_note | default('') }}</td></tr>
+          {% if cashflow_peak_trough_note %}
+          <!-- PAR-225 follow-up: cashflow_trend_note ("The trend over the
+               observed period is net POSITIVE/NEGATIVE...") deliberately not
+               rendered here. Its underlying first/last-month figures are
+               already visible in the table rows above, and its trough/peak/
+               negative-month facts are already stated in cashflow_note and
+               cashflow_peak_trough_note directly above — the only thing this
+               sentence adds beyond those is a directional "trend is X"
+               characterization, which is interpretation, not disclosure
+               (PAR-150 / PAR-225 Rule 2). Computation is untouched; only
+               removed from render. -->
+          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }}</td></tr>
           {% endif %}
         </tfoot>
       </table>
