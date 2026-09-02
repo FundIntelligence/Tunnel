@@ -1576,19 +1576,21 @@ def _build_supplier_payments(
             f"Insufficient supplier transaction volume for a reliable "
             f"concentration assessment (N={supplier_txn_count})."
         )
-    elif top_supplier_share >= config.high_threshold:
-        concentration = "HIGH"
-        narrative = "This represents HIGH supplier concentration risk."
-    elif top_supplier_share >= config.moderate_threshold:
-        concentration = "MODERATE"
-        narrative = "This represents MODERATE supplier concentration."
     else:
-        # PAR-226: was "Supplier spend is well-diversified across
-        # counterparties." — interpretive language, not disclosure (PAR-150).
-        # Replaced with the same figure already shown in the table, stated as
-        # a plain fact — the reviewer decides what "diversified" means from
-        # the number, not from an adjective this system supplies for them.
-        concentration = "DIVERSIFIED"
+        # PAR-226 follow-up: HIGH/MODERATE previously read "This represents
+        # HIGH supplier concentration risk." / "...MODERATE supplier
+        # concentration." — verdict-shaped narrative wrapping the bucket,
+        # same PAR-150 shape "well-diversified" had, just not named in
+        # PAR-226's original scope. Collapsed into the same factual sentence
+        # PAR-226 already shipped for DIVERSIFIED — the typed `concentration`
+        # bucket below is retained unchanged for any downstream/programmatic
+        # use; only the free-text narrative is unified and de-adjectived.
+        if top_supplier_share >= config.high_threshold:
+            concentration = "HIGH"
+        elif top_supplier_share >= config.moderate_threshold:
+            concentration = "MODERATE"
+        else:
+            concentration = "DIVERSIFIED"
         narrative = (
             f"Top supplier accounts for {top_supplier_share * 100:.1f}% of "
             f"total supplier spend across {supplier_entity_count} counterparties."
