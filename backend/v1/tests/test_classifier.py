@@ -510,17 +510,19 @@ def test_payloan_credit_loan_inflow():
     assert role == "loan_inflow"
     assert "keyword_match" in reason
 
-def test_tendepay_debit_loan_repayment():
-    """TENDEPAY LIMITED debits (Buildex KCB + Equity) → loan_repayment."""
+def test_tendepay_debit_needs_review():
+    """TENDEPAY LIMITED debits (Buildex KCB + Equity) → needs_review, not loan_repayment
+    (PAR-237: TendePay is a CBK-licensed payment platform, not a lender)."""
     role, reason = classify_with_reason(txn("transfer 107853 tendepay limited", -200000000))
-    assert role == "loan_repayment"
-    assert "keyword_match" in reason
+    assert role == "needs_review"
+    assert "tendepay" in reason
 
-def test_tendepay_ltd_debit_loan_repayment():
-    """TENDEPAY LTD variant (Equity RTGS descriptor) → loan_repayment."""
+def test_tendepay_ltd_debit_needs_review():
+    """TENDEPAY LTD variant (Equity RTGS descriptor) → needs_review, not loan_repayment
+    (PAR-237: TendePay is a CBK-licensed payment platform, not a lender)."""
     role, reason = classify_with_reason(txn("rtgs: rtobzn04308434 tendepay ltd", -15000000))
-    assert role == "loan_repayment"
-    assert "keyword_match" in reason
+    assert role == "needs_review"
+    assert "tendepay" in reason
 
 def test_swift_charge_jiinue_bank_charge():
     """SWIFT charge on Jiinue RTGS → bank_charge, not loan_repayment (lender name must not win)."""
