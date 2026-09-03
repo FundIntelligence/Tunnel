@@ -207,12 +207,26 @@ DEFAULT_TAX_COMPLIANCE_CONFIG = TaxComplianceConfig()
 
 
 @dataclass(frozen=True)
+class TaxKeywordGroup:
+    """PAR-229: one row of the matched-keyword breakdown. `keyword` is the
+    literal descriptor keyword the classifier matched (classifier.py's
+    _TAX_KEYWORDS), parsed from role_reason ("keyword_match:{kw}:tax_keywords")
+    — NOT a verified tax type. A single tax_payment transaction (e.g. a
+    bundled KRA remittance) is not provably one tax type; this states only
+    what matched, not what it means."""
+    keyword: str          # e.g. "vat", "paye", "kra" — or "(none recorded)" if role_reason is unset/unparseable
+    txn_count: int
+    total: Money
+
+
+@dataclass(frozen=True)
 class TaxCompliance:
     total: Money
     months_with_tax: int
     months_total: int
     status: KraStatus
     narrative: str
+    by_keyword: Optional[List[TaxKeywordGroup]] = None   # PAR-229
 
 
 @dataclass(frozen=True)
@@ -323,6 +337,17 @@ class Composition:
 
 
 @dataclass(frozen=True)
+class SupplierEntry:
+    """PAR-226: one row of the ranked supplier table. Same per-counterparty
+    data _build_supplier_payments() already aggregates into supplier_by_entity
+    — this just retains the top N instead of discarding all but the max()."""
+    name: str
+    txn_count: int
+    total: Money
+    share: Percent   # this entry's total / supplier_total_cents
+
+
+@dataclass(frozen=True)
 class SupplierPayments:
     available: bool
     total: Optional[Money] = None
@@ -332,6 +357,7 @@ class SupplierPayments:
     top_share: Optional[Percent] = None
     concentration: Optional[SupplierConcentration] = None
     narrative: Optional[str] = None
+    top_n: Optional[List[SupplierEntry]] = None   # PAR-226: top 10 by total, all deals
 
 
 @dataclass(frozen=True)
@@ -720,9 +746,13 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "balance_cents, account_id, document_id",
         deal_id,
     )
-    map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id", deal_id)
+    # PAR-229 added role_reason (-> "role_reason") for Tax Compliance's
+    # matched-keyword breakdown — the only consumer; every other section
+    # ignores this key.
+    map_rows = _paginate(sb, "pds_txn_entity_map", "txn_id, role, entity_id, role_reason", deal_id)
     role_by_txn = {r["txn_id"]: r["role"] for r in map_rows}
     entity_id_by_txn = {r["txn_id"]: r.get("entity_id") for r in map_rows}
+    role_reason_by_txn = {r["txn_id"]: r.get("role_reason") for r in map_rows}
 
     return [{
         "id": t["id"],
@@ -735,6 +765,7 @@ def _fetch_txns_for_context(sb, deal_id: str) -> List[Dict]:
         "entity_id": entity_id_by_txn.get(t["id"]),
         "account_id": t.get("account_id"),
         "document_id": t.get("document_id"),
+        "role_reason": role_reason_by_txn.get(t["id"]),
     } for t in txn_rows]
 
 
@@ -1379,6 +1410,21 @@ def _build_loan_activity(
     )
 
 
+def _parse_tax_keyword(role_reason: Optional[str]) -> str:
+    """PAR-229: extract the matched keyword from a role_reason string of the
+    form "keyword_match:{kw}:tax_keywords" (classifier.py:349-351). Real
+    prod data confirmed (2026-09-01) this format is consistent — no
+    near-duplicate variants — across the 4 keywords actually observed
+    (kra, vat, paye, tax) out of classifier.py's 8-keyword _TAX_KEYWORDS set.
+    Returns "(none recorded)" for a null/legacy/unparseable role_reason
+    rather than guessing — this deal's version of "we don't know," not a
+    silently-dropped row."""
+    if not role_reason or not role_reason.startswith("keyword_match:"):
+        return "(none recorded)"
+    parts = role_reason.split(":")
+    return parts[1] if len(parts) >= 2 and parts[1] else "(none recorded)"
+
+
 def _build_tax_compliance(
     txns: List[Dict],
     in_active_period,
@@ -1388,6 +1434,10 @@ def _build_tax_compliance(
     tax_total_cents_active = 0
     tax_txn_count_active = 0
     all_months_active: set = set()
+    # PAR-229: same filter (active period, _TAX_ROLES, signed < 0) as the
+    # totals above, so by_keyword's totals reconcile with `total` exactly —
+    # not a separately-scoped recompute.
+    keyword_agg: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "count": 0})
     for t in txns:
         m = (t["txn_date"] or "")[:7]
         if t["txn_date"] and in_active_period(m):
@@ -1396,6 +1446,13 @@ def _build_tax_compliance(
                 tax_months_active.add(m)
                 tax_total_cents_active += t["abs"]
                 tax_txn_count_active += 1
+                keyword_agg[_parse_tax_keyword(t.get("role_reason"))]["total"] += t["abs"]
+                keyword_agg[_parse_tax_keyword(t.get("role_reason"))]["count"] += 1
+
+    by_keyword = [
+        TaxKeywordGroup(keyword=kw, txn_count=v["count"], total=Money(cents=v["total"]))
+        for kw, v in sorted(keyword_agg.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    ] or None
 
     n_tax_months = len(tax_months_active)
     n_total_months = len(all_months_active)
@@ -1433,6 +1490,7 @@ def _build_tax_compliance(
         months_total=n_total_months,
         status=status,
         narrative=narrative,
+        by_keyword=by_keyword,
     )
 
 
@@ -1518,15 +1576,43 @@ def _build_supplier_payments(
             f"Insufficient supplier transaction volume for a reliable "
             f"concentration assessment (N={supplier_txn_count})."
         )
-    elif top_supplier_share >= config.high_threshold:
-        concentration = "HIGH"
-        narrative = "This represents HIGH supplier concentration risk."
-    elif top_supplier_share >= config.moderate_threshold:
-        concentration = "MODERATE"
-        narrative = "This represents MODERATE supplier concentration."
     else:
-        concentration = "DIVERSIFIED"
-        narrative = "Supplier spend is well-diversified across counterparties."
+        # PAR-226 follow-up: HIGH/MODERATE previously read "This represents
+        # HIGH supplier concentration risk." / "...MODERATE supplier
+        # concentration." — verdict-shaped narrative wrapping the bucket,
+        # same PAR-150 shape "well-diversified" had, just not named in
+        # PAR-226's original scope. Collapsed into the same factual sentence
+        # PAR-226 already shipped for DIVERSIFIED — the typed `concentration`
+        # bucket below is retained unchanged for any downstream/programmatic
+        # use; only the free-text narrative is unified and de-adjectived.
+        if top_supplier_share >= config.high_threshold:
+            concentration = "HIGH"
+        elif top_supplier_share >= config.moderate_threshold:
+            concentration = "MODERATE"
+        else:
+            concentration = "DIVERSIFIED"
+        narrative = (
+            f"Top supplier accounts for {top_supplier_share * 100:.1f}% of "
+            f"total supplier spend across {supplier_entity_count} counterparties."
+        )
+
+    # PAR-226: top-10 by total value, for every deal regardless of size —
+    # confirmed as a safe default, not a large-deal-only safeguard, pending
+    # real data at materially larger supplier counts than observed so far.
+    ranked = sorted(supplier_by_entity.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    top_n = [
+        SupplierEntry(
+            name=(
+                entity_name_by_id.get(eid)
+                or (eid[:16] + "…" if len(eid) > 16 else eid)
+                or "--"
+            ),
+            txn_count=data["count"],
+            total=Money(cents=data["total"]),
+            share=Percent(value=data["total"] / supplier_total_cents),
+        )
+        for eid, data in ranked[:10]
+    ]
 
     return SupplierPayments(
         available=True,
@@ -1537,6 +1623,7 @@ def _build_supplier_payments(
         top_share=Percent(value=top_supplier_share),
         concentration=concentration,
         narrative=narrative,
+        top_n=top_n,
     )
 
 
@@ -2254,6 +2341,11 @@ def build_snapshot_context(
     analyst_notes: Optional[str] = deal_row.get("analyst_notes") or None
     currency: str = deal_row.get("currency") or "KES"
 
+    # PAR-228: deterministic row selection. Without an explicit order, a deal
+    # with 2+ years of audited financials (unique key is deal_id,financial_year
+    # per AuditedFinancialsRepo.upsert()) would have PostgREST return whichever
+    # row it pleases, not necessarily the most recent. Matches the pattern
+    # reconciliation_engine.py's _get_audited_financials() already uses.
     af_result = (
         sb.table("pds_audited_financials")
         .select(
@@ -2261,6 +2353,8 @@ def build_snapshot_context(
             "loan_breakdown, turnover_cents, profit_before_tax_cents"
         )
         .eq("deal_id", deal_id)
+        .order("financial_year", desc=True)
+        .limit(1)
         .execute()
         .data or []
     )

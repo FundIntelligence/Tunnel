@@ -226,7 +226,25 @@ def test_tax_compliance_matches_original(txns, in_active_period):
     old = _original_tax_compliance_ctx(txns, in_active_period)
     new_typed = _build_tax_compliance(txns, in_active_period, DEFAULT_TAX_COMPLIANCE_CONFIG)
     new = _tax_compliance_ctx_from(new_typed)
-    assert new == old, f"Tax Compliance Analysis diverged.\nOLD: {old}\nNEW: {new}"
+
+    # PAR-229 intentionally adds "by_keyword" — the ORIGINAL (pre-PAR-229)
+    # reference never had this. None of this file's fixtures set role_reason,
+    # so every group falls to the "(none recorded)" bucket — asserted
+    # separately below, not folded into the byte-diff equality check.
+    expected = dict(old)
+    expected["by_keyword"] = new.get("by_keyword")
+    assert new == expected, (
+        f"Tax Compliance Analysis diverged beyond PAR-229's known addition.\n"
+        f"OLD: {old}\nEXPECTED (OLD + PAR-229 diff): {expected}\nNEW: {new}"
+    )
+    if new_typed.months_with_tax > 0 and new_typed.total.cents > 0:
+        assert new["by_keyword"], "expected at least one keyword group when tax activity exists"
+        total_from_groups = sum(g["txn_count"] for g in new["by_keyword"])
+        assert total_from_groups == sum(
+            1 for t in txns
+            if t["role"] in ("tax_payment", "kra_payment") and t["signed"] < 0
+            and t["txn_date"] and in_active_period(t["txn_date"][:7])
+        )
 
 
 def test_risk_assessment_critical_count_now_sources_from_transaction_patterns():

@@ -128,6 +128,12 @@ class TestConcurrencyAssault(unittest.IsolatedAsyncioTestCase):
         self._af_patcher = patch("backend.v1.db.supabase_repositories.AuditedFinancialsRepo")
         mock_af_cls = self._af_patcher.start()
         mock_af_cls.return_value.get_by_deal_id.return_value = []
+        # PAR-238: export() now also calls get_latest_confirmed() to source
+        # reconciliation's accrual figures — an unconfigured MagicMock here
+        # would flow into compute_metrics() as accrual_revenue_cents and
+        # blow up on `> 0`. None matches "no audited financials", same as
+        # get_by_deal_id returning [] above.
+        mock_af_cls.return_value.get_latest_confirmed.return_value = None
 
         self._recon_patcher = patch(
             "backend.v1.analysis.snapshot_generator.generate_reconciliation_section",

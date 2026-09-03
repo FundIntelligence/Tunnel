@@ -177,6 +177,17 @@ def _supplier_payments_ctx_from(sp: _SupplierPayments) -> Dict[str, Any]:
         "top_name":     sp.top_counterparty,
         "top_pct_str":  f"{sp.top_share.value * 100:.1f}%",
         "clause":       sp.narrative,
+        # PAR-226: ranked table rows, name/count/amount — mirrors Loan
+        # Facilities' table shape. Already top-10 from _build_supplier_payments().
+        "rows": [
+            {
+                "name":      row.name,
+                "txn_count": row.txn_count,
+                "total_str": _fmt_money_kes(row.total),
+                "pct_str":   f"{row.share.value * 100:.1f}%",
+            }
+            for row in (sp.top_n or [])
+        ],
     }
 
 
@@ -223,6 +234,16 @@ def _tax_compliance_ctx_from(tc: _TaxCompliance) -> Dict[str, Any]:
         "n_total_months": tc.months_total,
         "kra_compliance": tc.status,
         "clause":         tc.narrative,
+        # PAR-229: matched-keyword breakdown — see TaxKeywordGroup's docstring
+        # for why "keyword" is never labeled "tax type" in the template.
+        "by_keyword": [
+            {
+                "keyword":   g.keyword,
+                "txn_count": g.txn_count,
+                "total_str": _fmt_money_kes(g.total),
+            }
+            for g in (tc.by_keyword or [])
+        ],
     }
 
 
@@ -761,6 +782,9 @@ def render_snapshot_html(
         })
 
     # 4. Audited financials (optional — sets recon_available)
+    # PAR-228: deterministic row selection — see snapshot_context.py's
+    # identical fix for the full rationale (matches reconciliation_engine.py's
+    # existing _get_audited_financials() pattern).
     af_result = (
         sb.table("pds_audited_financials")
         # PAR-189 Stage 11: turnover_cents/profit_before_tax_cents dropped —
@@ -770,6 +794,8 @@ def render_snapshot_html(
             "inventory_cents, cost_of_sales_cents, extraction_confidence"
         )
         .eq("deal_id", deal_id)
+        .order("financial_year", desc=True)
+        .limit(1)
         .execute()
         .data or []
     )

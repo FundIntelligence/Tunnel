@@ -31,15 +31,19 @@ _LOAN_KEYWORDS = frozenset({
     "od limit",
 })
 
-# Known microfinance and bank paybill patterns for loan repayment detection
+# Known microfinance and bank paybill patterns for loan repayment detection.
+# NOTE (PAR-237): a name turning up on a statement scan with no "loan"
+# substring in its own descriptor is NOT sufficient evidence it belongs here
+# — confirm the entity is an actual licensed lender before adding it, not
+# just an unfamiliar counterparty name. This exact assumption previously
+# added "tendepay" (a CBK-licensed payment platform, not a lender) to this
+# set; see the dedicated needs_review check below instead.
 _LOAN_REPAYMENT_PATTERNS = frozenset({
     "choice microfinance", "faulu", "kwft", "smep", "sumac",
     "rafiki microfinance", "century microfinance", "uwezo",
     "oda collection",
     # Overdraft-specific repayment terms (no "loan" substring to catch via _LOAN_KEYWORDS)
     "overdraft repayment", "od repayment", "od recovery",
-    # Digital lenders identified via statement scan — no "loan" substring in descriptors
-    "tendepay",
 })
 
 # Capital injection (positive only)
@@ -303,6 +307,16 @@ def _keyword_classify(descriptor: str, amount_cents: int) -> Optional[Tuple[str,
     # prevent lender names in the descriptor (e.g. "jiinue") from firing first.
     if "swift charge" in d:
         return ("bank_charge", "keyword_match:swift_charge_fee")
+
+    # TendePay (PAR-237) — CBK-licensed payment platform, not a lender; was
+    # previously miscategorized in _LOAN_REPAYMENT_PATTERNS on an unverified
+    # "digital lender identified via statement scan" assumption (PAR-236).
+    # What these transactions actually represent (payroll funding, supplier
+    # payout, or something else) isn't determinable from bank narration
+    # alone, so route to needs_review pending analyst confirmation rather
+    # than guess a replacement role.
+    if "tendepay" in d:
+        return ("needs_review", "keyword_match:tendepay:reclassified_non_lender_par237")
 
     # 2. Loan keywords
     for kw in _LOAN_KEYWORDS:

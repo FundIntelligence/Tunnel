@@ -1849,6 +1849,21 @@ body {
           <tr><td>Top supplier</td><td class="rt-figure" style="text-align:right">{{ supplier_payments.top_name }} · {{ supplier_payments.top_pct_str }}</td></tr>
         </tbody>
       </table>
+      <!-- PAR-226: ranked supplier table, top-10 by total value, name/count/amount only -->
+      <table class="loan-table">
+        <thead>
+          <tr><th>Supplier</th><th>Transactions</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+          {% for row in supplier_payments.rows | default([]) %}
+          <tr>
+            <td><span class="loan-name">{{ row.name | default('--') }}</span></td>
+            <td class="rt-figure">{{ row.txn_count | default('--') }}</td>
+            <td class="rt-figure">{{ row.total_str | default('--') }} ({{ row.pct_str | default('--') }})</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
       <div class="cashflow-note">{{ supplier_payments.clause }}</div>
       {% else %}
       <div class="cashflow-note" style="border-top:none">No supplier payments classified for this deal.</div>
@@ -1899,6 +1914,25 @@ body {
           <tr><td>Compliance status</td><td class="rt-figure" style="text-align:right">{{ tax_compliance.kra_compliance }}</td></tr>
         </tbody>
       </table>
+      {% if tax_compliance.by_keyword %}
+      <!-- PAR-229: grouped by matched descriptor keyword, never "tax type" —
+           a keyword match is not a verified tax-type classification. -->
+      <table class="loan-table">
+        <thead>
+          <tr><th>Matched keyword</th><th>Transactions</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+          {% for row in tax_compliance.by_keyword %}
+          <tr>
+            <td><span class="loan-name">{{ row.keyword | default('--') }}</span></td>
+            <td class="rt-figure">{{ row.txn_count | default('--') }}</td>
+            <td class="rt-figure">{{ row.total_str | default('--') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="cashflow-note">Grouped by matched payment narration, not a verified tax category.</div>
+      {% endif %}
       <div class="cashflow-note">{{ tax_compliance.clause }}</div>
     </div>
 
@@ -1940,8 +1974,18 @@ body {
         </tbody>
         <tfoot>
           <tr><td colspan="5" class="cf-foot">{{ cashflow_note | default('') }}</td></tr>
-          {% if cashflow_peak_trough_note or cashflow_trend_note %}
-          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }} {{ cashflow_trend_note | default('') }}</td></tr>
+          {% if cashflow_peak_trough_note %}
+          <!-- PAR-225 follow-up: cashflow_trend_note ("The trend over the
+               observed period is net POSITIVE/NEGATIVE...") deliberately not
+               rendered here. Its underlying first/last-month figures are
+               already visible in the table rows above, and its trough/peak/
+               negative-month facts are already stated in cashflow_note and
+               cashflow_peak_trough_note directly above — the only thing this
+               sentence adds beyond those is a directional "trend is X"
+               characterization, which is interpretation, not disclosure
+               (PAR-150 / PAR-225 Rule 2). Computation is untouched; only
+               removed from render. -->
+          <tr><td colspan="5" class="cf-foot">{{ cashflow_peak_trough_note | default('') }}</td></tr>
           {% endif %}
         </tfoot>
       </table>
