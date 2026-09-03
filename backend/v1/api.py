@@ -1109,15 +1109,26 @@ def export(request: Request, deal_id: str, force: bool = False):
             COMPUTATION_FINGERPRINT,
         )
 
+    # PAR-238: read the accrual figures reconciliation compares against from
+    # the confirmed pds_audited_financials record, not deal.accrual_*. Those
+    # deal-level fields are only ever set once, at deal-creation time (POST
+    # /deals), and are never updated when audited financials are later
+    # uploaded/confirmed — so a deal following the normal flow (create deal,
+    # then confirm financials afterward) was structurally guaranteed to hit
+    # NOT_RUN regardless of how complete the confirmed financials were. This
+    # reads from the one source of truth instead, and works retroactively for
+    # deals already confirmed before this fix shipped, with no backfill.
+    from .db.supabase_repositories import AuditedFinancialsRepo
+    confirmed_af = AuditedFinancialsRepo().get_latest_confirmed(deal_id)
     stage = "PIPELINE_START"
     run, links, entities, txn_map = run_pipeline(
         deal_id=deal_id,
         raw_transactions=raw,
         overrides=overrides,
         accrual={
-            "accrual_revenue_cents": deal.get("accrual_revenue_cents"),
-            "accrual_period_start": deal.get("accrual_period_start"),
-            "accrual_period_end": deal.get("accrual_period_end"),
+            "accrual_revenue_cents": confirmed_af.get("turnover_cents") if confirmed_af else None,
+            "accrual_period_start": confirmed_af.get("financial_year_start") if confirmed_af else None,
+            "accrual_period_end": confirmed_af.get("financial_year_end") if confirmed_af else None,
         },
     )
     stage = "PIPELINE_DONE"

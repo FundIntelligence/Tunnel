@@ -112,14 +112,24 @@ def _run_export(deal_id: str, created_by: str) -> dict:
 
     overrides = list(overrides_repo.list_overrides(deal_id))
 
+    # PAR-238: same fix as api.py's export() — read accrual figures from the
+    # confirmed pds_audited_financials record, not the disconnected
+    # deal.accrual_* fields (set once at deal-creation, never updated when
+    # financials are confirmed afterward). This MUSA-triggered path is a
+    # second, independent call site for run_pipeline() with the exact same
+    # bug, so it needs the identical fix — leaving it unfixed would mean
+    # MUSA-driven exports keep hitting NOT_RUN after the primary export path
+    # is fixed, which defeats the point of moving to a single source of truth.
+    from ..db.supabase_repositories import AuditedFinancialsRepo
+    confirmed_af = AuditedFinancialsRepo().get_latest_confirmed(deal_id)
     run, links, entities, txn_map = run_pipeline(
         deal_id=deal_id,
         raw_transactions=raw,
         overrides=overrides,
         accrual={
-            "accrual_revenue_cents": deal.get("accrual_revenue_cents"),
-            "accrual_period_start": deal.get("accrual_period_start"),
-            "accrual_period_end": deal.get("accrual_period_end"),
+            "accrual_revenue_cents": confirmed_af.get("turnover_cents") if confirmed_af else None,
+            "accrual_period_start": confirmed_af.get("financial_year_start") if confirmed_af else None,
+            "accrual_period_end": confirmed_af.get("financial_year_end") if confirmed_af else None,
         },
     )
 
