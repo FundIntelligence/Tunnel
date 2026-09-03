@@ -796,6 +796,28 @@ class AuditedFinancialsRepo(BaseRepo):
         )
         return res.data[0] if res.data else None
 
+    def get_latest_confirmed(self, deal_id: str) -> Optional[Dict[str, Any]]:
+        """Return the confirmed (confirmed_at IS NOT NULL) record for the most
+        recent financial_year for this deal, or None if none is confirmed yet.
+
+        PAR-238: this is what reconciliation should read as the deal's accrual
+        source of truth instead of the disconnected deal.accrual_* fields.
+        "Most recent financial_year" mirrors the ordering
+        GET /deals/{deal_id}/audited-financials already uses to sort multiple
+        years for display, rather than inventing a new convention.
+        """
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .is_("removed_at", "null")
+            .not_.is_("confirmed_at", "null")
+            .order("financial_year", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
     def soft_delete(
         self,
         deal_id: str,
