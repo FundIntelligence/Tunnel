@@ -1,0 +1,37 @@
+-- Migration 042: cap sandbox-classify keys' call_cap at 3,000 (PAR-245)
+--
+-- Migration 027 (PAR-130) already added calls_used/call_cap/status to
+-- api_keys and an atomic increment_api_key_usage() RPC, generic across both
+-- key_type values api_keys currently supports ('musa-partner',
+-- 'sandbox-classify') -- but nothing in backend/ ever called that RPC
+-- (confirmed by grep before writing this migration: zero callers anywhere
+-- in this repo), so no cap was ever enforced. PAR-245 is that first real
+-- caller (backend/v1/integrations/auth.py's require_scoped_api_key).
+--
+-- The "10k sandbox limit" some remembered turns out to be real, just as an
+-- unenforced schema default (call_cap's table-wide default is 10000, set by
+-- migration 027) rather than a limit that was ever actually checked
+-- anywhere. PAR-245 sets the real, enforced sandbox limit at 3,000 --
+-- deliberately lower than and independent of that old default, and
+-- deliberately not touching the column's table-wide default (still 10000),
+-- since that default is shared with 'musa-partner' rows and changing it
+-- would silently affect Musa's cap too, which is out of scope here.
+--
+-- This constraint is a defense-in-depth backstop, not the primary
+-- enforcement mechanism (that's the application-level explicit
+-- call_cap=3000 set at key-issuance time, per this PR's other changes) --
+-- it exists so that no sandbox-classify row can ever end up above 3,000
+-- even via a future insert path that forgets to set call_cap explicitly.
+--
+-- Scope note: this migration reaches parity-staging (and, via the prod
+-- equivalent of this same workflow, prod) -- it does NOT reach the separate
+-- `paritysandbox` Supabase project (vksrelnjoejzqkiwqano) that
+-- admin/app/api/data/sandbox-keys actually issues real sandbox keys
+-- against. That project has its own, separate migration history (see
+-- PAR-168, still open) which this repo's migration pipeline cannot apply
+-- to. Confirmed directly: paritystaging's api_keys table currently has zero
+-- sandbox-classify rows at all (real sandbox keys live in paritysandbox,
+-- not here) -- so there's nothing to backfill on this project.
+alter table public.api_keys
+  add constraint api_keys_sandbox_call_cap_max
+  check (key_type <> 'sandbox-classify' or call_cap <= 3000);

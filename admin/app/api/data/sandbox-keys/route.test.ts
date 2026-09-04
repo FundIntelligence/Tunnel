@@ -35,7 +35,7 @@ beforeEach(() => {
   selectMock.mockReturnValue({ order: orderMock })
 
   insertSelectSingleMock.mockResolvedValue({
-    data: { id: 'k2', partner_name: 'Acme', contact_email: 'dev@acme.com', calls_used: 0, call_cap: 10000, status: 'active', created_at: '2026-08-17T00:00:00Z' },
+    data: { id: 'k2', partner_name: 'Acme', contact_email: 'dev@acme.com', calls_used: 0, call_cap: 3000, status: 'active', created_at: '2026-08-17T00:00:00Z' },
     error: null,
   })
   insertMock.mockReturnValue({ select: () => ({ single: insertSelectSingleMock }) })
@@ -95,9 +95,21 @@ describe('POST /api/data/sandbox-keys', () => {
       partner_name: 'Acme',
       contact_email: 'dev@acme.com',
       key_type: 'sandbox-classify',
+      call_cap: 3000,
     })
     const body = await res.json()
     expect(body.raw_key).toBe('psb_rawkeyvalue')
     expect(body.id).toBe('k2')
+  })
+
+  it('issues a new key with the 3,000 lifetime call cap, not the shared 10,000 table default (PAR-245)', async () => {
+    const { POST } = await import('./route')
+    const req = new NextRequest('http://localhost/api/data/sandbox-keys', {
+      method: 'POST',
+      body: JSON.stringify({ partner_name: 'Acme', contact_email: 'dev@acme.com' }),
+    })
+    await POST(req)
+    const insertedRow = insertMock.mock.calls[0][0]
+    expect(insertedRow.call_cap).toBe(3000)
   })
 })
