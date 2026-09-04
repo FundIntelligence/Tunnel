@@ -40,6 +40,13 @@ export interface ParserRequestDoc {
   docId: string;
   fileName: string;
   errorMessage: string;
+  // PAR-242: distinguishes a direct-upload failure (docId is a pds_documents
+  // id; submit inserts a fresh pds_parser_requests row, existing behaviour)
+  // from a Musa-originated one PAR-62 already auto-inserted into
+  // parser_requests (docId is that row's id; submit enriches it in place
+  // via PATCH /deals/{deal_id}/parser-requests/{id} instead of inserting a
+  // second row for the same detected failure).
+  source?: 'direct' | 'musa';
 }
 
 export interface ParserRequestForm {
