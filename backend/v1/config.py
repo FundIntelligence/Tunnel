@@ -113,6 +113,15 @@ CONFIG_VERSION = _CONFIG_VERSION_BASE
 MAX_PDF_FILES = 20          # max files per single batch upload operation
 MAX_BATCH_UPLOADS = 20      # max distinct batch upload operations per deal
 
+# PAR-245: sandbox-classify keys' lifetime call limit -- deliberately simple
+# (no monthly reset, no date math), matching the sandbox's actual purpose of
+# proving an integration works once, not an ongoing allowance. Enforced via
+# api_keys.call_cap + increment_api_key_usage() (migration 027/032/042), not
+# read from this constant at request time -- the DB is the source of truth
+# for the atomic check. This constant is what new sandbox-classify keys get
+# issued with, and what the rejection message names.
+SANDBOX_FREE_LIMIT_CALLS = 3000
+
 GIT_COMMIT = os.getenv("GIT_COMMIT") or None
 BUILD_TIMESTAMP = os.getenv("BUILD_TIMESTAMP") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 DETERMINISTIC_MODE = True
