@@ -450,9 +450,30 @@ async def _record_unrecognized_document(
         logger.exception(
             "[MUSA] Failed to insert parser_requests row session=%s", session_id
         )
+
+    # PAR-242: pre-fill what's already resolvable at this exact point in the
+    # flow (the deal record) rather than asking anyone to retype it. Only the
+    # deal's own name/company_name is available here — no separate org/account
+    # table with a registration or contact email exists for a Musa-originated
+    # deal at this point (the deal's `created_by`/`user_id` links to `profiles`,
+    # but Musa-created deals frequently have no signed-in Parity user attached,
+    # so that lookup would silently return nothing for the common case; not
+    # guessed at). Best-effort: a lookup failure must not block the existing
+    # parser_requests insert/notify above.
+    deal_name: Optional[str] = None
+    try:
+        deal = DealsRepo().get_deal(deal_id)
+        if deal:
+            deal_name = deal.get("company_name") or deal.get("name")
+    except Exception:
+        logger.exception(
+            "[MUSA] Failed to look up deal for parser-request pre-fill deal_id=%s", deal_id
+        )
+
     await _notify_parser_request(
         session_id=session_id,
         deal_id=deal_id,
+        deal_name=deal_name,
         venture_country=venture_country,
         document_url=document_url,
         error_message=error_message,
@@ -465,6 +486,7 @@ async def _notify_parser_request(
     venture_country: str,
     document_url: Optional[str],
     error_message: str,
+    deal_name: Optional[str] = None,
 ) -> None:
     """
     Email the team that a Musa file failed with an unsupported/unparseable
@@ -473,6 +495,11 @@ async def _notify_parser_request(
     its own). Tags the request partner="musa" so the route skips its
     pds_parser_requests insert (this path already wrote to parser_requests
     directly, just above) and the email is the only thing left to do here.
+
+    deal_name (PAR-242): whatever was resolvable from the deal record at the
+    detection point (see caller) — passed through so the notification names
+    the actual deal, not just its opaque UUID. None when not resolvable;
+    the frontend/email template renders that as "—", not a guess.
 
     Best-effort only: this must never affect musa_sessions state or the
     webhook Musa actually depends on.
@@ -489,6 +516,7 @@ async def _notify_parser_request(
                     "country": venture_country,
                     "notes": error_message,
                     "deal_id": deal_id,
+                    "deal_name": deal_name,
                     "original_filename": document_url,
                 },
             )

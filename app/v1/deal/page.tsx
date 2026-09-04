@@ -27,6 +27,8 @@ import {
   getReconciliation,
   downloadReport,
   getLatestAnalysis,
+  listPendingParserRequests,
+  enrichParserRequest,
 } from '@/lib/v1-api';
 import type { DealListItem } from '@/lib/v1-api';
 import { useDealsListQuery, useDealDetailQuery, useDealDocumentsQuery, dealDocumentsKey, dealDetailKey, dealsListKey } from '@/lib/queries/deals';
@@ -494,6 +496,55 @@ function V1DealPageInner() {
     };
   }, [deal?.id, statementQueueHasProcessing]);
 
+  // PAR-242: unlike the polling effect above (which only runs while this
+  // browser session is actively watching an in-flight upload), Musa's
+  // ingestion runs asynchronously with no live session to notice — PAR-62's
+  // pipeline already writes a parser_requests row and fires an internal
+  // notification the moment it detects an unrecognized format, but until
+  // now there was no signal in the app itself, only the 24h SLA sweep
+  // silently retrying in the background. Check once whenever a user opens
+  // this deal, and reuse the same UnknownParserModal prompt already built
+  // for direct-upload failures instead of building a second UI for this.
+  const checkedMusaRequests = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!deal?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { parser_requests } = await listPendingParserRequests(deal.id);
+        if (cancelled || parser_requests.length === 0) return;
+        const first = parser_requests.find((r) => !checkedMusaRequests.current.has(r.id));
+        if (!first) return;
+        checkedMusaRequests.current.add(first.id);
+        // Don't steal focus from an already-open direct-upload prompt.
+        setUnknownParserDoc((prev) =>
+          prev
+            ? prev
+            : {
+                docId: first.id,
+                // PAR-62 never stores a friendly filename on this row, only
+                // the original (signed, not human-readable) download URL —
+                // shown as-is rather than guessed at.
+                fileName: first.document_url || 'A document submitted via Musa',
+                errorMessage: first.error_message || 'Bank format not recognised',
+                source: 'musa',
+              }
+        );
+        // bank_name is only ever set here if a prior session already
+        // confirmed it via this same flow (PATCH below) -- pre-fill when
+        // known, leave blank (never guessed) otherwise.
+        if (first.bank_name) {
+          setParserRequestForm((p) => (p.bankName ? p : { ...p, bankName: first.bank_name as string }));
+        }
+      } catch {
+        // best-effort — this must never block the rest of the deal page
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deal?.id]);
+
   const runAnalysis = async () => {
     setErrorMsg('');
     try {
@@ -760,40 +811,54 @@ function V1DealPageInner() {
     if (!unknownParserDoc || !parserRequestForm.bankName.trim()) return;
     setParserRequestSubmitting(true);
     try {
-      // 1. Persist to Supabase (existing behaviour)
-      const sbClient = supabase;
-      if (sbClient) {
-        await (sbClient as any).from('pds_parser_requests').insert({
-          deal_id: deal?.id ?? null,
-          document_id: unknownParserDoc.docId,
-          original_filename: unknownParserDoc.fileName,
-          bank_name: parserRequestForm.bankName.trim(),
-          country: parserRequestForm.country,
-          account_type: parserRequestForm.accountType,
-          notes: parserRequestForm.notes.trim() || null,
-          error_type: 'InvalidSchemaError',
-          error_message: unknownParserDoc.errorMessage,
-        });
-      }
+      if (unknownParserDoc.source === 'musa') {
+        // PAR-62 already auto-inserted this row into parser_requests the
+        // moment Musa's ingestion detected the unrecognized format — enrich
+        // it in place (bank name confirmed by the deal's user) rather than
+        // inserting a second row for the same failure.
+        if (deal?.id) {
+          await enrichParserRequest(deal.id, unknownParserDoc.docId, {
+            bank_name: parserRequestForm.bankName.trim(),
+            notes: parserRequestForm.notes.trim() || undefined,
+          }).catch(() => {/* best-effort — still show confirmation below */});
+        }
+      } else {
+        // Direct-upload path (existing behaviour): fresh pds_parser_requests row.
+        const sbClient = supabase;
+        if (sbClient) {
+          await (sbClient as any).from('pds_parser_requests').insert({
+            deal_id: deal?.id ?? null,
+            document_id: unknownParserDoc.docId,
+            original_filename: unknownParserDoc.fileName,
+            bank_name: parserRequestForm.bankName.trim(),
+            country: parserRequestForm.country,
+            account_type: parserRequestForm.accountType,
+            notes: parserRequestForm.notes.trim() || null,
+            error_type: 'InvalidSchemaError',
+            error_message: unknownParserDoc.errorMessage,
+          });
+        }
 
-      // 2. Send email notification (best-effort — don't block on failure)
-      fetch('/api/request-parser', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bank_name: parserRequestForm.bankName.trim(),
-          country: parserRequestForm.country,
-          account_type: parserRequestForm.accountType,
-          notes: parserRequestForm.notes.trim() || '',
-          deal_id: deal?.id ?? '',
-          document_id: unknownParserDoc.docId,
-          original_filename: unknownParserDoc.fileName,
-        }),
-      }).catch(() => {/* silently ignore email errors */});
+        // Email notification only for the direct path — Musa's row already
+        // fired its own notification at detection time (musa_file_processor.py).
+        fetch('/api/request-parser', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bank_name: parserRequestForm.bankName.trim(),
+            country: parserRequestForm.country,
+            account_type: parserRequestForm.accountType,
+            notes: parserRequestForm.notes.trim() || '',
+            deal_id: deal?.id ?? '',
+            document_id: unknownParserDoc.docId,
+            original_filename: unknownParserDoc.fileName,
+          }),
+        }).catch(() => {/* silently ignore email errors */});
+      }
 
       setParserRequestSubmitted(true);
     } catch {
-      setParserRequestSubmitted(true); // still show confirmation even if insert fails
+      setParserRequestSubmitted(true); // still show confirmation even if insert/enrich fails
     } finally {
       setParserRequestSubmitting(false);
     }

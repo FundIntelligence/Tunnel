@@ -264,7 +264,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         AnalysisRunsRepo, SnapshotsRepo,
         EnrichmentsRepo, ClassificationOverridesRepo, CustomFlagsRepo,
         AccountCoverageRepo, OverrideLogRepo, IntelligenceLogRepo,
-        ExportPersistenceRepo,
+        ExportPersistenceRepo, ParserRequestsRepo,
     )
     return {
         "deals": DealsRepo(),
@@ -283,6 +283,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         "cls_overrides": ClassificationOverridesRepo(),
         "custom_flags": CustomFlagsRepo(),
         "account_coverage": AccountCoverageRepo(),
+        "parser_requests": ParserRequestsRepo(),
     }
 
 
@@ -687,6 +688,77 @@ def list_documents(request: Request, deal_id: str):
         _error("NOT_FOUND", f"Deal {deal_id} not found")
     docs = repos["documents"].list_by_deal(deal_id)
     return {"documents": [_document_row_for_list_response(d) for d in docs]}
+
+
+@router.get("/deals/{deal_id}/parser-requests")
+def list_parser_requests_for_deal(request: Request, deal_id: str):
+    """
+    PAR-242: surfaces parser_requests rows PAR-62's Musa ingestion path
+    already writes on unrecognized-format detection (previously invisible
+    to the deal's own user until the 24h SLA sweep force-closed it) so the
+    web app can show the same inline "Request parser" prompt it already
+    shows for direct-upload failures (UnknownParserModal), instead of
+    silence for up to 24h.
+
+    Only 'pending' rows -- 'in_progress'/'done' rows are being handled or
+    resolved and don't need a fresh prompt.
+    """
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    rows = repos["parser_requests"].list_pending_for_deal(deal_id, partner="musa")
+    return {
+        "parser_requests": [
+            {
+                "id": r.get("id"),
+                "bank_name": r.get("bank_name"),
+                "market": r.get("market"),
+                "error_message": r.get("error_message"),
+                "document_url": r.get("document_url"),
+                "status": r.get("status"),
+                "requested_at": r.get("requested_at"),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.patch("/deals/{deal_id}/parser-requests/{request_id}")
+def enrich_parser_request(request: Request, deal_id: str, request_id: str, body: dict = Body(...)):
+    """
+    PAR-242: lets the deal's own user confirm/add details (bank name,
+    notes) on a parser_requests row PAR-62's Musa path already auto-created
+    -- an in-place update, never a second insert for the same detected
+    failure (reuses PAR-62's persistence per the ticket's explicit
+    instruction, rather than rebuilding it). Moves status pending ->
+    in_progress to signal a human has acknowledged and enriched it, distinct
+    from the engineering-side pending -> in_progress -> done cycle in the
+    admin dashboard.
+    """
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    existing = repos["parser_requests"].get(request_id)
+    if not existing or existing.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"Parser request {request_id} not found for deal {deal_id}")
+
+    fields: Dict[str, Any] = {}
+    bank_name = body.get("bank_name")
+    if isinstance(bank_name, str) and bank_name.strip():
+        fields["bank_name"] = bank_name.strip()
+    notes = body.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        # error_message is PAR-62's own detection reason; append rather than
+        # overwrite so the original diagnostic isn't lost.
+        fields["error_message"] = f"{existing.get('error_message') or ''}\n\nUser notes: {notes.strip()}".strip()
+    if existing.get("status") == "pending":
+        fields["status"] = "in_progress"
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    updated = repos["parser_requests"].enrich(request_id, deal_id, fields)
+    return {"parser_request": updated or {**existing, **fields}}
 
 
 @router.delete("/deals/{deal_id}/documents/{document_id}")
