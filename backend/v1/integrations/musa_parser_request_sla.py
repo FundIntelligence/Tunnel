@@ -17,6 +17,7 @@ Runs hourly, started as a background asyncio task from main.py's lifespan
 """
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -274,13 +275,14 @@ class ParserRequestSlaSweeper:
 parser_request_sla_sweeper = ParserRequestSlaSweeper()
 
 
+
 # ---------------------------------------------------------------------------
 # Raw-document retention cleanup (PAR-248)
 # Decoupled from the 24h SLA force-close path so both policies can evolve
-# independently. Default: 4 days, configurable via PARSER_REQUEST_RETENTION_DAYS.
+# independently. Default: 10 days, configurable via PARSER_REQUEST_RETENTION_DAYS.
 # ---------------------------------------------------------------------------
 
-_RETENTION_DAYS = int(os.getenv("PARSER_REQUEST_RETENTION_DAYS", "4"))
+_RETENTION_DAYS = int(os.getenv("PARSER_REQUEST_RETENTION_DAYS", "10"))
 
 
 def _cleanup_expired_raw_documents(supabase) -> int:
