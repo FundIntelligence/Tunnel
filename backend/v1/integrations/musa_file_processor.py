@@ -684,9 +684,8 @@ async def process_musa_session(
                             deal_id=deal_id,
                             venture_country=venture_country,
                             document_url=url,
-                            file_bytes=file_bytes,
-                            file_name=file_name,
                             error_message=doc_error_message,
+                            storage_path=raw_storage_path,
                         )
                     elif other_failure is None:
                         other_failure = RuntimeError(doc_error_message)
