@@ -230,17 +230,17 @@ async def _send_webhook(
         logger.error("[MUSA] Webhook exception session=%s: %s", session_id, exc)
 
 
-def _persist_failed_sample(
+def _persist_raw_document(
     session_id: str,
     file_bytes: Optional[bytes],
     file_name: Optional[str],
 ) -> Optional[str]:
     """
-    Upload the sample file behind a failed/unparseable Musa document to the
-    `parser-requests` Storage bucket (PAR-34) so it survives past the
-    lifetime of the signed URL it was originally downloaded from. Mirrors
-    the upload done in app/api/request-parser/route.ts for the human-
-    submitted (pds_parser_requests) path.
+    Upload a raw Musa document to the `parser-requests` Storage bucket
+    (PAR-34 / PAR-248) immediately after download, before any parse attempt.
+    This ensures the file survives past the signed-URL expiry regardless of
+    whether ingestion succeeds or fails, and gives the SLA sweep (PAR-62) a
+    reliable file to retry against.
 
     Best-effort: a Storage hiccup must not affect musa_sessions state or
     the webhook Musa depends on, so failures are logged and swallowed.
@@ -258,7 +258,7 @@ def _persist_failed_sample(
         return object_path
     except Exception:
         logger.exception(
-            "[MUSA] Failed to persist sample file to storage session=%s", session_id
+            "[MUSA] Failed to persist raw document to storage session=%s", session_id
         )
         return None
 
@@ -268,19 +268,20 @@ async def _record_unrecognized_document(
     deal_id: str,
     venture_country: str,
     document_url: Optional[str],
-    file_bytes: Optional[bytes],
-    file_name: Optional[str],
-    exc: Exception,
+    error_message: str,
+    storage_path: Optional[str] = None,
 ) -> None:
     """
-    Record one document's unrecognized-format failure: persist its sample
-    to Storage (PAR-34), log a parser_requests row deferred to the 24h SLA
-    sweep (PAR-62), and notify engineers. Called once per failing document
-    within a batch — PAR-61: a batch can contain several unrecognized
-    files alongside recognizable ones, each tracked and retried
-    independently rather than one bad file failing the whole batch.
+    Record one document's unrecognized-format failure: log a parser_requests
+    row deferred to the 24h SLA sweep (PAR-62) and notify engineers. The
+    raw file must already be persisted via _persist_raw_document() before
+    this is called — storage_path is passed in, not re-computed here.
+
+    Called once per failing document within a batch — PAR-61: a batch can
+    contain several unrecognized files alongside recognizable ones, each
+    tracked and retried independently rather than one bad file failing the
+    whole batch.
     """
-    storage_path = _persist_failed_sample(session_id, file_bytes, file_name)
     try:
         get_supabase().table("parser_requests").insert({
             "partner": "musa",
@@ -288,7 +289,7 @@ async def _record_unrecognized_document(
             "document_url": document_url,
             "session_id": str(session_id),
             "deal_id": deal_id,
-            "error_message": str(exc),
+            "error_message": error_message,
             "status": "pending",
             "storage_path": storage_path,
         }).execute()
@@ -303,7 +304,7 @@ async def _record_unrecognized_document(
         deal_id=deal_id,
         venture_country=venture_country,
         document_url=document_url,
-        error_message=str(exc),
+        error_message=error_message,
     )
 
 
@@ -414,6 +415,7 @@ async def process_musa_session(
 
             file_bytes: Optional[bytes] = None
             file_name: Optional[str] = None
+            raw_storage_path: Optional[str] = None
             try:
                 file_bytes = await _download_file(url)
 
@@ -422,6 +424,13 @@ async def process_musa_session(
                 original_name = Path(url.split("?")[0]).name
                 file_name = original_name if original_name and len(original_name) > 4 else f"musa_{hint_label}_{i + 1}{ext}"
                 file_type = ext.lstrip(".")
+
+                # PAR-248: persist the raw file to our own storage immediately
+                # after download, before attempting to parse. This guarantees
+                # storage_path is populated on any parser_requests row we
+                # create, even if parsing fails — the SLA retry sweep (PAR-62)
+                # depends on storage_path to re-download and retry the file.
+                raw_storage_path = _persist_raw_document(session_id, file_bytes, file_name)
 
                 # Create pds_documents row before calling process_document_background
                 document_id = str(uuid.uuid4())
@@ -468,9 +477,8 @@ async def process_musa_session(
                         deal_id=deal_id,
                         venture_country=venture_country,
                         document_url=url,
-                        file_bytes=file_bytes,
-                        file_name=file_name,
-                        exc=doc_exc,
+                        error_message=str(doc_exc),
+                        storage_path=raw_storage_path,
                     )
                 elif other_failure is None:
                     other_failure = doc_exc
