@@ -122,7 +122,7 @@ def _attempt_retry(supabase, row: Dict[str, Any]) -> bool:
         )
         _run_export(deal_id, _SERVICE_UUID)
     except Exception as exc:
-        logger.info(
+        logger.error(
             "[MUSA-SLA] Retry still failing request=%s deal=%s: %s",
             row.get("id"), deal_id, exc,
         )
