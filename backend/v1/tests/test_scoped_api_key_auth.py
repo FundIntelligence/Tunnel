@@ -55,10 +55,17 @@ class TestValidateScopedApiKey:
 
 
 class TestRequireScopedApiKey:
+    """Generic dependency-factory mechanism -- deliberately NOT key_type
+    "sandbox-classify" here (PAR-245 added sandbox-classify-specific call-cap
+    enforcement inside require_scoped_api_key's dependency; that behavior has
+    its own dedicated coverage in test_par245_sandbox_call_cap.py). Using a
+    different key_type keeps this class testing the shared 401/200 gate
+    mechanism in isolation, unaffected by that key_type-specific branch."""
+
     @pytest.fixture
     def client(self, monkeypatch):
         app = FastAPI()
-        gate = auth.require_scoped_api_key("sandbox-classify")
+        gate = auth.require_scoped_api_key("generic-scope")
 
         @app.get("/sandbox/ping")
         def _ping(_: bool = Depends(gate)):

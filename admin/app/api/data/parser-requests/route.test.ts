@@ -63,14 +63,48 @@ describe('GET /api/data/parser-requests', () => {
 
     expect(fromMock).toHaveBeenCalledWith('parser_requests')
     expect(fromMock).toHaveBeenCalledWith('pds_parser_requests')
+    // Neither fixture row has a deal_id -> no pds_deals lookup needed,
+    // deal_name resolves to null rather than a guessed value.
+    expect(fromMock).not.toHaveBeenCalledWith('pds_deals')
     // PAR-145: no storage_path -> signed_url: null, never a stale stored URL
-    expect(body.auto).toEqual([{ ...autoRows[0], signed_url: null }])
+    expect(body.auto).toEqual([{ ...autoRows[0], signed_url: null, deal_name: null }])
     // storage_path present -> signed fresh on this request, not read from a column
     expect(createSignedUrlMock).toHaveBeenCalledWith('m1/stanbic.pdf', 36000)
     expect(body.manual).toEqual([{
       ...manualRows[0],
       signed_url: 'https://staging.supabase.co/storage/v1/object/sign/parser-requests/m1/stanbic.pdf?token=fresh',
+      deal_name: null,
     }])
+  })
+
+  it('resolves deal_id -> company_name via a batched pds_deals lookup (PAR-242)', async () => {
+    const dealRow = { id: 'd1', partner: 'musa', bank_name: 'Equity', deal_id: 'deal-1', status: 'pending', requested_at: '2026-09-01T00:00:00Z', storage_path: null }
+    fromMock.mockImplementationOnce(() => ({
+      select: vi.fn().mockReturnThis(),
+      order: vi.fn().mockResolvedValue({ data: [dealRow], error: null }),
+      update: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockResolvedValue({ error: null }),
+    }))
+    fromMock.mockImplementationOnce(() => ({
+      select: vi.fn().mockReturnThis(),
+      order: vi.fn().mockResolvedValue({ data: [], error: null }),
+      update: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockResolvedValue({ error: null }),
+    }))
+    fromMock.mockImplementationOnce(() => ({
+      select: vi.fn().mockReturnThis(),
+      in: vi.fn().mockResolvedValue({ data: [{ id: 'deal-1', company_name: 'Buildex Interiors', name: null }], error: null }),
+      order: vi.fn().mockReturnThis(),
+      update: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+    }))
+
+    const { GET } = await import('./route')
+    const res = await GET()
+    const body = await res.json()
+
+    expect(fromMock).toHaveBeenCalledWith('pds_deals')
+    expect(body.auto[0].deal_name).toBe('Buildex Interiors')
   })
 
   it('sets the x-data-environment header to prod (PAR-181)', async () => {

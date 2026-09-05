@@ -875,3 +875,38 @@ class AccountCoverageRepo(BaseRepo):
 
     def list_by_deal(self, deal_id: str) -> List[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
+
+
+class ParserRequestsRepo(BaseRepo):
+    """`parser_requests` -- the auto/Musa table PAR-62 already writes to on
+    unrecognized-format detection (backend.v1.integrations.musa_file_processor).
+    PAR-242 reuses this table/persistence as-is rather than rebuilding it;
+    this repo only adds deal-scoped reads and an enrichment update so a
+    pending row can be surfaced and annotated (e.g. bank name confirmed by
+    a human) without a duplicate insert."""
+
+    def __init__(self):
+        super().__init__("parser_requests")
+
+    def list_pending_for_deal(self, deal_id: str, partner: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self.select_eq2("deal_id", deal_id, "status", "pending", order_by="requested_at")
+        if partner:
+            rows = [r for r in rows if r.get("partner") == partner]
+        return rows
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.select_eq("id", request_id)
+        return rows[0] if rows else None
+
+    def enrich(self, request_id: str, deal_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing pending row in place (e.g. bank_name confirmed
+        by the deal's user) -- never inserts a second row for the same
+        detected failure."""
+        res = (
+            self.client.table(self.table)
+            .update(fields)
+            .eq("id", request_id)
+            .eq("deal_id", deal_id)
+            .execute()
+        )
+        return res.data[0] if res.data else {}

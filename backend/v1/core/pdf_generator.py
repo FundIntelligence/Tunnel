@@ -640,8 +640,8 @@ def generate_pdf(
     rec_sum   = canonical.get("reconciliation_summary", {})
     snap      = snapshot_meta or {}
 
-    top_suppliers = [r for r in entity_breakdown if r["role"] in _SUPPLIER_ROLES][:5]
-    top_revenue   = [r for r in entity_breakdown if r["role"] in _REVENUE_ROLES][:5]
+    top_suppliers = [r for r in entity_breakdown if r["role"] in _SUPPLIER_ROLES][:10]
+    top_revenue   = [r for r in entity_breakdown if r["role"] in _REVENUE_ROLES][:10]
     review_ents   = [r for r in entity_breakdown if r["role"] in _REVIEW_ROLES]
 
     total_outflow  = sum(m["outflow_cents"] for m in monthly_cashflow)
@@ -779,12 +779,16 @@ def generate_pdf(
         for i, r in enumerate(top_suppliers, 1):
             label = _trunc(r["entity_name"], 30)
             story.append(_body_line(f"  {i}. {label:<32} {r['pct_of_total']:.1f}%"))
+    else:
+        story.append(_body_line("Top suppliers: No concentration data available."))
+    story.append(Spacer(1, 4))
     if top_revenue:
-        story.append(Spacer(1, 4))
-        story.append(_body_line("Top revenue entities:"))
+        story.append(_body_line("Top customers:"))
         for i, r in enumerate(top_revenue, 1):
             label = _trunc(r["entity_name"], 30)
             story.append(_body_line(f"  {i}. {label:<32} {_fmt_cents(r['total_abs_cents'], currency)}"))
+    else:
+        story.append(_body_line("Top customers: No concentration data available."))
     payroll_pct = (payroll_total / total_outflow * 100) if total_outflow > 0 else 0.0
     story.append(Spacer(1, 4))
     story.append(_body_line(f"Payroll % of total outflow:     {payroll_pct:.1f}%"))

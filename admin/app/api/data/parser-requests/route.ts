@@ -43,7 +43,35 @@ export async function GET() {
     signParserRequestPaths(supabase, manualResult.data ?? []),
   ])
 
-  return NextResponse.json({ auto, manual }, { headers: envHeaders(SUPABASE_ENV) })
+  // PAR-242: "which deal/org requested it" — both tables only carry deal_id,
+  // not a name, so the list previously showed an opaque UUID at best (manual
+  // rows) or nothing (auto rows have no deal-name field at all). Resolve
+  // deal_id -> company_name/name in one batched query rather than persisting
+  // a duplicate copy of the name on either source table.
+  const dealIds = Array.from(
+    new Set(
+      [...auto, ...manual]
+        .map((r) => (r as { deal_id?: string | null }).deal_id)
+        .filter((id): id is string => Boolean(id))
+    )
+  )
+  let dealNameById: Record<string, string> = {}
+  if (dealIds.length > 0) {
+    const { data: deals } = await supabase
+      .from('pds_deals')
+      .select('id, company_name, name')
+      .in('id', dealIds)
+    dealNameById = Object.fromEntries(
+      (deals ?? []).map((d) => [d.id, d.company_name || d.name || null])
+    )
+  }
+  const withDealName = <T extends { deal_id?: string | null }>(rows: T[]) =>
+    rows.map((r) => ({ ...r, deal_name: r.deal_id ? dealNameById[r.deal_id] ?? null : null }))
+
+  return NextResponse.json(
+    { auto: withDealName(auto), manual: withDealName(manual) },
+    { headers: envHeaders(SUPABASE_ENV) }
+  )
 }
 
 export async function PATCH(request: NextRequest) {

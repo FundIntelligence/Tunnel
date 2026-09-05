@@ -365,6 +365,39 @@ class MemoryExportPersistenceRepo:
             raise
 
 
+class MemoryParserRequestsRepo:
+    """In-memory fake for `parser_requests` (PAR-62/PAR-242) -- mirrors
+    ParserRequestsRepo's read/enrich surface without a real Supabase client."""
+
+    def __init__(self):
+        self._store: List[Dict[str, Any]] = []
+
+    def list_pending_for_deal(self, deal_id: str, partner: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = [r for r in self._store if r.get("deal_id") == deal_id and r.get("status") == "pending"]
+        if partner:
+            rows = [r for r in rows if r.get("partner") == partner]
+        return [copy.deepcopy(r) for r in sorted(rows, key=lambda r: r.get("requested_at") or "")]
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        for r in self._store:
+            if r["id"] == request_id:
+                return copy.deepcopy(r)
+        return None
+
+    def enrich(self, request_id: str, deal_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        for r in self._store:
+            if r["id"] == request_id and r.get("deal_id") == deal_id:
+                r.update(fields)
+                return copy.deepcopy(r)
+        return {}
+
+    # Test-only helper -- not part of ParserRequestsRepo's real interface.
+    def seed(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row = {"status": "pending", **row}
+        self._store.append(row)
+        return copy.deepcopy(row)
+
+
 def build_memory_repos() -> Dict[str, Any]:
     runs = MemoryAnalysisRunsRepo()
     links = MemoryTransferLinksRepo()
@@ -382,4 +415,5 @@ def build_memory_repos() -> Dict[str, Any]:
         "runs": runs,
         "snapshots": MemorySnapshotsRepo(),
         "export_persistence": MemoryExportPersistenceRepo(runs, links, entities, txn_map),
+        "parser_requests": MemoryParserRequestsRepo(),
     }

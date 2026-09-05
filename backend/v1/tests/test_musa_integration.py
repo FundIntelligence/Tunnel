@@ -592,6 +592,70 @@ class TestParserRequestStoragePersistence:
 
         assert inserted_rows.get("storage_path") == object_path
 
+    def test_raw_document_persisted_before_parse_attempt(self, monkeypatch):
+        """
+        PAR-248: storage upload must happen BEFORE process_document_background
+        is called — not after. This ensures storage_path is always populated
+        on any parser_requests row, even when the parse raises immediately.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, call
+        from v1.integrations.musa_file_processor import process_musa_session
+
+        call_order = []
+
+        async def _fake_download(url, timeout=300):
+            return b"bytes"
+
+        def _fake_upload(path, content, options=None):
+            call_order.append("upload")
+            return MagicMock()
+
+        def _raise_unsupported(*args, **kwargs):
+            call_order.append("parse")
+            raise ValueError("Unsupported bank format — no recognisable transactions")
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.insert.return_value.execute.return_value = MagicMock()
+        mock_supabase.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock()
+        mock_supabase.storage.from_.return_value.upload.side_effect = _fake_upload
+
+        with patch(
+            "v1.integrations.musa_file_processor.get_supabase",
+            return_value=mock_supabase,
+        ), patch(
+            "v1.db.supabase_repositories.get_supabase",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._download_file",
+            AsyncMock(side_effect=_fake_download),
+        ), patch(
+            "v1.integrations.musa_file_processor.DocumentsRepo",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor.IngestionService.process_document_background",
+            side_effect=_raise_unsupported,
+        ), patch(
+            "v1.integrations.musa_file_processor._send_webhook",
+            AsyncMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._notify_parser_request",
+            AsyncMock(),
+        ):
+            asyncio.run(process_musa_session(
+                session_id="test-sid-order",
+                deal_id=str(uuid.uuid4()),
+                venture_name="Acme",
+                venture_country="Kenya",
+                documents=[{"url": "https://example.com/signed/doc.pdf"}],
+                status_url="https://parity.io/status",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        assert call_order == ["upload", "parse"], (
+            f"Expected upload before parse, got order: {call_order}"
+        )
+
     def test_unsupported_format_defers_webhook_to_sla_sweep(self, monkeypatch):
         """
         PAR-62: an unrecognized-format failure must NOT fire the failure
@@ -1493,6 +1557,137 @@ class TestShapeParity:
             f"Shape mismatch — POST has {post_keys - get_keys} extra, "
             f"GET has {get_keys - post_keys} extra"
         )
+
+
+# ===========================================================================
+# 6e. Raw-document retention cleanup (PAR-248)
+# ===========================================================================
+
+class TestParserRequestRetentionCleanup:
+    def _row(self, status, requested_at, storage_path="musa/sid/file.pdf"):
+        return {
+            "id": str(uuid.uuid4()),
+            "partner": "musa",
+            "status": status,
+            "storage_path": storage_path,
+            "requested_at": requested_at,
+        }
+
+    def test_deletes_storage_for_expired_rows_past_retention_window(self):
+        """
+        _cleanup_expired_raw_documents must delete the storage file and clear
+        storage_path for expired/resolved rows older than the retention window.
+        """
+        from v1.integrations.musa_parser_request_sla import _cleanup_expired_raw_documents
+
+        old_expired = self._row(
+            status="expired",
+            requested_at=(datetime.now(timezone.utc) - timedelta(days=5)).isoformat(),
+            storage_path="musa/old-sid/old.pdf",
+        )
+        old_resolved = self._row(
+            status="resolved",
+            requested_at=(datetime.now(timezone.utc) - timedelta(days=6)).isoformat(),
+            storage_path="musa/old-sid2/old2.pdf",
+        )
+        recent = self._row(
+            status="expired",
+            requested_at=(datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(),
+            storage_path="musa/recent-sid/recent.pdf",
+        )
+
+        deleted_files = []
+
+        def _fake_remove(paths):
+            deleted_files.extend(paths)
+            return MagicMock()
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.select.return_value.in_.return_value.lt.return_value.execute.return_value = MagicMock(
+            data=[old_expired, old_resolved, recent]
+        )
+        mock_supabase.storage.from_.return_value.remove.side_effect = _fake_remove
+        mock_supabase.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock()
+
+        with patch(
+            "v1.integrations.musa_parser_request_sla._RETENTION_DAYS",
+            4,
+        ):
+            count = _cleanup_expired_raw_documents(mock_supabase)
+
+        assert count == 2, f"Expected 2 deletions, got {count}"
+        assert "musa/old-sid/old.pdf" in deleted_files
+        assert "musa/old-sid2/old2.pdf" in deleted_files
+        assert "musa/recent-sid/recent.pdf" not in deleted_files
+
+    def test_pending_rows_never_deleted_by_retention_cleanup(self):
+        """
+        Rows with status="pending" must not be touched by the retention cleanup
+        — they are still within the SLA window and the file may still be needed
+        for an in-window retry.
+        """
+        from v1.integrations.musa_parser_request_sla import _cleanup_expired_raw_documents
+
+        # Query returns no rows (status filter for expired/resolved applied in SQL)
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.select.return_value.in_.return_value.lt.return_value.execute.return_value = MagicMock(
+            data=[]
+        )
+
+        count = _cleanup_expired_raw_documents(mock_supabase)
+
+        assert count == 0
+        mock_supabase.storage.from_.return_value.remove.assert_not_called()
+
+    def test_force_close_does_not_delete_storage_file(self):
+        """
+        _force_close_expired (the SLA sweep's 24h force-close path) must NOT
+        delete the storage file. Retention cleanup runs separately on its own
+        schedule (PARSER_REQUEST_RETENTION_DAYS, default 4 days), so the file
+        must still be present immediately after force-close for potential
+        out-of-band recovery.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations import musa_parser_request_sla as sla
+
+        expired_row = {
+            "id": str(uuid.uuid4()),
+            "partner": "musa",
+            "status": "expired",
+            "storage_path": "musa/sid/file.pdf",
+            "requested_at": (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+            "session_id": "sid-force-close",
+            "deal_id": str(uuid.uuid4()),
+        }
+        session_row = {
+            "session_id": "sid-force-close",
+            "venture_name": "Acme",
+            "venture_country": "Kenya",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        def _fake_table(name):
+            tbl = MagicMock()
+            if name == "musa_sessions":
+                tbl.select.return_value.eq.return_value.execute.return_value = MagicMock(
+                    data=[session_row]
+                )
+                tbl.update.return_value.eq.return_value.execute.return_value = MagicMock()
+            else:
+                tbl.update.return_value.eq.return_value.execute.return_value = MagicMock()
+            return tbl
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.side_effect = _fake_table
+
+        with patch(
+            "v1.integrations.musa_parser_request_sla._send_webhook",
+            AsyncMock(),
+        ):
+            asyncio.run(sla._force_close_expired(mock_supabase, expired_row))
+
+        mock_supabase.storage.from_.return_value.remove.assert_not_called()
 
 
 # ===========================================================================

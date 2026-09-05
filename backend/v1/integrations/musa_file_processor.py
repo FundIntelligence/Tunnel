@@ -377,17 +377,17 @@ async def resend_webhook_for_session(session_id: str, base_url: Optional[str] = 
     }
 
 
-def _persist_failed_sample(
+def _persist_raw_document(
     session_id: str,
     file_bytes: Optional[bytes],
     file_name: Optional[str],
 ) -> Optional[str]:
     """
-    Upload the sample file behind a failed/unparseable Musa document to the
-    `parser-requests` Storage bucket (PAR-34) so it survives past the
-    lifetime of the signed URL it was originally downloaded from. Mirrors
-    the upload done in app/api/request-parser/route.ts for the human-
-    submitted (pds_parser_requests) path.
+    Upload a raw Musa document to the `parser-requests` Storage bucket
+    (PAR-34 / PAR-248) immediately after download, before any parse attempt.
+    This ensures the file survives past the signed-URL expiry regardless of
+    whether ingestion succeeds or fails, and gives the SLA sweep (PAR-62) a
+    reliable file to retry against.
 
     Best-effort: a Storage hiccup must not affect musa_sessions state or
     the webhook Musa depends on, so failures are logged and swallowed.
@@ -405,7 +405,7 @@ def _persist_failed_sample(
         return object_path
     except Exception:
         logger.exception(
-            "[MUSA] Failed to persist sample file to storage session=%s", session_id
+            "[MUSA] Failed to persist raw document to storage session=%s", session_id
         )
         return None
 
@@ -415,24 +415,20 @@ async def _record_unrecognized_document(
     deal_id: str,
     venture_country: str,
     document_url: Optional[str],
-    file_bytes: Optional[bytes],
-    file_name: Optional[str],
     error_message: str,
+    storage_path: Optional[str] = None,
 ) -> None:
     """
-    Record one document's unrecognized-format failure: persist its sample
-    to Storage (PAR-34), log a parser_requests row deferred to the 24h SLA
-    sweep (PAR-62), and notify engineers. Called once per failing document
-    within a batch — PAR-61: a batch can contain several unrecognized
-    files alongside recognizable ones, each tracked and retried
-    independently rather than one bad file failing the whole batch.
+    Record one document's unrecognized-format failure: log a parser_requests
+    row deferred to the 24h SLA sweep (PAR-62) and notify engineers. The
+    raw file must already be persisted via _persist_raw_document() before
+    this is called — storage_path is passed in, not re-computed here.
 
-    Takes the failure reason as a plain string rather than an Exception
-    (PAR-200): process_document_background never raises on a genuine parse
-    failure, so its caller has a real error_message string from the
-    document's own row, not a caught exception object, in the common case.
+    Called once per failing document within a batch — PAR-61: a batch can
+    contain several unrecognized files alongside recognizable ones, each
+    tracked and retried independently rather than one bad file failing the
+    whole batch.
     """
-    storage_path = _persist_failed_sample(session_id, file_bytes, file_name)
     try:
         get_supabase().table("parser_requests").insert({
             "partner": "musa",
@@ -450,9 +446,30 @@ async def _record_unrecognized_document(
         logger.exception(
             "[MUSA] Failed to insert parser_requests row session=%s", session_id
         )
+
+    # PAR-242: pre-fill what's already resolvable at this exact point in the
+    # flow (the deal record) rather than asking anyone to retype it. Only the
+    # deal's own name/company_name is available here — no separate org/account
+    # table with a registration or contact email exists for a Musa-originated
+    # deal at this point (the deal's `created_by`/`user_id` links to `profiles`,
+    # but Musa-created deals frequently have no signed-in Parity user attached,
+    # so that lookup would silently return nothing for the common case; not
+    # guessed at). Best-effort: a lookup failure must not block the existing
+    # parser_requests insert/notify above.
+    deal_name: Optional[str] = None
+    try:
+        deal = DealsRepo().get_deal(deal_id)
+        if deal:
+            deal_name = deal.get("company_name") or deal.get("name")
+    except Exception:
+        logger.exception(
+            "[MUSA] Failed to look up deal for parser-request pre-fill deal_id=%s", deal_id
+        )
+
     await _notify_parser_request(
         session_id=session_id,
         deal_id=deal_id,
+        deal_name=deal_name,
         venture_country=venture_country,
         document_url=document_url,
         error_message=error_message,
@@ -465,6 +482,7 @@ async def _notify_parser_request(
     venture_country: str,
     document_url: Optional[str],
     error_message: str,
+    deal_name: Optional[str] = None,
 ) -> None:
     """
     Email the team that a Musa file failed with an unsupported/unparseable
@@ -473,6 +491,11 @@ async def _notify_parser_request(
     its own). Tags the request partner="musa" so the route skips its
     pds_parser_requests insert (this path already wrote to parser_requests
     directly, just above) and the email is the only thing left to do here.
+
+    deal_name (PAR-242): whatever was resolvable from the deal record at the
+    detection point (see caller) — passed through so the notification names
+    the actual deal, not just its opaque UUID. None when not resolvable;
+    the frontend/email template renders that as "—", not a guess.
 
     Best-effort only: this must never affect musa_sessions state or the
     webhook Musa actually depends on.
@@ -489,6 +512,7 @@ async def _notify_parser_request(
                     "country": venture_country,
                     "notes": error_message,
                     "deal_id": deal_id,
+                    "deal_name": deal_name,
                     "original_filename": document_url,
                 },
             )
@@ -571,6 +595,7 @@ async def process_musa_session(
 
             file_bytes: Optional[bytes] = None
             file_name: Optional[str] = None
+            raw_storage_path: Optional[str] = None
             try:
                 file_bytes = await _download_file(url)
 
@@ -579,6 +604,13 @@ async def process_musa_session(
                 original_name = Path(url.split("?")[0]).name
                 file_name = original_name if original_name and len(original_name) > 4 else f"musa_{hint_label}_{i + 1}{ext}"
                 file_type = ext.lstrip(".")
+
+                # PAR-248: persist the raw file to our own storage immediately
+                # after download, before attempting to parse. This guarantees
+                # storage_path is populated on any parser_requests row we
+                # create, even if parsing fails — the SLA retry sweep (PAR-62)
+                # depends on storage_path to re-download and retry the file.
+                raw_storage_path = _persist_raw_document(session_id, file_bytes, file_name)
 
                 # Create pds_documents row before calling process_document_background
                 document_id = str(uuid.uuid4())
@@ -685,9 +717,8 @@ async def process_musa_session(
                         deal_id=deal_id,
                         venture_country=venture_country,
                         document_url=url,
-                        file_bytes=file_bytes,
-                        file_name=file_name,
                         error_message=str(doc_exc),
+                        storage_path=raw_storage_path,
                     )
                 elif other_failure is None:
                     other_failure = doc_exc
