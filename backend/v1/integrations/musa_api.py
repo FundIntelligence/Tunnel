@@ -60,6 +60,7 @@ class CreateSessionRequest(BaseModel):
     venture_name: str
     venture_country: str
     document_urls: List[DocumentUpload]
+    deal_id: Optional[str] = None  # PAR-253: if provided, reuse an existing deal instead of minting a new one
 
 
 class SessionResponse(BaseModel):
@@ -174,11 +175,14 @@ async def create_session(
     Create a new Musa session with document URLs for processing.
 
     Flow:
-    1. Create musa_sessions record (status=processing)
-    2. Create pds_deals record
-    3. Link session to deal
-    4. Trigger background file processing
-    5. Return session response immediately
+    1. Resolve or create pds_deals record
+    2. Create musa_sessions record (status=processing)
+    3. Trigger background file processing
+    4. Return session response immediately
+
+    PAR-253: if body.deal_id is provided, the existing deal is reused — no new
+    deal is created. This lets partners retry/resubmit against the same deal
+    without producing a duplicate pds_deals row.
     """
     session_id = str(uuid.uuid4())
 
@@ -188,19 +192,27 @@ async def create_session(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    # 1. Create deal
-    try:
-        deal = DealsRepo().create_deal({
-            "id": str(uuid.uuid4()),
-            "currency": deal_currency,
-            "name": body.venture_name,
-            "created_by": "00000000-0000-0000-0000-000000000001",  # Musa system user
-        })
-    except Exception:
-        logger.exception("Failed to create deal for Musa session %s", session_id)
-        raise HTTPException(status_code=500, detail="Failed to create deal")
-
-    deal_id = deal.get("id")
+    # 1. Resolve or create deal
+    if body.deal_id is not None:
+        existing_deal = DealsRepo().get_deal(body.deal_id)
+        if not existing_deal:
+            raise HTTPException(
+                status_code=404,
+                detail=f"deal_id '{body.deal_id}' not found — cannot reuse a deal that does not exist",
+            )
+        deal_id = body.deal_id
+    else:
+        try:
+            deal = DealsRepo().create_deal({
+                "id": str(uuid.uuid4()),
+                "currency": deal_currency,
+                "name": body.venture_name,
+                "created_by": "00000000-0000-0000-0000-000000000001",  # Musa system user
+            })
+        except Exception:
+            logger.exception("Failed to create deal for Musa session %s", session_id)
+            raise HTTPException(status_code=500, detail="Failed to create deal")
+        deal_id = deal.get("id")
 
     # 2. Create musa_sessions record
     created_at = datetime.now(timezone.utc).isoformat()
