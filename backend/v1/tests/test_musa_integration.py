@@ -257,6 +257,99 @@ class TestCreateSession:
 
 
 # ===========================================================================
+# 4b. PAR-253 — idempotent-by-choice deal reuse in create_session
+# ===========================================================================
+
+class TestCreateSessionDealIdReuse:
+    """
+    PAR-253: create_session can accept an existing deal_id to reuse instead of
+    minting a fresh pds_deals row.
+    """
+
+    def _mock_db_with_existing_deal(self, monkeypatch, session_id: str, deal_id: str):
+        """Patch DB so DealsRepo.get_deal returns the existing deal and no new deal is created."""
+        existing_deal = {"id": deal_id, "name": "Existing Venture", "currency": "KES"}
+        deals_repo_mock = MagicMock()
+        deals_repo_mock.get_deal.return_value = existing_deal
+        # create_deal must NOT be called — if it is, the test will catch it via call_count
+        monkeypatch.setattr("v1.integrations.musa_api.DealsRepo", lambda: deals_repo_mock)
+
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.insert.return_value.execute.return_value = MagicMock(
+            data=[{"session_id": session_id, "created_at": datetime.now(timezone.utc).isoformat()}]
+        )
+        monkeypatch.setattr("v1.integrations.musa_api.get_supabase", lambda: mock_sb)
+        monkeypatch.setattr("v1.integrations.auth.validate_api_key", lambda k, p: True)
+        monkeypatch.setattr("v1.integrations.musa_api.process_musa_session", lambda **kw: None)
+        return deals_repo_mock
+
+    def test_provided_deal_id_is_reused_no_new_deal_created(self, client, monkeypatch):
+        """When deal_id is given and exists, the session links to it — create_deal is NOT called."""
+        sid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+        repo_mock = self._mock_db_with_existing_deal(monkeypatch, sid, did)
+
+        body = {**VALID_SESSION_BODY, "deal_id": did}
+        resp = client.post("/api/musa/sessions", json=body, headers=VALID_HEADERS)
+
+        assert resp.status_code == 200
+        assert repo_mock.create_deal.call_count == 0, "create_deal must not be called when deal_id is reused"
+        assert repo_mock.get_deal.call_count == 1
+        assert repo_mock.get_deal.call_args[0][0] == did
+
+    def test_missing_deal_id_returns_404(self, client, monkeypatch):
+        """When deal_id is provided but doesn't exist, a 404 is returned immediately."""
+        sid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+
+        deals_repo_mock = MagicMock()
+        deals_repo_mock.get_deal.return_value = None  # deal not found
+        monkeypatch.setattr("v1.integrations.musa_api.DealsRepo", lambda: deals_repo_mock)
+        monkeypatch.setattr("v1.integrations.auth.validate_api_key", lambda k, p: True)
+
+        body = {**VALID_SESSION_BODY, "deal_id": did}
+        resp = client.post("/api/musa/sessions", json=body, headers=VALID_HEADERS)
+
+        assert resp.status_code == 404
+        assert did in resp.json()["detail"]
+        assert deals_repo_mock.create_deal.call_count == 0
+
+    def test_no_deal_id_path_is_unchanged(self, client, monkeypatch):
+        """When deal_id is omitted, behavior is byte-for-byte identical to the original path."""
+        sid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+
+        # Use the same mock as the original TestCreateSession tests
+        calls = {"create_deal": 0, "get_deal": 0}
+
+        def fake_create_deal(d):
+            calls["create_deal"] += 1
+            return {**d, "id": did}
+
+        deals_repo_mock = MagicMock()
+        deals_repo_mock.create_deal.side_effect = fake_create_deal
+        monkeypatch.setattr("v1.integrations.musa_api.DealsRepo", lambda: deals_repo_mock)
+
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.insert.return_value.execute.return_value = MagicMock(
+            data=[{"session_id": sid, "created_at": datetime.now(timezone.utc).isoformat()}]
+        )
+        monkeypatch.setattr("v1.integrations.musa_api.get_supabase", lambda: mock_sb)
+        monkeypatch.setattr("v1.integrations.auth.validate_api_key", lambda k, p: True)
+        monkeypatch.setattr("v1.integrations.musa_api.process_musa_session", lambda **kw: None)
+
+        # No deal_id field — original body unchanged
+        resp = client.post("/api/musa/sessions", json=VALID_SESSION_BODY, headers=VALID_HEADERS)
+
+        assert resp.status_code == 200
+        assert calls["create_deal"] == 1, "create_deal must still be called when no deal_id provided"
+        assert deals_repo_mock.get_deal.call_count == 0, "get_deal must not be called when no deal_id"
+        data = resp.json()
+        assert data["status"] == "processing"
+        assert data["venture_name"] == VALID_SESSION_BODY["venture_name"]
+
+
+# ===========================================================================
 # 5. GET /sessions/{id}/status — response shape parity
 # ===========================================================================
 
@@ -1559,6 +1652,7 @@ class TestShapeParity:
         )
 
 
+
 # ===========================================================================
 # 6e. Raw-document retention cleanup (PAR-248)
 # ===========================================================================
@@ -1643,7 +1737,7 @@ class TestParserRequestRetentionCleanup:
         """
         _force_close_expired (the SLA sweep's 24h force-close path) must NOT
         delete the storage file. Retention cleanup runs separately on its own
-        schedule (PARSER_REQUEST_RETENTION_DAYS, default 4 days), so the file
+        schedule (PARSER_REQUEST_RETENTION_DAYS, default 10 days), so the file
         must still be present immediately after force-close for potential
         out-of-band recovery.
         """
