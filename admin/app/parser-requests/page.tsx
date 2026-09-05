@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { DataTable, Column } from '@/components/DataTable'
 import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT, timeSince, refreshedLabel, downloadCSV } from './utils'
 
 type Status = 'pending' | 'in_progress' | 'done'
@@ -18,6 +20,7 @@ interface AutoRequest {
   document_url: string | null
   session_id?: string | null
   deal_id?: string | null
+  deal_name?: string | null
   error_message: string | null
   status: Status
   requested_at: string
@@ -29,6 +32,7 @@ interface AutoRequest {
 interface ManualRequest {
   id: string
   deal_id?: string | null
+  deal_name?: string | null
   document_id?: string | null
   original_filename: string | null
   bank_name: string | null
@@ -48,6 +52,7 @@ interface Row {
   partner: string
   market: string
   bank_display: string
+  deal_display: string
   error_message: string | null
   status: Status | null
   date: string
@@ -75,12 +80,17 @@ function normalize(data: ApiResponse): Row[] {
     manual = Array.isArray(data.manual) ? data.manual : []
   }
 
+  // deal_name comes pre-resolved from /api/data/parser-requests (joined
+  // server-side against pds_deals so this page never needs the service-role
+  // key). Falls back to the raw deal_id (still useful for lookup) and then
+  // "—" for rows with no deal at all.
   const autoRows: Row[] = auto.map((r) => ({
     id: r.id,
     source: 'Auto · Musa',
     partner: r.partner ?? '—',
     market: r.market ?? '—',
     bank_display: r.bank_name ?? '—',
+    deal_display: r.deal_name || r.deal_id || '—',
     error_message: r.error_message ?? null,
     status: r.status,
     date: r.requested_at,
@@ -93,6 +103,7 @@ function normalize(data: ApiResponse): Row[] {
     partner: 'Manual',
     market: r.country ?? '—',
     bank_display: r.bank_name ?? r.original_filename ?? '—',
+    deal_display: r.deal_name || r.deal_id || '—',
     error_message: r.error_message ?? null,
     status: null,
     date: r.created_at,
@@ -136,6 +147,7 @@ export default function ParserRequestsPage() {
   const [partnerFilter, setPartnerFilter] = useState<typeof PARTNER_FILTERS[number]>('All')
   const [statusFilter, setStatusFilter] = useState<typeof STATUS_FILTERS[number]>('All')
   const [lastFetched, setLastFetched] = useState<string>(() => new Date().toISOString())
+  const [env, setEnv] = useState<string | null>(null)
   const [, setTick] = useState(0)
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const tickIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -144,6 +156,7 @@ export default function ParserRequestsPage() {
     const res = await fetch('/api/data/parser-requests')
     const data: ApiResponse = await res.json()
     setRows(normalize(data))
+    setEnv(res.headers.get(ENV_HEADER))
     setLoading(false)
     setLastFetched(new Date().toISOString())
   }, [])
@@ -202,6 +215,7 @@ export default function ParserRequestsPage() {
       id: r.id,
       source: r.source,
       partner: r.partner,
+      deal: r.deal_display,
       market: r.market,
       bank_display: r.bank_display,
       error_message: r.error_message ?? '',
@@ -236,6 +250,7 @@ export default function ParserRequestsPage() {
       ),
     },
     { key: 'partner', label: 'Partner/Bank', render: (_, row) => row.isAuto ? row.partner : row.bank_display },
+    { key: 'deal_display', label: 'Deal' },
     { key: 'market', label: 'Market/Country' },
     {
       key: 'status',
@@ -287,6 +302,7 @@ export default function ParserRequestsPage() {
           subtitle={loading ? 'Loading…' : summary}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+          {env === 'prod' && <EnvBadge env="prod" />}
           <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: 'var(--t2)' }}>
             {refreshedLabel(lastFetched)}
           </span>

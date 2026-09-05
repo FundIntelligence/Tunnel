@@ -30,6 +30,42 @@ steps:
       - --max-instances=3
       - --quiet
 
+  # PAR-194 — parity-pdf-render (the Cloud Run Job PAR-192's async PDF
+  # pipeline actually executes inside) is a separate GCP resource pinned to
+  # whatever image existed at Job-creation time; it does NOT pick up a new
+  # image just because the service above redeployed. Discovered 2026-08-26
+  # when a real fix merged and deployed cleanly, but every render still ran
+  # the old, broken code -- costing a full failed verification cycle before
+  # the stale Job image (not a new bug) was found. This step keeps the two
+  # resources from ever drifting apart again.
+  #
+  # Deliberately after the service update, not before: the service is the
+  # higher-priority resource, and a Job update failure here must never block
+  # a service deploy that already succeeded.
+  #
+  # Only --image is set. Confirmed empirically (2026-08-26, disposable throwaway
+  # Job, not this Job -- create with distinctive cpu/memory/task-timeout/
+  # max-retries/env-vars/secrets, run this exact `jobs update --image=...`
+  # command with no other flags, re-describe, delete) that `gcloud run jobs
+  # update` preserves every unspecified field -- cpu, memory, task-timeout,
+  # max-retries, env vars, and secretKeyRef-based secrets all survived
+  # byte-for-byte. Passing --cpu/--memory/--task-timeout/--set-secrets/
+  # --set-env-vars here would require this file to duplicate and keep in
+  # sync with parity-pdf-render's real settings (including live secret
+  # references) for no benefit, and risks drifting from them silently if
+  # anyone changes the Job's config out-of-band without also updating this
+  # file -- worse than the bug this step fixes.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - parity-pdf-render
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tunnel/parity-backend-prod:$COMMIT_SHA
+      - --region=us-central1
+      - --quiet
+
 options:
   logging: CLOUD_LOGGING_ONLY
 

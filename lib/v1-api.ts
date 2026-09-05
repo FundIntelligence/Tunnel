@@ -216,6 +216,41 @@ export async function listDocuments(
   return res.json()
 }
 
+// PAR-242: surfaces parser_requests rows PAR-62's Musa ingestion path already
+// writes on unrecognized-format detection, which previously had no signal in
+// the app at all until the 24h SLA sweep force-closed it silently.
+export interface ParserRequestListItem {
+  id: string
+  bank_name: string | null
+  market: string | null
+  error_message: string | null
+  document_url: string | null
+  status: string
+  requested_at: string
+}
+
+export async function listPendingParserRequests(
+  dealId: string
+): Promise<{ parser_requests: ParserRequestListItem[] }> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/parser-requests`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function enrichParserRequest(
+  dealId: string,
+  requestId: string,
+  fields: { bank_name?: string; notes?: string }
+): Promise<{ parser_request: Record<string, unknown> }> {
+  const res = await fetchApi(`${BASE}/deals/${dealId}/parser-requests/${requestId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fields),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export interface BatchUploadResponse {
   document_id: string
   batch_number: number

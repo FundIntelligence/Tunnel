@@ -8,14 +8,16 @@ import csv
 import io
 import json
 import logging
+import multiprocessing
 import os
+import queue as _queue_module
 import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Request, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form, Request, BackgroundTasks, Body, Header
 from fastapi.responses import StreamingResponse, HTMLResponse
 from jose import jwt as _jose_jwt
 from jose.exceptions import JWTError as _JoseJWTError
@@ -26,7 +28,7 @@ from .utils.pdf_merge import validate_pdf_count
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 
-from .config import SCHEMA_VERSION, CONFIG_VERSION, GIT_COMMIT, BUILD_TIMESTAMP, DETERMINISTIC_MODE, MAX_PDF_FILES, MAX_BATCH_UPLOADS
+from .config import SCHEMA_VERSION, CONFIG_VERSION, COMPUTATION_FINGERPRINT, GIT_COMMIT, BUILD_TIMESTAMP, DETERMINISTIC_MODE, MAX_PDF_FILES, MAX_BATCH_UPLOADS
 from .ingestion.service import IngestionService
 from .parsing.errors import CurrencyMismatchError, InvalidSchemaError
 from .core.pipeline import run_pipeline
@@ -163,6 +165,7 @@ _ERROR_CODES = {
     "UNAUTHORIZED": 401,
     "INTERNAL": 500,
     "SERVICE_UNAVAILABLE": 503,
+    "PDF_GENERATION_TIMEOUT": 503,
 }
 
 
@@ -177,6 +180,65 @@ def _error(code: str, message: str, *, status: int = 0, next_action: Optional[st
             "details": details or {},
         },
     )
+
+
+# WeasyPrint's write_pdf() is synchronous C-extension work with no
+# cooperative cancellation point. A thread-based timeout (e.g.
+# ThreadPoolExecutor.submit + future.result(timeout=...)) cannot actually
+# stop it — future.result() only stops *waiting*; the worker thread keeps
+# rendering to completion in the background, permanently tying up a pool
+# slot for every deal slow enough to time out. Running the render in a real
+# OS process lets us SIGKILL it on timeout instead (PAR-183).
+# 180s (not 45s) because the budget, not the mechanism, was wrong: large
+# snapshots genuinely cost ~90-100s of layout on prod hardware — the Deed
+# deal (3,059 txns) returned 200 at 95.2s and 105.6s uncontended on
+# 2026-08-17, and 45s killed the same render mid-layout. Interim mitigation
+# only; the real fix is async generation (see
+# docs/PAR-177-async-pdf-implementation-plan.md). Still well under Cloud
+# Run's own timeoutSeconds=1200. Note this budget wraps write_pdf() alone —
+# auth/DB/HTML-build sit outside it, so client-visible worst case is higher.
+_PDF_RENDER_TIMEOUT_S = 180
+_PDF_KILL_GRACE_S = 5
+_pdf_mp_ctx = multiprocessing.get_context("fork")
+
+
+def _pdf_render_worker(html: str, result_queue: "multiprocessing.Queue") -> None:
+    import weasyprint
+    try:
+        pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+        result_queue.put(("ok", pdf_bytes))
+    except Exception as exc:  # noqa: BLE001 — report render failures to the parent, don't crash silently
+        result_queue.put(("error", repr(exc)))
+
+
+def _render_html_to_pdf(html: str, deal_id: str) -> bytes:
+    """Render HTML to PDF bytes, hard-killing the render after _PDF_RENDER_TIMEOUT_S."""
+    result_queue = _pdf_mp_ctx.Queue()
+    proc = _pdf_mp_ctx.Process(target=_pdf_render_worker, args=(html, result_queue), daemon=True)
+    proc.start()
+    try:
+        # Actively drain the queue while waiting so a large PDF can't fill the
+        # underlying pipe and deadlock the child before it ever exits.
+        status, payload = result_queue.get(timeout=_PDF_RENDER_TIMEOUT_S)
+    except _queue_module.Empty:
+        proc.terminate()
+        proc.join(_PDF_KILL_GRACE_S)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        _error(
+            "PDF_GENERATION_TIMEOUT",
+            f"PDF generation for deal {deal_id} took longer than {_PDF_RENDER_TIMEOUT_S}s, "
+            "likely due to a large transaction count. Use GET /v1/deals/{deal_id}/snapshot/html "
+            "for the same report in a browser, or GET /v1/deals/{deal_id}/transactions for the raw data.",
+            next_action="Use /snapshot/html or /transactions instead of /snapshot/pdf",
+        )
+    else:
+        proc.join()
+
+    if status == "error":
+        _error("INTERNAL", f"PDF generation failed for deal {deal_id}: {payload}")
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +264,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         AnalysisRunsRepo, SnapshotsRepo,
         EnrichmentsRepo, ClassificationOverridesRepo, CustomFlagsRepo,
         AccountCoverageRepo, OverrideLogRepo, IntelligenceLogRepo,
-        ExportPersistenceRepo,
+        ExportPersistenceRepo, ParserRequestsRepo,
     )
     return {
         "deals": DealsRepo(),
@@ -221,6 +283,7 @@ def _repos(request: Optional[Request] = None) -> Dict[str, Any]:
         "cls_overrides": ClassificationOverridesRepo(),
         "custom_flags": CustomFlagsRepo(),
         "account_coverage": AccountCoverageRepo(),
+        "parser_requests": ParserRequestsRepo(),
     }
 
 
@@ -339,6 +402,32 @@ def _extract_user_id_from_request(request: Request) -> Optional[str]:
         return None
 
     return claims.get("sub")
+
+
+def _require_snapshot_access(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+) -> None:
+    """Gate for routes that expose full deal financials to non-deal-scoped
+    callers (PAR-175). Accepts any ONE of:
+      - a valid Musa partner key (x-api-key, same as musa_api.py's routes)
+      - a valid admin-scoped key (x-api-key, key_type="admin" — the admin
+        panel's server-side proxy, which has no Supabase user session to
+        forward)
+      - an authenticated internal user (Supabase JWT), same verification
+        _extract_user_id_from_request already does for confirm-endpoint
+        attribution, but enforced here as a hard gate rather than optional
+        attribution.
+    x-api-key is optional at the header level (unlike require_musa_api_key)
+    because a JWT-only caller must not be forced to send one.
+    """
+    if x_api_key:
+        from .integrations.auth import validate_api_key, validate_scoped_api_key
+        if validate_api_key(x_api_key, "Musa Ventures") or validate_scoped_api_key(x_api_key, "admin"):
+            return
+    if _extract_user_id_from_request(request):
+        return
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 @router.post("/deals")
@@ -601,6 +690,77 @@ def list_documents(request: Request, deal_id: str):
     return {"documents": [_document_row_for_list_response(d) for d in docs]}
 
 
+@router.get("/deals/{deal_id}/parser-requests")
+def list_parser_requests_for_deal(request: Request, deal_id: str):
+    """
+    PAR-242: surfaces parser_requests rows PAR-62's Musa ingestion path
+    already writes on unrecognized-format detection (previously invisible
+    to the deal's own user until the 24h SLA sweep force-closed it) so the
+    web app can show the same inline "Request parser" prompt it already
+    shows for direct-upload failures (UnknownParserModal), instead of
+    silence for up to 24h.
+
+    Only 'pending' rows -- 'in_progress'/'done' rows are being handled or
+    resolved and don't need a fresh prompt.
+    """
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    rows = repos["parser_requests"].list_pending_for_deal(deal_id, partner="musa")
+    return {
+        "parser_requests": [
+            {
+                "id": r.get("id"),
+                "bank_name": r.get("bank_name"),
+                "market": r.get("market"),
+                "error_message": r.get("error_message"),
+                "document_url": r.get("document_url"),
+                "status": r.get("status"),
+                "requested_at": r.get("requested_at"),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.patch("/deals/{deal_id}/parser-requests/{request_id}")
+def enrich_parser_request(request: Request, deal_id: str, request_id: str, body: dict = Body(...)):
+    """
+    PAR-242: lets the deal's own user confirm/add details (bank name,
+    notes) on a parser_requests row PAR-62's Musa path already auto-created
+    -- an in-place update, never a second insert for the same detected
+    failure (reuses PAR-62's persistence per the ticket's explicit
+    instruction, rather than rebuilding it). Moves status pending ->
+    in_progress to signal a human has acknowledged and enriched it, distinct
+    from the engineering-side pending -> in_progress -> done cycle in the
+    admin dashboard.
+    """
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    existing = repos["parser_requests"].get(request_id)
+    if not existing or existing.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"Parser request {request_id} not found for deal {deal_id}")
+
+    fields: Dict[str, Any] = {}
+    bank_name = body.get("bank_name")
+    if isinstance(bank_name, str) and bank_name.strip():
+        fields["bank_name"] = bank_name.strip()
+    notes = body.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        # error_message is PAR-62's own detection reason; append rather than
+        # overwrite so the original diagnostic isn't lost.
+        fields["error_message"] = f"{existing.get('error_message') or ''}\n\nUser notes: {notes.strip()}".strip()
+    if existing.get("status") == "pending":
+        fields["status"] = "in_progress"
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    updated = repos["parser_requests"].enrich(request_id, deal_id, fields)
+    return {"parser_request": updated or {**existing, **fields}}
+
+
 @router.delete("/deals/{deal_id}/documents/{document_id}")
 def delete_document(request: Request, deal_id: str, document_id: str):
     repos = _repos(request)
@@ -857,16 +1017,16 @@ def resolve_transaction(
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     # Fetch the txn-entity map row to get original role and entity
-    all_maps = repos["txn_map"].list_by_deal(deal_id)
-    txn_map_row = next((m for m in all_maps if str(m.get("txn_id")) == row_id), None)
+    # PAR-96: point lookup instead of list_by_deal(deal_id) + Python scan —
+    # this used to be a full-deal fetch just to find one row by id.
+    txn_map_row = repos["txn_map"].get_by_deal_and_txn(deal_id, row_id)
     if not txn_map_row:
         _error("NOT_FOUND", f"Transaction mapping {row_id} not found for deal {deal_id}")
 
     original_role = txn_map_row.get("role") or "needs_review"
 
-    # Fetch the raw transaction for its SHA256 hash
-    all_txns = repos["raw"].list_by_deal(deal_id)
-    tx_row = next((t for t in all_txns if str(t.get("id")) == row_id), None)
+    # Fetch the raw transaction for its SHA256 hash (point lookup, same reasoning)
+    tx_row = repos["raw"].get_by_deal_and_id(deal_id, row_id)
     txn_hash = tx_row.get("txn_id") or "" if tx_row else ""
 
     user_id = _extract_user_id_from_request(request)
@@ -892,12 +1052,10 @@ def resolve_transaction(
     if hasattr(repos["txn_map"], "update_role"):
         repos["txn_map"].update_role(row_id, new_role)
 
-    # Count remaining needs_review for this deal
-    remaining = sum(
-        1 for m in repos["txn_map"].list_by_deal(deal_id)
-        if (m.get("role") or "").lower() == "needs_review"
-        and str(m.get("txn_id")) != row_id
-    )
+    # Count remaining needs_review for this deal — DB-side COUNT (PAR-96),
+    # not a third full-deal fetch. Same semantics as before: role == 'needs_review'
+    # excluding the row just resolved above.
+    remaining = repos["txn_map"].count_needs_review_excluding(deal_id, row_id)
 
     return {"success": True, "remaining_count": remaining}
 
@@ -962,15 +1120,36 @@ def export(request: Request, deal_id: str, force: bool = False):
     # Skipped when force=True to rebuild the snapshot unconditionally.
     latest_snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
     latest_doc_at = repos["documents"].get_latest_update_at(deal_id)
-    latest_override_at = repos["overrides"].get_latest_update_at(deal_id) or ""
+    # PAR-111: pds_overrides (entity-level overrides, fed into run_pipeline()) and
+    # pds_override_log (per-transaction Review Queue resolutions, overlaid onto
+    # run_pipeline()'s output per PAR-77) are both real, both still-live tables
+    # that can change what export() produces — this check was only ever reading
+    # the former, so a fresh resolve_transaction() call never invalidated the
+    # short-circuit and export() could silently keep serving a pre-resolution
+    # snapshot. Take the max of both.
+    latest_override_at = max(
+        repos["overrides"].get_latest_update_at(deal_id) or "",
+        (repos["override_log"].get_latest_update_at(deal_id) if repos.get("override_log") else "") or "",
+    )
     snap_created_at = (latest_snapshot or {}).get("created_at") or ""
     snap_config_version = (latest_snapshot or {}).get("config_version")
+    # PAR-219: a backend code deploy was not previously an invalidation signal,
+    # so a shipped computation-logic fix never reached already-sealed deals —
+    # PAR-217's corrected reconciliation figure was live at 100% traffic while
+    # every sealed deal kept serving the pre-fix number. Comparing the snapshot's
+    # recorded computation fingerprint against the running one closes that gap
+    # automatically, with no version constant for anyone to remember to bump.
+    # NULL (pre-migration-040 rows, i.e. every snapshot sealed before this
+    # mechanism existed) deliberately never matches, so those re-compute once and
+    # then carry a real fingerprint.
+    snap_fingerprint = (latest_snapshot or {}).get("computation_fingerprint")
     if not force and (
         latest_snapshot
         and snap_created_at
         and (not latest_doc_at or snap_created_at >= latest_doc_at)
         and snap_created_at > latest_override_at
         and snap_config_version == CONFIG_VERSION
+        and snap_fingerprint == COMPUTATION_FINGERPRINT
     ):
         latest_run = repos["runs"].get_latest_run(deal_id)
         if latest_run and latest_run.get("id") == latest_snapshot.get("analysis_run_id"):
@@ -991,16 +1170,37 @@ def export(request: Request, deal_id: str, force: bool = False):
             }
     if latest_snapshot and snap_config_version != CONFIG_VERSION:
         logger.info("[EXPORT] deal=%s config_version mismatch snap=%s current=%s — bypassing cache", deal_id, snap_config_version, CONFIG_VERSION)
+    elif latest_snapshot and snap_fingerprint != COMPUTATION_FINGERPRINT:
+        # PAR-219: distinct log line from the config_version case so a deploy-
+        # driven recompute is attributable in logs rather than looking like a
+        # mystery cache miss.
+        logger.info(
+            "[EXPORT] deal=%s computation_fingerprint mismatch snap=%s current=%s — bypassing cache",
+            deal_id,
+            snap_fingerprint,
+            COMPUTATION_FINGERPRINT,
+        )
 
+    # PAR-238: read the accrual figures reconciliation compares against from
+    # the confirmed pds_audited_financials record, not deal.accrual_*. Those
+    # deal-level fields are only ever set once, at deal-creation time (POST
+    # /deals), and are never updated when audited financials are later
+    # uploaded/confirmed — so a deal following the normal flow (create deal,
+    # then confirm financials afterward) was structurally guaranteed to hit
+    # NOT_RUN regardless of how complete the confirmed financials were. This
+    # reads from the one source of truth instead, and works retroactively for
+    # deals already confirmed before this fix shipped, with no backfill.
+    from .db.supabase_repositories import AuditedFinancialsRepo
+    confirmed_af = AuditedFinancialsRepo().get_latest_confirmed(deal_id)
     stage = "PIPELINE_START"
     run, links, entities, txn_map = run_pipeline(
         deal_id=deal_id,
         raw_transactions=raw,
         overrides=overrides,
         accrual={
-            "accrual_revenue_cents": deal.get("accrual_revenue_cents"),
-            "accrual_period_start": deal.get("accrual_period_start"),
-            "accrual_period_end": deal.get("accrual_period_end"),
+            "accrual_revenue_cents": confirmed_af.get("turnover_cents") if confirmed_af else None,
+            "accrual_period_start": confirmed_af.get("financial_year_start") if confirmed_af else None,
+            "accrual_period_end": confirmed_af.get("financial_year_end") if confirmed_af else None,
         },
     )
     stage = "PIPELINE_DONE"
@@ -1330,7 +1530,7 @@ def list_deal_transactions(request: Request, deal_id: str):
 
 
 @router.get("/deals/{deal_id}/snapshot/pdf")
-def get_snapshot_pdf(request: Request, deal_id: str):
+def get_snapshot_pdf(request: Request, deal_id: str, _auth: None = Depends(_require_snapshot_access)):
     repos = _repos(request)
     deal = repos["deals"].get_deal(deal_id)
     if not deal:
@@ -1354,9 +1554,147 @@ def get_snapshot_pdf(request: Request, deal_id: str):
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
+    filename = f"parity_snapshot_{deal_id}.pdf"
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PAR-192 — interim async PDF jobs (render -> job row -> authenticated fetch)
+#
+# Tactical, additive-only: the sync endpoint above is completely untouched.
+# These three endpoints are a NEW, opt-in path -- existing callers (including
+# Musa's current integration) keep working exactly as before unless they
+# switch to calling POST .../jobs. See core/pdf_jobs.py's module docstring
+# for the full design rationale (Cloud Run Job execution, not BackgroundTasks;
+# bytes-in-row, not a Storage bucket).
+#
+# Interim measure per PAR-192 -- expected to be replaced by PAR-191's
+# hash-based freshness-policy mechanism. Do not extend this scope (no
+# per-partner freshness branching, no build_snapshot_context() dependency)
+# without checking PAR-191's status first.
+# ---------------------------------------------------------------------------
+
+@router.post("/deals/{deal_id}/snapshot/pdf/jobs", status_code=202)
+def create_snapshot_pdf_job(
+    request: Request,
+    deal_id: str,
+    variant: str = "snapshot",
+    _auth: None = Depends(_require_snapshot_access),
+):
+    """
+    Trigger an async render, off the synchronous request path. Returns
+    immediately (202) with a job_id and poll_url -- does NOT wait for the
+    render to complete. See GET .../jobs/{job_id} for status and
+    .../jobs/{job_id}/content for the finished PDF.
+
+    Reuses an existing DONE job for the same (deal, variant, snapshot_id)
+    instead of re-rendering, per the deterministic-cache idea already used
+    by the export short-circuit above (api.py:1039) -- a rendered PDF is
+    fully determined by that triple.
+    """
+    from .core import pdf_jobs
+
+    if variant not in ("snapshot", "enriched", "report"):
+        _error("BAD_REQUEST", f"Unknown variant: {variant!r}. Must be one of: snapshot, enriched, report.")
+
+    repos = _repos(request)
+    deal = repos["deals"].get_deal(deal_id)
+    if not deal:
+        _error("NOT_FOUND", f"Deal {deal_id} not found")
+    snapshot = repos["snapshots"].get_latest_snapshot(deal_id)
+    if not snapshot:
+        _error("NOT_FOUND", "No snapshot found for this deal. Run POST /export first.")
+    snapshot_id = snapshot.get("id")
+
+    cached = pdf_jobs.find_cached_done_job(deal_id, variant, snapshot_id)
+    if cached:
+        base_url = str(request.base_url).rstrip("/")
+        job_id = cached["job_id"]
+        return {
+            "job_id": job_id,
+            "status": "done",
+            "poll_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}",
+            "content_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content",
+            "cached": True,
+        }
+
+    requested_by = _extract_user_id_from_request(request) or "api_key_caller"
+    job = pdf_jobs.create_job(deal_id, variant, snapshot_id, requested_by)
+    job_id = job["job_id"]
+
+    try:
+        pdf_jobs.trigger_render_job(job_id, deal_id, variant)
+    except Exception as exc:  # noqa: BLE001 — job row already exists; report the failure on it
+        logger.exception("[PAR-192] Failed to trigger render job_id=%s deal_id=%s", job_id, deal_id)
+        pdf_jobs.mark_failed(job_id, f"Failed to start render: {exc!r}")
+
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "poll_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}",
+        "content_url": f"{base_url}/v1/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content",
+        "cached": False,
+    }
+
+
+@router.get("/deals/{deal_id}/snapshot/pdf/jobs/{job_id}")
+def get_snapshot_pdf_job_status(
+    deal_id: str,
+    job_id: str,
+    _auth: None = Depends(_require_snapshot_access),
+):
+    from .core import pdf_jobs
+
+    job = pdf_jobs.get_job(job_id)
+    if not job or job.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"PDF job {job_id} not found for deal {deal_id}")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "variant": job["variant"],
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "byte_size": job.get("byte_size"),
+        "error_message": job.get("error_message"),
+    }
+
+
+@router.get("/deals/{deal_id}/snapshot/pdf/jobs/{job_id}/content")
+def get_snapshot_pdf_job_content(
+    deal_id: str,
+    job_id: str,
+    _auth: None = Depends(_require_snapshot_access),
+):
+    """
+    Serve the finished PDF directly from the job row, freshly authenticated
+    on every call via _require_snapshot_access -- the same "sign fresh on
+    each read, never persist a stale link" principle as the existing
+    admin/lib/parser-requests-signed-urls.ts pattern (PAR-145), adapted here
+    to an authenticated-fetch URL instead of a bucket-signed one (see
+    core/pdf_jobs.py's module docstring for why).
+    """
+    from .core import pdf_jobs
+
+    job = pdf_jobs.get_job(job_id)
+    if not job or job.get("deal_id") != deal_id:
+        _error("NOT_FOUND", f"PDF job {job_id} not found for deal {deal_id}")
+    if job["status"] == "failed":
+        _error("INTERNAL", f"PDF render failed: {job.get('error_message') or 'unknown error'}")
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"PDF job {job_id} is {job['status']}, not ready yet")
+
+    pdf_bytes = pdf_jobs.get_job_bytes(job_id)
+    if pdf_bytes is None:
+        _error("INTERNAL", f"PDF job {job_id} is marked done but has no stored bytes")
+
     filename = f"parity_snapshot_{deal_id}.pdf"
     return StreamingResponse(
         iter([pdf_bytes]),
@@ -1413,9 +1751,8 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
     #   account_coverage = repos["account_coverage"].list_by_deal(deal_id)
     #   pdf_bytes = _generate_snapshot_pdf(canonical, snap_meta, enrichment, account_coverage=account_coverage)
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     suffix = "_enriched" if enrichment else ""
     filename = f"parity_{deal_id}{suffix}.pdf"
     return StreamingResponse(
@@ -1428,10 +1765,9 @@ def get_enriched_pdf(request: Request, deal_id: str, enrichment_id: Optional[str
 @router.get("/deals/{deal_id}/report")
 def get_deal_report(request: Request, deal_id: str):
     from .analysis.snapshot_html_renderer import render_snapshot_html
-    import weasyprint
     from fastapi.responses import Response
     html = render_snapshot_html(deal_id)
-    pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+    pdf_bytes = _render_html_to_pdf(html, deal_id)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -1440,7 +1776,13 @@ def get_deal_report(request: Request, deal_id: str):
 
 
 @router.get("/deals/{deal_id}/snapshot/html")
-def get_deal_snapshot_html(deal_id: str, view: str = "observed_recon", partner_name: str | None = None):
+def get_deal_snapshot_html(
+    request: Request,
+    deal_id: str,
+    view: str = "observed_recon",
+    partner_name: str | None = None,
+    _auth: None = Depends(_require_snapshot_access),
+):
     """
     Returns the rendered HTML snapshot for web viewing.
     view: observed_recon (default — branches internally on recon_available) | verify
@@ -2258,7 +2600,11 @@ def get_audited_financials(request: Request, deal_id: str):
         _error("NOT_FOUND", f"Deal {deal_id} not found")
 
     af_repo = AuditedFinancialsRepo()
-    records = af_repo.get_by_deal_id(deal_id)
+    try:
+        records = af_repo.get_by_deal_id(deal_id)
+    except Exception as exc:
+        logger.exception("[AUDITED_FINANCIALS] DB read failed for deal=%s", deal_id)
+        _error("SERVICE_UNAVAILABLE", "Unable to retrieve audited financials at this time", details={"message": str(exc)})
     records.sort(key=lambda r: r.get("financial_year") or 0, reverse=True)
     return {"deal_id": deal_id, "records": records}
 

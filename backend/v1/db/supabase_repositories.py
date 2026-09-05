@@ -44,8 +44,19 @@ class BaseRepo:
             return
         self.client.table(self.table).insert(items).execute()
 
-    def select_eq(self, column: str, value: Any) -> List[Dict[str, Any]]:
+    def select_eq(self, column: str, value: Any, order_by: str = "id") -> List[Dict[str, Any]]:
         # Paginate: one .range(0, N) with a large N still hits the server max (~1000 rows).
+        #
+        # PAR-106 Bug 3: pagination here previously carried no .order(), and
+        # PostgREST/Postgres does not guarantee stable row order across separate
+        # query executions without one -- on deals with >1,000 rows (e.g. a
+        # 12,851-row deal -> 13 pages), unordered pagination could silently
+        # return the same row on two different pages. That duplicate then
+        # collided in a downstream upsert with "ON CONFLICT DO UPDATE command
+        # cannot affect row a second time" (21000) -- reproduced live during
+        # export on a real 2-bank-statement deal. `order_by` defaults to the
+        # `id` column every table except pds_entities/pds_txn_entity_map has;
+        # those two pass their own primary key (entity_id/txn_id) instead.
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:
@@ -54,6 +65,7 @@ class BaseRepo:
                 self.client.table(self.table)
                 .select("*")
                 .eq(column, value)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -71,8 +83,12 @@ class BaseRepo:
                 break
         return out
 
-    def select_eq2(self, col1: str, val1: Any, col2: str, val2: Any) -> List[Dict[str, Any]]:
-        """Same pagination as select_eq, with a second equality filter pushed to the DB."""
+    def select_eq2(
+        self, col1: str, val1: Any, col2: str, val2: Any, order_by: str = "id"
+    ) -> List[Dict[str, Any]]:
+        """Same pagination as select_eq, with a second equality filter pushed to
+        the DB. See select_eq's docstring (PAR-106 Bug 3) for why order_by
+        is required for pagination to be safe above ~1,000 rows."""
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:
@@ -82,6 +98,7 @@ class BaseRepo:
                 .select("*")
                 .eq(col1, val1)
                 .eq(col2, val2)
+                .order(order_by)
                 .range(offset, end)
                 .execute()
             )
@@ -247,6 +264,19 @@ class RawTxRepo(RawTransactionsRepository, BaseRepo):
     def list_by_document(self, document_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("document_id", document_id)
 
+    def get_by_deal_and_id(self, deal_id: str, row_id: str) -> Optional[Dict[str, Any]]:
+        """PAR-96: point lookup for a single raw transaction, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal."""
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .eq("id", row_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
     def get_all_transactions_for_export(
         self, deal_id: str, year: Optional[int] = None
     ) -> Sequence[Dict[str, Any]]:
@@ -391,7 +421,9 @@ class EntitiesRepo(EntitiesRepository, BaseRepo):
                 self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_entities has no plain `id` column -- entity_id is its primary
+        # key. See BaseRepo.select_eq's PAR-106 Bug 3 docstring.
+        return self.select_eq("deal_id", deal_id, order_by="entity_id")
 
 
 class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
@@ -407,19 +439,62 @@ class TxnEntityMapRepo(TxnEntityMapRepository, BaseRepo):
             self.client.table(self.table).upsert(batch).execute()
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
-        return self.select_eq("deal_id", deal_id)
+        # pds_txn_entity_map has no plain `id` column -- txn_id is its
+        # primary key. See BaseRepo.select_eq's PAR-106 Bug 3 docstring.
+        return self.select_eq("deal_id", deal_id, order_by="txn_id")
 
     def list_needs_review_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         """Filters role='needs_review' in the DB query instead of pulling every
         mapping row for the deal and filtering in Python."""
-        return self.select_eq2("deal_id", deal_id, "role", "needs_review")
+        return self.select_eq2("deal_id", deal_id, "role", "needs_review", order_by="txn_id")
 
     def update_role(self, txn_uuid: str, new_role: str) -> None:
         self.client.table(self.table).update({"role": new_role}).eq("txn_id", txn_uuid).execute()
 
     def count_needs_review(self, deal_id: str) -> int:
-        rows = self.select_eq("deal_id", deal_id)
+        rows = self.select_eq("deal_id", deal_id, order_by="txn_id")
         return sum(1 for r in rows if (r.get("role") or "") == "needs_review")
+
+    def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
+        """PAR-96: point lookup for a single txn_map row, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal."""
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .eq("txn_id", txn_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    def count_needs_review_excluding(self, deal_id: str, exclude_txn_id: str) -> int:
+        """PAR-96: DB-side COUNT for the post-resolve remaining-count, instead of
+        list_by_deal(deal_id) + a Python scan over the whole deal. Same semantics
+        as the resolve_transaction() call site it replaces: role == 'needs_review'
+        (already lowercase in the DB, per the equivalent DB-side filter in
+        list_needs_review_by_deal above) excluding the just-resolved row.
+
+        PAR-96 hotfix: originally used .select("*", count="exact", head=True) —
+        confirmed live against parity-staging (2026-08-04, postgrest-py 0.17.2)
+        that head=True silently makes res.count come back 0 regardless of the
+        actual count, even though the identical query without head=True returns
+        the correct count. Not caught locally because the in-memory test double
+        doesn't exercise real PostgREST HTTP/count semantics at all, and the one
+        existing test asserting remaining_count happened to expect 0 anyway in
+        its fixture (a coincidental false-positive, not a real check). Dropping
+        head=True and projecting only txn_id (not "*") keeps this far cheaper
+        than the original full-deal scan it replaced, without the broken
+        HEAD-request path."""
+        res = (
+            self.client.table(self.table)
+            .select("txn_id", count="exact")
+            .eq("deal_id", deal_id)
+            .eq("role", "needs_review")
+            .neq("txn_id", exclude_txn_id)
+            .execute()
+        )
+        return res.count or 0
 
 
 class ExportPersistenceRepo(BaseRepo):
@@ -465,6 +540,20 @@ class OverrideLogRepo(BaseRepo):
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
+
+    def get_latest_update_at(self, deal_id: str) -> Optional[str]:
+        """PAR-111: export()'s short-circuit freshness check needs this to
+        notice a fresh Review Queue resolution — see OverridesRepo.get_latest_update_at
+        for the sibling check on pds_overrides (a genuinely different, still-live
+        table: entity-level classification overrides fed into run_pipeline(),
+        vs. this table's per-transaction resolve_transaction() audit log,
+        overlaid onto run_pipeline()'s output afterward per PAR-77). Both can
+        invalidate a cached export, so the freshness check must take the max
+        of both, not just one."""
+        rows = self.select_eq("deal_id", deal_id)
+        if not rows:
+            return ""
+        return max((r.get("created_at") or "") for r in rows)
 
 
 class IntelligenceLogRepo(BaseRepo):
@@ -549,8 +638,19 @@ class SnapshotsRepo(SnapshotsRepository, BaseRepo):
     # 500 (PAR-33). List/metadata consumers never read it, so we never fetch it here.
     _METADATA_COLUMNS = (
         "id, deal_id, analysis_run_id, schema_version, config_version, "
-        "sha256_hash, created_by, created_at, financial_state_hash"
+        "sha256_hash, created_by, created_at, financial_state_hash, "
+        "computation_fingerprint"
     )
+
+    def set_computation_fingerprint(self, snapshot_id: str, fingerprint: str) -> None:
+        """PAR-219: stamp provenance on an existing row. Used when a recompute
+        produces a byte-identical hash (so the existing row is reused) but that
+        row was sealed by older code — without this the short-circuit would
+        re-compute the same deal on every subsequent call instead of
+        converging. Never touches any hashed field."""
+        self.client.table(self.table).update(
+            {"computation_fingerprint": fingerprint}
+        ).eq("id", snapshot_id).execute()
 
     def list_snapshots(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         # Metadata only — no canonical_json. Callers (GET /deals/{id},
@@ -696,6 +796,28 @@ class AuditedFinancialsRepo(BaseRepo):
         )
         return res.data[0] if res.data else None
 
+    def get_latest_confirmed(self, deal_id: str) -> Optional[Dict[str, Any]]:
+        """Return the confirmed (confirmed_at IS NOT NULL) record for the most
+        recent financial_year for this deal, or None if none is confirmed yet.
+
+        PAR-238: this is what reconciliation should read as the deal's accrual
+        source of truth instead of the disconnected deal.accrual_* fields.
+        "Most recent financial_year" mirrors the ordering
+        GET /deals/{deal_id}/audited-financials already uses to sort multiple
+        years for display, rather than inventing a new convention.
+        """
+        res = (
+            self.client.table(self.table)
+            .select("*")
+            .eq("deal_id", deal_id)
+            .is_("removed_at", "null")
+            .not_.is_("confirmed_at", "null")
+            .order("financial_year", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
     def soft_delete(
         self,
         deal_id: str,
@@ -753,3 +875,38 @@ class AccountCoverageRepo(BaseRepo):
 
     def list_by_deal(self, deal_id: str) -> List[Dict[str, Any]]:
         return self.select_eq("deal_id", deal_id)
+
+
+class ParserRequestsRepo(BaseRepo):
+    """`parser_requests` -- the auto/Musa table PAR-62 already writes to on
+    unrecognized-format detection (backend.v1.integrations.musa_file_processor).
+    PAR-242 reuses this table/persistence as-is rather than rebuilding it;
+    this repo only adds deal-scoped reads and an enrichment update so a
+    pending row can be surfaced and annotated (e.g. bank name confirmed by
+    a human) without a duplicate insert."""
+
+    def __init__(self):
+        super().__init__("parser_requests")
+
+    def list_pending_for_deal(self, deal_id: str, partner: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self.select_eq2("deal_id", deal_id, "status", "pending", order_by="requested_at")
+        if partner:
+            rows = [r for r in rows if r.get("partner") == partner]
+        return rows
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.select_eq("id", request_id)
+        return rows[0] if rows else None
+
+    def enrich(self, request_id: str, deal_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing pending row in place (e.g. bank_name confirmed
+        by the deal's user) -- never inserts a second row for the same
+        detected failure."""
+        res = (
+            self.client.table(self.table)
+            .update(fields)
+            .eq("id", request_id)
+            .eq("deal_id", deal_id)
+            .execute()
+        )
+        return res.data[0] if res.data else {}

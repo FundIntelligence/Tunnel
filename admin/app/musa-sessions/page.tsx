@@ -3,6 +3,8 @@
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react'
 import { StatusBadge } from '@/components/StatusBadge'
 import { PageHeader } from '@/components/PageHeader'
+import { EnvBadge } from '@/components/EnvBadge'
+import { ENV_HEADER } from '@/lib/env-header'
 import { toEAT, refreshedLabel, downloadCSV } from './utils'
 
 interface MusaSession {
@@ -16,9 +18,24 @@ interface MusaSession {
   completed_at: string | null
   document_urls: unknown
   error_message: string | null
+  webhook_last_status_code: number | null
+  webhook_last_attempted_at: string | null
+  webhook_last_error: string | null
+  webhook_delivered_at: string | null
+  webhook_first_delivered_at: string | null
+  webhook_resend_count: number
 }
 
-const SNAPSHOT_PDF_BASE = 'https://parity-backend-prod-121148713552.us-central1.run.app/v1/deals'
+function webhookDeliveryLabel(row: MusaSession): { text: string; color: string } {
+  if (!row.webhook_last_attempted_at) {
+    return { text: 'Not sent yet', color: 'var(--t3)' }
+  }
+  if (row.webhook_delivered_at) {
+    return { text: 'Delivered', color: 'var(--green)' }
+  }
+  const code = row.webhook_last_status_code
+  return { text: code ? `Failed (${code})` : 'Failed', color: 'var(--red)' }
+}
 
 function documentUrlList(document_urls: unknown): string[] {
   if (!Array.isArray(document_urls)) return []
@@ -35,6 +52,9 @@ export default function MusaSessionsPage() {
   const [error, setError] = useState<string | null>(null)
   const [, setTick] = useState(0)
   const loadingRef = useRef(false)
+  const [resendingId, setResendingId] = useState<string | null>(null)
+  const [resendResult, setResendResult] = useState<{ sessionId: string; message: string; ok: boolean } | null>(null)
+  const [env, setEnv] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     if (loadingRef.current) return
@@ -47,6 +67,7 @@ export default function MusaSessionsPage() {
       }
       const sessions: MusaSession[] = Array.isArray(data) ? data : (data?.sessions ?? [])
       setRows(sessions)
+      setEnv(res.headers.get(ENV_HEADER))
       setError(null)
       setLastFetched(new Date().toISOString())
     } catch (err) {
@@ -58,6 +79,31 @@ export default function MusaSessionsPage() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  const handleResend = async (sessionId: string) => {
+    setResendingId(sessionId)
+    setResendResult(null)
+    try {
+      const res = await fetch(`/api/data/musa-sessions/${encodeURIComponent(sessionId)}/resend-webhook`, {
+        method: 'POST',
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        setResendResult({ sessionId, ok: false, message: data?.error ?? `Resend failed (${res.status})` })
+        return
+      }
+      setResendResult({
+        sessionId,
+        ok: true,
+        message: data?.webhook_delivered
+          ? `Resent — Musa returned ${data.webhook_status_code}`
+          : `Resend attempt ${data?.resend_count ?? '?'} sent — Musa returned ${data?.webhook_status_code ?? 'no response'}`,
+      })
+      await load()
+    } finally {
+      setResendingId(null)
+    }
+  }
 
   useEffect(() => {
     const id = setInterval(load, 60000)
@@ -87,6 +133,7 @@ export default function MusaSessionsPage() {
     { key: 'venture_name', label: 'Venture' },
     { key: 'venture_country', label: 'Country' },
     { key: 'status', label: 'Status' },
+    { key: 'webhook', label: 'Webhook' },
     { key: 'created_at', label: 'Created At' },
     { key: 'error_message', label: 'Error' },
   ]
@@ -99,6 +146,7 @@ export default function MusaSessionsPage() {
           subtitle={loading ? 'Loading…' : `${rows.length} sessions (last 100)`}
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {env === 'prod' && <EnvBadge env="prod" />}
           {lastFetched && (
             <span style={{ fontSize: 12, color: 'var(--t3)', fontFamily: "'IBM Plex Mono', monospace" }}>
               {refreshedLabel(lastFetched)}
@@ -221,6 +269,17 @@ export default function MusaSessionsPage() {
                         <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13, color: 'var(--t0)' }}>
                           <StatusBadge status={row.status} />
                         </td>
+                        <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+                          {(() => {
+                            const wh = webhookDeliveryLabel(row)
+                            return (
+                              <span style={{ color: wh.color, fontSize: 12 }}>
+                                {wh.text}
+                                {row.webhook_resend_count > 0 && ` · resent ${row.webhook_resend_count}×`}
+                              </span>
+                            )
+                          })()}
+                        </td>
                         <td style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontSize: 13, color: 'var(--t0)' }}>
                           {toEAT(row.created_at)}
                         </td>
@@ -265,15 +324,26 @@ export default function MusaSessionsPage() {
                                   {docUrls.length === 0 ? (
                                     <span style={{ color: 'var(--t3)' }}>—</span>
                                   ) : (
-                                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                                      {docUrls.map((url, urlIdx) => (
-                                        <li key={urlIdx}>
-                                          <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--teal)' }}>
-                                            {url}
-                                          </a>
-                                        </li>
-                                      ))}
-                                    </ul>
+                                    <>
+                                      <ul style={{ margin: 0, paddingLeft: 18 }}>
+                                        {docUrls.map((url, urlIdx) => (
+                                          <li key={urlIdx}>
+                                            <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--teal)' }}>
+                                              {url}
+                                            </a>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                      {/* PAR-145: these are Musa's own presigned URLs, captured verbatim from
+                                          their session-creation request — Parity never takes ownership of that
+                                          storage, so unlike Parser Requests' storage_path there is no credential
+                                          Parity holds to mint a fresh one. Once Musa's own expiry passes, this
+                                          link is gone for good; that's expected, not an admin bug. */}
+                                      <div style={{ fontSize: 11, color: 'var(--t3)', marginTop: 4 }}>
+                                        External links from Musa&apos;s own storage — expire independently on
+                                        their side and can&apos;t be refreshed by Parity.
+                                      </div>
+                                    </>
                                   )}
                                 </div>
 
@@ -286,6 +356,74 @@ export default function MusaSessionsPage() {
                                   </>
                                 )}
 
+                                <div style={{ color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: '0.06em' }}>
+                                  WEBHOOK
+                                </div>
+                                <div>
+                                  {(() => {
+                                    const wh = webhookDeliveryLabel(row)
+                                    const isProcessing = row.status === 'processing'
+                                    const isResending = resendingId === row.session_id
+                                    return (
+                                      <>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                          <span style={{ color: wh.color, fontWeight: 500 }}>{wh.text}</span>
+                                          {row.webhook_first_delivered_at && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              first delivered {toEAT(row.webhook_first_delivered_at)}
+                                            </span>
+                                          )}
+                                          {row.webhook_last_attempted_at && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              last attempt {toEAT(row.webhook_last_attempted_at)}
+                                            </span>
+                                          )}
+                                          {row.webhook_resend_count > 0 && (
+                                            <span style={{ color: 'var(--t2)', fontSize: 12 }}>
+                                              · resent {row.webhook_resend_count}×
+                                            </span>
+                                          )}
+                                        </div>
+                                        {row.webhook_last_error && (
+                                          <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 4, whiteSpace: 'pre-wrap' }}>
+                                            {row.webhook_last_error}
+                                          </div>
+                                        )}
+                                        <button
+                                          onClick={() => handleResend(row.session_id)}
+                                          disabled={isProcessing || isResending}
+                                          title={isProcessing ? 'Session is still processing — nothing to resend yet' : undefined}
+                                          style={{
+                                            marginTop: 8,
+                                            border: '1px solid var(--teal)',
+                                            background: 'var(--white)',
+                                            color: 'var(--teal)',
+                                            borderRadius: 6,
+                                            padding: '5px 12px',
+                                            fontFamily: "'IBM Plex Mono', monospace",
+                                            fontSize: 11,
+                                            cursor: isProcessing || isResending ? 'default' : 'pointer',
+                                            opacity: isProcessing || isResending ? 0.5 : 1,
+                                          }}
+                                        >
+                                          {isResending ? 'Resending…' : 'Resend Webhook'}
+                                        </button>
+                                        {resendResult && resendResult.sessionId === row.session_id && (
+                                          <div
+                                            style={{
+                                              marginTop: 6,
+                                              fontSize: 12,
+                                              color: resendResult.ok ? 'var(--green)' : 'var(--red)',
+                                            }}
+                                          >
+                                            {resendResult.message}
+                                          </div>
+                                        )}
+                                      </>
+                                    )
+                                  })()}
+                                </div>
+
                                 {row.deal_id && (
                                   <>
                                     <div style={{ color: 'var(--t2)', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: '0.06em' }}>
@@ -293,7 +431,7 @@ export default function MusaSessionsPage() {
                                     </div>
                                     <div>
                                       <a
-                                        href={`${SNAPSHOT_PDF_BASE}/${row.deal_id}/snapshot/pdf`}
+                                        href={`/api/data/deals/${row.deal_id}/snapshot-pdf`}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         style={{ color: 'var(--teal)' }}

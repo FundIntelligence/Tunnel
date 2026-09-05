@@ -10,6 +10,7 @@ import os
 import sys
 import unittest
 from typing import Any, Dict, List, Tuple
+from unittest.mock import patch
 
 import httpx
 from fastapi import FastAPI
@@ -101,8 +102,49 @@ class TestConcurrencyAssault(unittest.IsolatedAsyncioTestCase):
         self.app, self.repos = _make_app()
         self.client = await _async_client(self.app)
 
+        # PAR-196: export() unconditionally instantiates a live-Supabase
+        # AuditedFinancialsRepo and calls generate_reconciliation_section()
+        # (itself live-Supabase-dependent via calculate_account_coverage ->
+        # _get_audited_financials) -- bypassing this file's own in-memory
+        # repos_factory entirely. Neither was mocked here, contradicting
+        # this module's own docstring ("no external dependencies (no
+        # Supabase...)"). Same pre-existing gap test_par77_override_survives_
+        # reexport.py already works around for AuditedFinancialsRepo.
+        #
+        # This isn't cosmetic: generate_reconciliation_section() NEVER
+        # returns None (its internal _safe_call always returns a dict, even
+        # on failure), so build_pds_payload() always seals a real
+        # "recon_section" key into every export() payload. test_override_
+        # export_race_consistency's _expected_hashes() helper never passes
+        # recon_section, so its independently-reconstructed payload can
+        # NEVER match export()'s real sha256_hash -- a permanent,
+        # deterministic mismatch since recon_section sealing landed
+        # (8ff184c, 2026-06-25), unrelated to concurrency timing. Confirmed
+        # via a zero-concurrency control run: the exact same mismatch
+        # reproduces with no race involved at all. Disabling recon_section
+        # here (matching this test's own explicit "no Supabase" scope --
+        # reconciliation reporting is irrelevant to what this file tests)
+        # makes both sides agree again.
+        self._af_patcher = patch("backend.v1.db.supabase_repositories.AuditedFinancialsRepo")
+        mock_af_cls = self._af_patcher.start()
+        mock_af_cls.return_value.get_by_deal_id.return_value = []
+        # PAR-238: export() now also calls get_latest_confirmed() to source
+        # reconciliation's accrual figures — an unconfigured MagicMock here
+        # would flow into compute_metrics() as accrual_revenue_cents and
+        # blow up on `> 0`. None matches "no audited financials", same as
+        # get_by_deal_id returning [] above.
+        mock_af_cls.return_value.get_latest_confirmed.return_value = None
+
+        self._recon_patcher = patch(
+            "backend.v1.analysis.snapshot_generator.generate_reconciliation_section",
+            side_effect=RuntimeError("recon_section disabled in concurrency/idempotency tests (PAR-196)"),
+        )
+        self._recon_patcher.start()
+
     async def asyncTearDown(self):
         await self.client.aclose()
+        self._recon_patcher.stop()
+        self._af_patcher.stop()
 
     async def _prep_deal_with_doc(self) -> str:
         resp = await self.client.post("/v1/deals", data={"currency": "USD"})

@@ -125,6 +125,12 @@ class MemoryRawTxRepo(RawTransactionsRepository):
         wanted = set(values)
         return [copy.deepcopy(r) for r in self._store if r.get(column) in wanted]
 
+    def get_by_deal_and_id(self, deal_id: str, row_id: str) -> Optional[Dict[str, Any]]:
+        for r in self._store:
+            if r.get("deal_id") == deal_id and str(r.get("id")) == str(row_id):
+                return copy.deepcopy(r)
+        return None
+
 
 class MemoryTransferLinksRepo(TransferLinksRepository):
     def __init__(self):
@@ -189,6 +195,20 @@ class MemoryTxnEntityMapRepo(TxnEntityMapRepository):
     def count_needs_review(self, deal_id: str) -> int:
         return len(self.list_needs_review_by_deal(deal_id))
 
+    def get_by_deal_and_txn(self, deal_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
+        for m in self._store.values():
+            if m.get("deal_id") == deal_id and str(m.get("txn_id")) == str(txn_id):
+                return copy.deepcopy(m)
+        return None
+
+    def count_needs_review_excluding(self, deal_id: str, exclude_txn_id: str) -> int:
+        return sum(
+            1 for m in self._store.values()
+            if m.get("deal_id") == deal_id
+            and (m.get("role") or "").lower() == "needs_review"
+            and str(m.get("txn_id")) != str(exclude_txn_id)
+        )
+
     def delete_eq(self, column: str, value: Any) -> None:
         self._store = {k: v for k, v in self._store.items() if v.get(column) != value}
 
@@ -215,7 +235,10 @@ class MemoryOverridesRepo(OverridesRepository):
 class MemoryOverrideLogRepo:
     """Mirrors OverrideLogRepo (pds_override_log) — append-only Review Queue
     resolution audit trail. Not part of the OverridesRepository interface;
-    a separate, unrelated table (see PAR-77)."""
+    a separate table from pds_overrides (see PAR-77) — but PAR-111: still a
+    real input to export()'s freshness check (get_latest_update_at below),
+    since a resolution here changes what a re-export overlays onto
+    run_pipeline()'s output."""
 
     def __init__(self):
         self._store: List[Dict[str, Any]] = []
@@ -227,6 +250,12 @@ class MemoryOverrideLogRepo:
 
     def list_by_deal(self, deal_id: str) -> Sequence[Dict[str, Any]]:
         return [copy.deepcopy(o) for o in self._store if o.get("deal_id") == deal_id]
+
+    def get_latest_update_at(self, deal_id: str) -> Optional[str]:
+        rows = [o for o in self._store if o.get("deal_id") == deal_id]
+        if not rows:
+            return ""
+        return max((r.get("created_at") or "") for r in rows)
 
 
 class MemoryAnalysisRunsRepo(AnalysisRunsRepository):
@@ -336,6 +365,39 @@ class MemoryExportPersistenceRepo:
             raise
 
 
+class MemoryParserRequestsRepo:
+    """In-memory fake for `parser_requests` (PAR-62/PAR-242) -- mirrors
+    ParserRequestsRepo's read/enrich surface without a real Supabase client."""
+
+    def __init__(self):
+        self._store: List[Dict[str, Any]] = []
+
+    def list_pending_for_deal(self, deal_id: str, partner: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = [r for r in self._store if r.get("deal_id") == deal_id and r.get("status") == "pending"]
+        if partner:
+            rows = [r for r in rows if r.get("partner") == partner]
+        return [copy.deepcopy(r) for r in sorted(rows, key=lambda r: r.get("requested_at") or "")]
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        for r in self._store:
+            if r["id"] == request_id:
+                return copy.deepcopy(r)
+        return None
+
+    def enrich(self, request_id: str, deal_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        for r in self._store:
+            if r["id"] == request_id and r.get("deal_id") == deal_id:
+                r.update(fields)
+                return copy.deepcopy(r)
+        return {}
+
+    # Test-only helper -- not part of ParserRequestsRepo's real interface.
+    def seed(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row = {"status": "pending", **row}
+        self._store.append(row)
+        return copy.deepcopy(row)
+
+
 def build_memory_repos() -> Dict[str, Any]:
     runs = MemoryAnalysisRunsRepo()
     links = MemoryTransferLinksRepo()
@@ -353,4 +415,5 @@ def build_memory_repos() -> Dict[str, Any]:
         "runs": runs,
         "snapshots": MemorySnapshotsRepo(),
         "export_persistence": MemoryExportPersistenceRepo(runs, links, entities, txn_map),
+        "parser_requests": MemoryParserRequestsRepo(),
     }

@@ -3,7 +3,6 @@
 import Link from 'next/link'
 import { useEffect, useState } from 'react'
 import { SignOutButton } from '@/components/SignOutButton'
-import { useEnv } from '@/app/providers'
 import { getSupabaseBrowser } from '@/lib/supabase-browser'
 import { isOntologyQaAllowed } from '@/lib/ontology-qa-access'
 
@@ -12,10 +11,10 @@ const navItems = [
   { href: '/musa-sessions', label: 'Musa Sessions' },
   { href: '/deals', label: 'Deal Pipeline' },
   { href: '/api-keys', label: 'API Keys' },
+  { href: '/sandbox-keys', label: 'Sandbox Keys' },
 ]
 
 export function Sidebar() {
-  const { env, setEnv } = useEnv()
   const [showOntologyQa, setShowOntologyQa] = useState(false)
 
   useEffect(() => {
@@ -69,57 +68,6 @@ export function Sidebar() {
           </Link>
         )}
       </nav>
-      <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-        <div style={{
-          fontFamily: "'IBM Plex Mono', monospace",
-          fontSize: 10,
-          letterSpacing: '0.06em',
-          color: 'rgba(255,255,255,0.4)',
-          marginBottom: 8,
-        }}>
-          ENVIRONMENT
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <button
-            type="button"
-            onClick={() => setEnv('prod')}
-            style={{
-              flex: 1,
-              padding: '6px 0',
-              borderRadius: 4,
-              fontSize: 11,
-              fontFamily: "'IBM Plex Mono', monospace",
-              fontWeight: 500,
-              letterSpacing: '0.04em',
-              cursor: 'pointer',
-              border: '1px solid #E24B4A',
-              background: env === 'prod' ? '#E24B4A' : 'transparent',
-              color: env === 'prod' ? '#1A0808' : '#E24B4A',
-            }}
-          >
-            ● PROD
-          </button>
-          <button
-            type="button"
-            onClick={() => setEnv('staging')}
-            style={{
-              flex: 1,
-              padding: '6px 0',
-              borderRadius: 4,
-              fontSize: 11,
-              fontFamily: "'IBM Plex Mono', monospace",
-              fontWeight: 500,
-              letterSpacing: '0.04em',
-              cursor: 'pointer',
-              border: '1px solid #1D9E75',
-              background: env === 'staging' ? '#1D9E75' : 'transparent',
-              color: env === 'staging' ? '#06140D' : '#1D9E75',
-            }}
-          >
-            ● STAGING
-          </button>
-        </div>
-      </div>
       <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '8px 0' }}>
         <SignOutButton />
       </div>

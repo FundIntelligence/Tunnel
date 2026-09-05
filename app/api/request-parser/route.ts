@@ -32,6 +32,7 @@ export async function POST(request: NextRequest) {
     let country = '';
     let accountType = '';
     let dealId = '';
+    let dealName = '';
     let documentId = '';
     let originalFilename = '';
     let partner = '';
@@ -62,6 +63,7 @@ export async function POST(request: NextRequest) {
       country = body.country ?? '';
       accountType = body.account_type ?? '';
       dealId = body.deal_id ?? '';
+      dealName = body.deal_name ?? '';
       documentId = body.document_id ?? '';
       originalFilename = body.original_filename ?? '';
       partner = body.partner ?? '';
@@ -81,6 +83,7 @@ export async function POST(request: NextRequest) {
         ${country ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Country</td><td>${country}</td></tr>` : ''}
         ${accountType ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Account type</td><td>${accountType}</td></tr>` : ''}
         ${contactEmail ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Contact</td><td>${contactEmail}</td></tr>` : ''}
+        ${dealName ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Deal</td><td>${dealName}</td></tr>` : ''}
         ${dealId ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Deal ID</td><td style="font-family:monospace">${dealId}</td></tr>` : ''}
         ${documentId ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">Document ID</td><td style="font-family:monospace">${documentId}</td></tr>` : ''}
         ${(originalFilename || fileName) ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-weight:600">File</td><td style="font-family:monospace">${originalFilename || fileName}</td></tr>` : ''}
@@ -118,6 +121,7 @@ export async function POST(request: NextRequest) {
       const adminBase = process.env.ADMIN_DASHBOARD_URL || 'https://parity-admin-three.vercel.app';
       const slackText = [
         `:wrench: *Parser Request${partnerTag}:* ${bankName}`,
+        dealName ? `• Deal: ${dealName}` : '',
         accountType ? `• Account type: ${accountType}` : '',
         country ? `• Country: ${country}` : '',
         contactEmail ? `• Contact: ${contactEmail}` : '',

@@ -15,13 +15,13 @@ import os
 from dotenv import load_dotenv
 
 from v1 import api as v1_api
-from v1.db.migrator import run_pending_migrations
 from v1.ingestion.service import register_ingestion_startup
 from v1.integrations.musa_api import router as musa_router
 from v1.integrations.musa_parser_request_sla import (
     parser_request_retention_sweeper,
     parser_request_sla_sweeper,
 )
+from v1.core.pdf_jobs import pdf_job_retention_sweeper
 
 load_dotenv()
 
@@ -33,14 +33,16 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    run_pending_migrations()
     sla_task = asyncio.create_task(parser_request_sla_sweeper.start())
     retention_task = asyncio.create_task(parser_request_retention_sweeper.start())
+    pdf_job_reaper_task = asyncio.create_task(pdf_job_retention_sweeper.start())
     yield
     parser_request_sla_sweeper.stop()
     parser_request_retention_sweeper.stop()
+    pdf_job_retention_sweeper.stop()
     sla_task.cancel()
     retention_task.cancel()
+    pdf_job_reaper_task.cancel()
 
 
 app = FastAPI(

@@ -538,6 +538,68 @@ def test_tax_compliance_analysis_partial_status():
     assert "Partial tax payment pattern — verify against filed returns." in html
 
 
+def test_tax_compliance_analysis_insufficient_data_below_min_sample():
+    """PAR-100: 2 tax-role transactions across a 12-month period is below
+    _MIN_TAX_SAMPLE_SIZE (3) — at that sample size the ratio is otherwise
+    mathematically able to assert a confident PARTIAL/COMPLIANT status
+    regardless of the real pattern (same soundness class as Supplier
+    Payment's N=1 bug, PR #109). Confirms the honest insufficient-data
+    message renders instead, and neither COMPLIANT nor PARTIAL appears."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:2]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "2 of 12" in html
+    assert "INSUFFICIENT_DATA" in html
+    assert "Insufficient tax transaction volume for a reliable compliance assessment (N=2)." in html
+    assert "Partial tax payment pattern" not in html
+    assert "Tax payment pattern is consistent with the business's stated activity level." not in html
+
+
+def test_tax_compliance_analysis_at_min_sample_boundary_not_insufficient():
+    """Exactly 3 tax transactions (_MIN_TAX_SAMPLE_SIZE itself) — confirms
+    the boundary is inclusive: N=3 is trusted (falls through to the normal
+    COMPLIANT/PARTIAL logic), only N<3 is gated as insufficient."""
+    months = [f"2025-{m:02d}" for m in range(1, 13)]
+    tax_months = months[:3]
+    raw_txns, txn_map = _tax_txn_fixture(tax_months, months)
+    tables = dict(_TABLES)
+    tables["pds_snapshots"] = [{
+        "sha256_hash": _SHA,
+        "created_at": "2026-01-30T08:00:00+00:00",
+        "canonical_json": json.dumps({
+            "metrics": {"coverage_bp": 10000, "missing_month_count": 0,
+                        "missing_month_penalty_bp": 0, "reconciliation_bp": None,
+                        "reconciliation_status": "NOT_RUN"},
+            "transactions": raw_txns,
+            "txn_entity_map": txn_map,
+        }),
+    }]
+    tables["pds_raw_transactions"] = raw_txns
+    tables["pds_txn_entity_map"] = txn_map
+    tables["pds_audited_financials"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    html = renderer.render_snapshot_html("deal-fixture")
+    assert "INSUFFICIENT_DATA" not in html
+    assert "PARTIAL" in html
+
+
 def test_tax_compliance_analysis_renders_in_observed_state_without_audited_financials():
     """Confirms the section renders (not gated on recon_available) when no
     audited financials are submitted at all — same both-states requirement
@@ -845,6 +907,80 @@ def test_inter_account_transfer_analysis_reports_manual_overrides():
     ) in html
 
 
+# ── inter-account transfer analysis (PAR-102) — live check replaces the stub
+# when pds_transfer_links actually has rows for the deal, since the account_id
+# fix (commit 64bebd4) means the "every transaction is undifferentiated"
+# premise no longer holds universally.
+
+def test_inter_account_transfer_analysis_renders_real_data_when_links_exist():
+    """Mirrors the real MBAKSTESTBUILDEX deal (63de219d): two documents with
+    distinct account_id/document_id values and populated pds_transfer_links.
+    Confirms the stub is replaced with a genuine breakdown, not the canned
+    'not currently available' copy."""
+    tables = dict(_TABLES)
+    tables["pds_documents"] = [
+        {"id": "docA", "storage_url": "inline://EQUITY STATEMENT.pdf", "source_files": [],
+         "analytics": {"summary": {"total_transactions": 1}}},
+        {"id": "docB", "storage_url": "inline://KCB STATEMENT.pdf", "source_files": [],
+         "analytics": {"summary": {"total_transactions": 1}}},
+    ]
+    tables["pds_raw_transactions"] = [
+        {"id": "tA1", "txn_date": "2025-01-05", "signed_amount_cents": -500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "TRANSFER OUT", "balance_cents": None,
+         "account_id": "docA", "document_id": "docA"},
+        {"id": "tB1", "txn_date": "2025-01-06", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "TRANSFER IN", "balance_cents": None,
+         "account_id": "docB", "document_id": "docB"},
+    ]
+    tables["pds_transfer_links"] = [
+        {"txn_out_id": "tA1", "txn_in_id": "tB1", "abs_amount_cents": 500000},
+    ]
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Inter-Account Transfer Analysis" in html
+    assert "1 inter-account transfer pair(s) detected" in html
+    assert "KES 5,000" in html
+    assert "Equity -> KCB" in html
+    assert "1 txns, KES 5,000" in html
+    # Scope the negative checks to this section only — "is not currently
+    # available" also legitimately appears in the (unchanged, out-of-scope)
+    # Risk Assessment Summary cross-reference note.
+    section = re.search(r'Inter-Account Transfer Analysis.*?</div>\s*</div>', html, re.S).group(0)
+    assert "is not currently available" not in section
+    assert "genuine result, not an infrastructure gap" not in section
+
+
+def test_inter_account_transfer_analysis_genuine_zero_distinct_from_stub():
+    """Two distinct account_id values but zero pds_transfer_links rows: the
+    matcher genuinely ran and found nothing, which must render a distinct
+    message from the 'account_id is broken' stub — a real zero is not the
+    same finding as an infrastructure gap."""
+    tables = dict(_TABLES)
+    tables["pds_raw_transactions"] = [
+        {"id": "t1", "txn_date": "2025-01-05", "signed_amount_cents": 500000,
+         "abs_amount_cents": 500000, "normalized_descriptor": "X", "balance_cents": None,
+         "account_id": "acc-1", "document_id": "docA"},
+        {"id": "t2", "txn_date": "2025-01-06", "signed_amount_cents": -300000,
+         "abs_amount_cents": 300000, "normalized_descriptor": "Y", "balance_cents": None,
+         "account_id": "acc-2", "document_id": "docB"},
+    ]
+    tables["pds_transfer_links"] = []
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Inter-Account Transfer Analysis" in html
+    assert (
+        "Self-transfer / cash-sweep detection ran for this deal — transactions are tagged "
+        "with distinct per-account identifiers — and found no qualifying inter-account "
+        "transfer pairs in this period. This is a genuine result, not an infrastructure gap."
+    ) in html
+    # Must not claim the old infrastructure-gap stub for a deal whose account_id is fine.
+    assert "not yet populated correctly in the current ingestion pipeline" not in html
+
+
 # ── risk assessment summary (PAR-63) ─────────────────────────────────────────
 # Reuses existing signals (tier, account coverage, transaction-pattern
 # rollup) plus one new computation (revenue concentration by entity), which
@@ -1075,19 +1211,29 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     instance of the same bug fixed above in the summary cashflow note — missed
     the first time because it's a separate code path. Confirms both now use the
     real observed-period length (13 here) instead of a hardcoded 12.
+
+    Also covers PAR-100: the cached pds_documents.analytics.credit_scoring_inputs
+    blob here is deliberately stale (CONSISTENT / 1 month), the opposite of the
+    live picture (payroll present in only 4 of 13 months -> IRREGULAR) — proves
+    the "Irregular payroll" card is driven entirely by a live pass over
+    pds_raw_transactions/pds_txn_entity_map, not the cache.
     """
     months = [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
     # 3 net-negative months so the "Net-negative months" pattern triggers (>2).
     neg = {"2025-02", "2025-05", "2025-08"}
+    # 4 of 13 months carry a live payroll-role transaction -> IRREGULAR (< 80%).
+    payroll_months = {"2025-01", "2025-04", "2025-07", "2025-10"}
     document_rows = [{
         "id": "doc-1",
         "storage_url": "inline://STATEMENT.pdf",
         "source_files": [],
         "analytics": {
             "summary": {"total_transactions": len(months)},
+            # Deliberately stale/mismatched vs the live txns below — proves
+            # this cached blob is no longer consulted for this card (PAR-100).
             "credit_scoring_inputs": {
-                "payroll_stability": "IRREGULAR",
-                "payroll_months_detected": 4,
+                "payroll_stability": "CONSISTENT",
+                "payroll_months_detected": 1,
             },
         },
     }]
@@ -1102,6 +1248,23 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
         canon_transactions.append({"id": out_id, "txn_date": f"{m}-10", "signed_amount_cents": -out_amt})
         canon_txn_entity_map.append({"txn_id": in_id, "role": "revenue_operational"})
         canon_txn_entity_map.append({"txn_id": out_id, "role": "supplier"})
+    # Live pds_raw_transactions/pds_txn_entity_map: one txn per month (so
+    # n_total_months == 13), plus a "payroll" role txn in 4 of those months.
+    raw_txn_rows, txn_map_rows = [], []
+    for i, m in enumerate(months):
+        rid = f"r{i}"
+        raw_txn_rows.append({
+            "id": rid, "txn_date": f"{m}-05", "signed_amount_cents": 100000,
+            "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": rid, "role": "revenue_operational"})
+        if m in payroll_months:
+            pid = f"p{i}"
+            raw_txn_rows.append({
+                "id": pid, "txn_date": f"{m}-25", "signed_amount_cents": -80000,
+                "abs_amount_cents": 80000, "normalized_descriptor": "PAYROLL", "balance_cents": None,
+            })
+            txn_map_rows.append({"txn_id": pid, "role": "payroll"})
     tables = {
         "pds_deals": [{"company_name": "CrossYear Co", "currency": "KES", "analyst_notes": ""}],
         "pds_snapshots": [{
@@ -1119,8 +1282,8 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
         }],
         "pds_documents": document_rows,
         "pds_audited_financials": [],
-        "pds_raw_transactions": [],
-        "pds_txn_entity_map": [],
+        "pds_raw_transactions": raw_txn_rows,
+        "pds_txn_entity_map": txn_map_rows,
     }
     renderer._get_supabase = lambda: _FakeSupabase(tables)
 
@@ -1129,6 +1292,50 @@ def test_observed_patterns_reflect_real_period_length_not_hardcoded_12():
     assert "3 of 13 months net-negative" in html
     assert "Payroll detected in 4 of 13 months" in html
     assert "of 12 months" not in html
+
+
+def test_irregular_payroll_pattern_absent_when_live_data_is_consistent():
+    """Inverse of the above: the cached blob says IRREGULAR (stale), but the
+    live pds_raw_transactions show payroll present in every one of 3 months
+    (CONSISTENT) — confirms the pattern card does NOT render, since a stale
+    cache asserting IRREGULAR must not override a live-consistent picture."""
+    months = ["2025-01", "2025-02", "2025-03"]
+    document_rows = [{
+        "id": "doc-1",
+        "storage_url": "inline://STATEMENT.pdf",
+        "source_files": [],
+        "analytics": {
+            "summary": {"total_transactions": len(months)},
+            "credit_scoring_inputs": {
+                "payroll_stability": "IRREGULAR",
+                "payroll_months_detected": 1,
+            },
+        },
+    }]
+    raw_txn_rows, txn_map_rows = [], []
+    for i, m in enumerate(months):
+        rid, pid = f"r{i}", f"p{i}"
+        raw_txn_rows.append({
+            "id": rid, "txn_date": f"{m}-05", "signed_amount_cents": 100000,
+            "abs_amount_cents": 100000, "normalized_descriptor": "PAYMENT IN", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": rid, "role": "revenue_operational"})
+        raw_txn_rows.append({
+            "id": pid, "txn_date": f"{m}-25", "signed_amount_cents": -80000,
+            "abs_amount_cents": 80000, "normalized_descriptor": "PAYROLL", "balance_cents": None,
+        })
+        txn_map_rows.append({"txn_id": pid, "role": "payroll"})
+    tables = dict(_TABLES)
+    tables["pds_documents"] = document_rows
+    tables["pds_raw_transactions"] = raw_txn_rows
+    tables["pds_txn_entity_map"] = txn_map_rows
+    renderer._get_supabase = lambda: _FakeSupabase(tables)
+    _patch_recon()
+
+    html = renderer.render_snapshot_html("deal-fixture")
+
+    assert "Irregular payroll" not in html
+    assert "Payroll detected in" not in html
 
 
 # ── single source of truth: PDF vs live /analytics/monthly-cashflow ─────────

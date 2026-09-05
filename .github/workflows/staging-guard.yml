@@ -1,6 +1,6 @@
 # Parity Staging Guard — determinism + ontology contract checks
 #
-# Runs on every PR targeting staging. No live Supabase required.
+# Runs on every PR targeting paritystaging. No live Supabase required.
 # These checks must pass before any merge to staging is allowed.
 #
 # Required secrets: none (all guards are static analysis + unit tests)
@@ -9,7 +9,7 @@ name: Staging Guard
 
 on:
   pull_request:
-    branches: [staging]
+    branches: [paritystaging]
   workflow_dispatch:
 
 jobs:
@@ -63,6 +63,33 @@ jobs:
             fi
           fi
 
+      # ── PAR-219: cache-invalidation coverage ─────────────────────────────
+      # The computation fingerprint in config.py auto-invalidates the export
+      # snapshot cache when any module in _COMPUTATION_MODULES changes, so no
+      # human has to remember a version bump (that dependence is exactly what
+      # PAR-217 forgot and PAR-219 exists to remove).
+      #
+      # This guard covers the one case the fingerprint cannot see: a NEW
+      # computation module added but not registered in _COMPUTATION_MODULES.
+      # Such a module's edits would silently stop invalidating the cache —
+      # reintroducing PAR-219 quietly. Fingerprint = mechanism, this = net.
+      - name: Computation modules registered for cache invalidation (PAR-219)
+        run: |
+          missing=""
+          for f in $(git diff --name-only --diff-filter=A origin/staging...HEAD 2>/dev/null \
+                     | grep -E '^backend/v1/(core|analysis)/.*\.py$' \
+                     | grep -vE '(renderer|pdf_|__init__|_helpers)' || true); do
+            rel="${f#backend/v1/}"
+            if ! grep -q "\"$rel\"" backend/v1/config.py; then
+              missing="$missing $rel"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::New computation module(s) not registered in _COMPUTATION_MODULES in backend/v1/config.py:$missing"
+            echo "::error::Unregistered modules do not invalidate the export snapshot cache (PAR-219). Add them, or exclude them deliberately if they are presentation-only."
+            exit 1
+          fi
+
       # ── Schema drift ─────────────────────────────────────────────────────
       - name: pds_* schema lock
         run: |
@@ -85,7 +112,7 @@ jobs:
       # ── Legacy route guard ───────────────────────────────────────────────
       - name: All routes must be under /v1
         run: |
-          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" 2>/dev/null \
+          LEGACY=$(grep -Rn "@app\.\(get\|post\|put\|delete\|patch\)" backend --include="*.py" --exclude-dir=tests --exclude-dir=tests_v1 2>/dev/null \
             | grep -v '("/")' | grep -v '("/health")' | grep -v '("/v1' \
             | grep -v '("/docs' | grep -v '("/openapi' | grep -v '("/redoc' || true)
           if [ -n "$LEGACY" ]; then

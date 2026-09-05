@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from typing import Iterator, List, Optional, Union
 
 import pdfplumber
+from pdfminer.pdfdocument import PDFPasswordIncorrect
 
 # Explicit word-grouping tolerances. Previously an implicit pdfplumber
 # default (`extract_words()` with no args) repeated ad hoc across ~10 bank
@@ -31,20 +32,34 @@ WORD_Y_TOLERANCE = 3
 
 
 class NormalizedPage:
-    """One page of a single-parsed document. `text` is extracted eagerly
-    (cheap); `words`/`tables` are extracted lazily and cached, since only the
-    winning bank extractor needs word positions and only NCBA/Co-op
-    detection needs tables."""
+    """One page of a single-parsed document. `text`, `words`, and `tables`
+    are all extracted lazily and cached (PAR-216) -- format detection only
+    ever reads the first ~2 pages' `text` (`NormalizedDocument.text_upto`),
+    so eagerly running pdfplumber's `extract_text()` for every page at
+    parse time (the previous behavior, and the docstring's own claim that
+    doing so was "cheap") wasted real work and real memory on a large
+    document: confirmed as a real, measured factor in a production OOM on a
+    451-page statement (2Gi container limit, ~2076 MiB used) -- the other,
+    larger factor being the double-parse this same ticket also fixed
+    (`extract_equity_clms_pdf` no longer re-opens the file from scratch).
+    Only the page(s) actually read ever pay the `extract_text()` cost now."""
 
     def __init__(self, page_number: int, page: "pdfplumber.page.Page"):
         self.page_number = page_number  # 1-indexed
         self.rotation: int = page.rotation
         self.width: float = page.width
         self.height: float = page.height
-        self.text: str = page.extract_text() or ""
         self._page = page
+        self._text: Optional[str] = None
         self._words: Optional[List[dict]] = None
         self._tables: Optional[list] = None
+
+    @property
+    def text(self) -> str:
+        """Lazy, cached passthrough to pdfplumber's `extract_text()`."""
+        if self._text is None:
+            self._text = self._page.extract_text() or ""
+        return self._text
 
     @property
     def words(self) -> List[dict]:
@@ -66,6 +81,23 @@ class NormalizedPage:
         if self._tables is None:
             self._tables = self._page.extract_tables()
         return self._tables
+
+    def flush_cache(self) -> None:
+        """Release both the underlying pdfplumber page's internal layout
+        cache AND this page's own cached `text`/`words`/`tables` (PAR-216)
+        -- call after a page's data has been fully consumed inside a loop
+        over many pages, so a 400+ page document doesn't retain every
+        page's already-processed word list for the rest of the document's
+        lifetime (this, combined with the eager-`text`-for-every-page issue
+        `text` being made lazy above already fixes, was the direct cause of
+        a real production OOM on a 451-page statement). Safe to call even
+        mid-document: a later re-access of `.text`/`.words`/`.extract_tables()`
+        on this page just recomputes from the underlying pdfplumber page
+        (slower, not broken) rather than reusing a stale cache."""
+        self._page.flush_cache()
+        self._text = None
+        self._words = None
+        self._tables = None
 
 
 class NormalizedDocument:
@@ -98,11 +130,44 @@ class NormalizedDocument:
         self.close()
 
 
-def parse_pdf(file_path: str) -> NormalizedDocument:
+class PDFLockedError(Exception):
+    """Raised by `parse_pdf()` when a PDF is encrypted and the supplied
+    password (or the absence of one) doesn't open it.
+
+    This is the one shared, bank-agnostic signal for "this file needs a
+    password" (PAR-69). Every `detect_*`/`extract_*` function already
+    routes through `parse_pdf()`/`as_document()`, so catching this in one
+    place at the router/dispatch layer covers every current and future
+    bank extractor — no per-bank password handling needed. NCBA's
+    "e-Statement Of Account" template is the first caller; PAR-14 (Co-op
+    Layout C) is expected to be the next.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        super().__init__(f"PDF is password-protected: {file_path}")
+
+
+def parse_pdf(file_path: str, password: Optional[str] = None) -> NormalizedDocument:
     """Open the PDF exactly once and eagerly extract per-page text (cheap).
     Returns a `NormalizedDocument` — use as a context manager to guarantee
-    the underlying file handle is closed."""
-    pdf = pdfplumber.open(file_path)
+    the underlying file handle is closed.
+
+    `password`, when given, is passed to pdfplumber for this open call
+    only — never stored, logged, or reused across calls. Raises
+    `PDFLockedError` if the file is encrypted and the password (or lack of
+    one) doesn't unlock it; callers that want to prompt the analyst for a
+    password should catch that specifically instead of treating it as a
+    generic parse failure.
+    """
+    try:
+        pdf = (
+            pdfplumber.open(file_path, password=password)
+            if password is not None
+            else pdfplumber.open(file_path)
+        )
+    except PDFPasswordIncorrect as exc:
+        raise PDFLockedError(file_path) from exc
     return NormalizedDocument(file_path, pdf)
 
 

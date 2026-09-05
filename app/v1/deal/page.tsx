@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useMemo, useRef, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
+import { useQueryClient } from '@tanstack/react-query';
 import { useDropzone } from 'react-dropzone';
 import { supabase } from '@/lib/supabase';
 import {
@@ -21,15 +22,16 @@ import {
   // askParityReview moved to ParityReviewChat component
   exportTransactionsCsv,
   getNeedsReview,
-  listDeals,
   getMonthlyCashflow,
   getCreditScoringInputs,
   getReconciliation,
-  getDeal,
   downloadReport,
   getLatestAnalysis,
+  listPendingParserRequests,
+  enrichParserRequest,
 } from '@/lib/v1-api';
 import type { DealListItem } from '@/lib/v1-api';
+import { useDealsListQuery, useDealDetailQuery, useDealDocumentsQuery, dealDocumentsKey, dealDetailKey, dealsListKey } from '@/lib/queries/deals';
 import { BatchUpload } from '@/components/BatchUpload';
 import DocumentsTab from '@/components/deal-tabs/DocumentsTab';
 import AnalysisTab from '@/components/deal-tabs/AnalysisTab';
@@ -54,55 +56,49 @@ import type {
 import type { AnalysisState, EntityBreakdownRow, QueuedStatement, PipelineStage, DrillModalState, ParserRequestDoc } from '@/components/deal-tabs/types';
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'KES', 'NGN'];
 
-// Module-level (outside the component, survives remounts of V1DealPageInner):
-// a fresh/cold navigation to a deal URL can mount this component more than
-// once in quick succession as part of Next.js's rendering path for a
-// useSearchParams()-consuming component under <Suspense> (see V1DealPage's
-// export below) — a component-local ref guard does NOT protect against this,
-// since a genuine remount gets a brand-new ref. Two independent mounts would
-// otherwise race two separate fetch chains for the same deal_id. Keying the
-// in-flight/resolved rehydration promise by dealId here means every mount
-// shares the SAME one chain — each mount still applies the result to its own
-// local state once resolved, but only one real fetch sequence ever runs.
+// Keyed by dealId in the shared QueryClient cache (via queryClient.fetchQuery
+// below) rather than a plain in-memory Map — this dedupes concurrent double
+// mounts (a fresh/cold navigation to a deal URL can mount this component more
+// than once in quick succession under <Suspense>'s useSearchParams() path)
+// exactly like the old module-level Map did, but also persists across full
+// page reloads (the QueryClient is synced to localStorage — see
+// ReactQueryProvider) and expires on its own after staleTime instead of
+// living forever until an explicit retry.
 type RehydrationResult =
   | { ok: true; analysis_run: AnalysisRun | null; exportData?: ExportResponse; rawTransactions?: Array<Record<string, unknown>>; creditScoringInputs?: Record<string, unknown> | null }
   | { ok: false; message: string };
-const rehydrationPromises = new Map<string, Promise<RehydrationResult>>();
+const rehydrationKey = (dealId: string) => ['rehydration', dealId] as const;
 
-function getOrFetchRehydration(dealId: string): Promise<RehydrationResult> {
-  let p = rehydrationPromises.get(dealId);
-  if (!p) {
-    p = (async (): Promise<RehydrationResult> => {
-      try {
-        const { analysis_run } = await getLatestAnalysis(dealId);
-        if (!analysis_run) return { ok: true, analysis_run: null };
-        const data = await exportSnapshot(dealId);
-        const txRes = await listDealTransactions(dealId);
-        let creditScoringInputs: Record<string, unknown> | null = null;
-        try {
-          creditScoringInputs = await getCreditScoringInputs(dealId);
-        } catch (e) {
-          console.error('getCreditScoringInputs failed on rehydrate:', e);
-        }
-        return {
-          ok: true,
-          analysis_run,
-          exportData: data,
-          rawTransactions: txRes.transactions as unknown as Array<Record<string, unknown>>,
-          creditScoringInputs,
-        };
-      } catch (e) {
-        return { ok: false, message: e instanceof Error ? e.message : String(e) };
-      }
-    })();
-    rehydrationPromises.set(dealId, p);
+async function fetchRehydration(dealId: string): Promise<RehydrationResult> {
+  try {
+    const { analysis_run } = await getLatestAnalysis(dealId);
+    if (!analysis_run) return { ok: true, analysis_run: null };
+    const data = await exportSnapshot(dealId);
+    const txRes = await listDealTransactions(dealId);
+    let creditScoringInputs: Record<string, unknown> | null = null;
+    try {
+      creditScoringInputs = await getCreditScoringInputs(dealId);
+    } catch (e) {
+      console.error('getCreditScoringInputs failed on rehydrate:', e);
+    }
+    return {
+      ok: true,
+      analysis_run,
+      exportData: data,
+      rawTransactions: txRes.transactions as unknown as Array<Record<string, unknown>>,
+      creditScoringInputs,
+    };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
   }
-  return p;
 }
 
 function V1DealPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const queryClient = useQueryClient();
+  const [userId, setUserId] = useState<string | undefined>(undefined);
+  const urlDealId = searchParams.get('deal_id') ?? undefined;
 
   useEffect(() => {
     if (!supabase) { router.replace('/login'); return; }
@@ -110,24 +106,39 @@ function V1DealPageInner() {
       if (!session) { router.replace('/login'); return; }
       const email = session.user.email ?? '';
       if (email) setUserInitials(email.slice(0, 2).toUpperCase());
-      listDeals(session.user.id).then(r => setSidebarDeals(r.deals)).catch(() => {});
+      setUserId(session.user.id);
     });
   }, [router]);
 
+  // Reads the same ['deals', userId] cache the /deals dashboard populates —
+  // opening a deal from there doesn't re-fetch the sidebar list within staleTime.
+  const dealsListQuery = useDealsListQuery(userId);
+  useEffect(() => {
+    if (dealsListQuery.data) setSidebarDeals(dealsListQuery.data.deals);
+  }, [dealsListQuery.data]);
+
   // Pre-load deal from URL param (set by /deals/new)
   useEffect(() => {
-    const urlDealId = searchParams.get('deal_id');
     if (!urlDealId || deal) return;
     setDeal({ id: urlDealId });
-    void refreshBatchUploadCount(urlDealId);
-    // Initial setDeal above only has `id` (from the URL param) — rehydrate the
-    // rest of the row (name, currency, etc.) from the backend so an existing
-    // deal opened by URL isn't missing fields a freshly-created deal already has.
-    getDeal(urlDealId)
-      .then(({ deal: fullDeal }) => setDeal((prev) => (prev ? { ...prev, ...fullDeal } : fullDeal)))
-      .catch((e) => console.error('getDeal failed:', e));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams]);
+  }, [urlDealId]);
+
+  // Initial setDeal above only has `id` (from the URL param) — rehydrate the
+  // rest of the row (name, currency, etc.) from the shared ['deal', id] cache,
+  // the same one the dashboard already populated, so a deal opened from there
+  // reads from cache instead of re-fetching within staleTime.
+  const dealDetailQuery = useDealDetailQuery(urlDealId);
+  useEffect(() => {
+    const fullDeal = dealDetailQuery.data?.deal;
+    if (fullDeal) setDeal((prev) => (prev ? { ...prev, ...fullDeal } : fullDeal));
+  }, [dealDetailQuery.data]);
+
+  // Same for the document list — shares ['documents', id] with the dashboard.
+  const dealDocumentsQuery = useDealDocumentsQuery(urlDealId);
+  useEffect(() => {
+    if (dealDocumentsQuery.data) setDealDocuments(dealDocumentsQuery.data.documents);
+  }, [dealDocumentsQuery.data]);
 
   const [file, setFile] = useState<File | null>(null);
   const [currency, setCurrency] = useState<string | null>(null);
@@ -215,13 +226,17 @@ function V1DealPageInner() {
       try {
         const { documents } = await listDocuments(id);
         setDealDocuments(documents);
+        // Keep the shared ['documents', id] cache in sync with this imperative
+        // read (post-upload/delete, polling) so navigating back to /deals reads
+        // fresh data from cache instead of re-fetching.
+        queryClient.setQueryData(dealDocumentsKey(id), { documents });
         return documents;
       } catch {
         setDealDocuments([]);
         return undefined;
       }
     },
-    [deal]
+    [deal, queryClient]
   );
 
   const loadAuditedFinancials = useCallback(async (dealIdOverride?: string) => {
@@ -237,9 +252,8 @@ function V1DealPageInner() {
 
   useEffect(() => {
     if (!deal?.id) return;
-    void refreshBatchUploadCount();
     void loadAuditedFinancials();
-  }, [deal?.id, refreshBatchUploadCount, loadAuditedFinancials]);
+  }, [deal?.id, loadAuditedFinancials]);
 
   // Rehydrate the Analysis tab from an existing run when a deal is (re)opened.
   // analysisState/exportData are pure client state — without this, reloading a
@@ -254,41 +268,45 @@ function V1DealPageInner() {
   // value — every UI surface that used to key off 'idle' to mean "no
   // analysis" must never see that state before this effect has conclusively
   // resolved one way or another. Real fetch work is delegated to
-  // getOrFetchRehydration (module-scoped, keyed by dealId) so a genuine
+  // queryClient.fetchQuery under ['rehydration', dealId] so a genuine
   // double-mount on a cold navigation shares one fetch chain instead of
-  // racing two — this effect just applies the shared result to local state,
-  // and the two state updates below happen back-to-back with no intervening
+  // racing two, and a later revisit within staleTime reads the cached result
+  // instead of re-issuing /export, /transactions and /credit-scoring-inputs —
+  // this effect just applies the (possibly cached) result to local state, and
+  // the two state updates below happen back-to-back with no intervening
   // await, so React batches them into a single render (no transient
   // "run truthy but analysisState still checking" flash either).
   useEffect(() => {
     if (!deal?.id || analysisState !== 'checking') return;
     const dealId = deal.id;
     let cancelled = false;
-    getOrFetchRehydration(dealId).then((result) => {
-      if (cancelled) return;
-      if (!result.ok) {
-        console.error('Rehydration failed:', result.message);
-        setErrorMsg("Could not check this deal's analysis status (a temporary network or server issue). If analysis already completed, your results are safe — retry to check again.");
-        setAnalysisState('error');
-        return;
-      }
-      if (!result.analysis_run) {
-        setAnalysisState('idle');
-        return;
-      }
-      setExportData(result.exportData!);
-      setRawTransactions(result.rawTransactions ?? []);
-      if (result.creditScoringInputs) setCreditScoringInputs(result.creditScoringInputs);
-      setAnalysisState('done');
-    });
+    queryClient
+      .fetchQuery({ queryKey: rehydrationKey(dealId), queryFn: () => fetchRehydration(dealId) })
+      .then((result) => {
+        if (cancelled) return;
+        if (!result.ok) {
+          console.error('Rehydration failed:', result.message);
+          setErrorMsg("Could not check this deal's analysis status (a temporary network or server issue). If analysis already completed, your results are safe — retry to check again.");
+          setAnalysisState('error');
+          return;
+        }
+        if (!result.analysis_run) {
+          setAnalysisState('idle');
+          return;
+        }
+        setExportData(result.exportData!);
+        setRawTransactions(result.rawTransactions ?? []);
+        if (result.creditScoringInputs) setCreditScoringInputs(result.creditScoringInputs);
+        setAnalysisState('done');
+      });
     return () => { cancelled = true; };
-  }, [deal?.id, analysisState]);
+  }, [deal?.id, analysisState, queryClient]);
 
   const retryRehydrate = useCallback(() => {
-    if (deal?.id) rehydrationPromises.delete(deal.id);
+    if (deal?.id) queryClient.removeQueries({ queryKey: rehydrationKey(deal.id) });
     setErrorMsg('');
     setAnalysisState('checking');
-  }, [deal?.id]);
+  }, [deal?.id, queryClient]);
 
   // PAR-91: land on Analysis (not Documents) by default for a deal that
   // already has completed results — Documents is for adding new files, not
@@ -478,6 +496,55 @@ function V1DealPageInner() {
     };
   }, [deal?.id, statementQueueHasProcessing]);
 
+  // PAR-242: unlike the polling effect above (which only runs while this
+  // browser session is actively watching an in-flight upload), Musa's
+  // ingestion runs asynchronously with no live session to notice — PAR-62's
+  // pipeline already writes a parser_requests row and fires an internal
+  // notification the moment it detects an unrecognized format, but until
+  // now there was no signal in the app itself, only the 24h SLA sweep
+  // silently retrying in the background. Check once whenever a user opens
+  // this deal, and reuse the same UnknownParserModal prompt already built
+  // for direct-upload failures instead of building a second UI for this.
+  const checkedMusaRequests = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!deal?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { parser_requests } = await listPendingParserRequests(deal.id);
+        if (cancelled || parser_requests.length === 0) return;
+        const first = parser_requests.find((r) => !checkedMusaRequests.current.has(r.id));
+        if (!first) return;
+        checkedMusaRequests.current.add(first.id);
+        // Don't steal focus from an already-open direct-upload prompt.
+        setUnknownParserDoc((prev) =>
+          prev
+            ? prev
+            : {
+                docId: first.id,
+                // PAR-62 never stores a friendly filename on this row, only
+                // the original (signed, not human-readable) download URL —
+                // shown as-is rather than guessed at.
+                fileName: first.document_url || 'A document submitted via Musa',
+                errorMessage: first.error_message || 'Bank format not recognised',
+                source: 'musa',
+              }
+        );
+        // bank_name is only ever set here if a prior session already
+        // confirmed it via this same flow (PATCH below) -- pre-fill when
+        // known, leave blank (never guessed) otherwise.
+        if (first.bank_name) {
+          setParserRequestForm((p) => (p.bankName ? p : { ...p, bankName: first.bank_name as string }));
+        }
+      } catch {
+        // best-effort — this must never block the rest of the deal page
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deal?.id]);
+
   const runAnalysis = async () => {
     setErrorMsg('');
     try {
@@ -566,20 +633,38 @@ function V1DealPageInner() {
       setOverridesList([]);
       await refreshBatchUploadCount(activeDeal.id);
       const txRes = await listDealTransactions(activeDeal.id);
-      setRawTransactions(txRes.transactions as unknown as Array<Record<string, unknown>>);
+      const rawTx = txRes.transactions as unknown as Array<Record<string, unknown>>;
+      setRawTransactions(rawTx);
       try {
         const mcRes = await getMonthlyCashflow(activeDeal.id);
         setMonthlyCashflow(mcRes.monthly_cashflow as unknown as Array<Record<string, unknown>>);
       } catch (e) {
         console.error('getMonthlyCashflow failed after export:', e);
       }
+      let csi: Record<string, unknown> | null = null;
       try {
-        const csiRes = await getCreditScoringInputs(activeDeal.id);
-        setCreditScoringInputs(csiRes);
+        csi = await getCreditScoringInputs(activeDeal.id);
+        setCreditScoringInputs(csi);
       } catch (e) {
         console.error('getCreditScoringInputs failed after export:', e);
       }
       setAnalysisState('done');
+      // Seed the rehydration cache with what we just fetched so a later revisit
+      // (this session or after a reload) reads it from cache instead of
+      // re-issuing /export, /transactions and /credit-scoring-inputs.
+      const rehydrationResult: RehydrationResult = {
+        ok: true,
+        analysis_run: data.analysis_run,
+        exportData: data,
+        rawTransactions: rawTx,
+        creditScoringInputs: csi,
+      };
+      queryClient.setQueryData(rehydrationKey(activeDeal.id), rehydrationResult);
+      // A run changes deal status/pipeline stage — refresh the detail cache and
+      // the dashboard list (which reads the same status) instead of leaving
+      // them stale for the rest of the (now unbounded) cache lifetime.
+      queryClient.invalidateQueries({ queryKey: dealDetailKey(activeDeal.id) });
+      queryClient.invalidateQueries({ queryKey: dealsListKey(userId) });
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : 'Analysis failed');
       setAnalysisState('error');
@@ -611,6 +696,13 @@ function V1DealPageInner() {
       setOverrideNote('');
       setOverrideSuccess('Override saved — analysis updated.');
       setTimeout(() => setOverrideSuccess(''), 4000);
+      // An override can shift entity classification, so everything derived
+      // from it (rehydration snapshot, needs-review queue, reconciliation) is
+      // now stale — mark it so the next read refetches instead of serving a
+      // pre-override cache.
+      queryClient.invalidateQueries({ queryKey: rehydrationKey(deal.id) });
+      queryClient.invalidateQueries({ queryKey: ['needsReview', deal.id] });
+      queryClient.invalidateQueries({ queryKey: ['reconciliation', deal.id] });
     } catch (e) {
       setOverrideError(e instanceof Error ? e.message : 'Override failed');
     } finally {
@@ -670,6 +762,10 @@ function V1DealPageInner() {
       setAnalysisState('done');
       setExportSuccess('Snapshot saved. PDF downloading.');
       setTimeout(() => setExportSuccess(''), 5000);
+      // Re-export writes a fresh snapshot server-side — invalidate so a later
+      // revisit refetches instead of serving the pre-export cache.
+      queryClient.invalidateQueries({ queryKey: rehydrationKey(deal.id) });
+      queryClient.invalidateQueries({ queryKey: dealDetailKey(deal.id) });
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed');
       setAnalysisState('done');
@@ -678,26 +774,36 @@ function V1DealPageInner() {
 
   // handleAsk — moved to ParityReviewChat component
 
-  // Load needs-review items when analysis completes
+  // Load needs-review items when analysis completes. Shares the ['needsReview', dealId]
+  // cache with ReviewQueue.tsx — a revisit within staleTime reads from cache, and
+  // resolving an item there invalidates this key so the next read is fresh.
   useEffect(() => {
     if (analysisState === 'done' && deal?.id) {
-      getNeedsReview(deal.id).then((res) => setNeedsReviewItems(res.transactions as unknown as Array<Record<string, unknown>>)).catch(() => {});
+      const dealId = deal.id;
+      queryClient
+        .fetchQuery({ queryKey: ['needsReview', dealId], queryFn: () => getNeedsReview(dealId) })
+        .then((res) => setNeedsReviewItems(res.transactions as unknown as Array<Record<string, unknown>>))
+        .catch(() => {});
       if (monthlyCashflow.length === 0) {
-        getMonthlyCashflow(deal.id)
+        getMonthlyCashflow(dealId)
           .then((r) => setMonthlyCashflow(r.monthly_cashflow as unknown as Array<Record<string, unknown>>))
           .catch((e) => console.error('useEffect getMonthlyCashflow failed:', e));
       }
     }
-  }, [analysisState, deal?.id]);
+  }, [analysisState, deal?.id, queryClient]);
 
-  // Load fiscal-year reconciliation breakdown when analysis completes and audited financials exist
+  // Load fiscal-year reconciliation breakdown when analysis completes and audited
+  // financials exist. Cached under ['reconciliation', dealId] so a revisit within
+  // staleTime doesn't re-hit the backend.
   useEffect(() => {
     if (analysisState === 'done' && deal?.id && auditedFinancialsList.length > 0) {
-      getReconciliation(deal.id)
+      const dealId = deal.id;
+      queryClient
+        .fetchQuery({ queryKey: ['reconciliation', dealId], queryFn: () => getReconciliation(dealId) })
         .then((r) => setReconciliationDetail(r.reconciliation))
         .catch((e) => console.error('getReconciliation failed:', e));
     }
-  }, [analysisState, deal?.id, auditedFinancialsList.length]);
+  }, [analysisState, deal?.id, auditedFinancialsList.length, queryClient]);
 
   // parityInputInteracted, proactive analysis trigger — moved to ParityReviewChat
 
@@ -705,40 +811,54 @@ function V1DealPageInner() {
     if (!unknownParserDoc || !parserRequestForm.bankName.trim()) return;
     setParserRequestSubmitting(true);
     try {
-      // 1. Persist to Supabase (existing behaviour)
-      const sbClient = supabase;
-      if (sbClient) {
-        await (sbClient as any).from('pds_parser_requests').insert({
-          deal_id: deal?.id ?? null,
-          document_id: unknownParserDoc.docId,
-          original_filename: unknownParserDoc.fileName,
-          bank_name: parserRequestForm.bankName.trim(),
-          country: parserRequestForm.country,
-          account_type: parserRequestForm.accountType,
-          notes: parserRequestForm.notes.trim() || null,
-          error_type: 'InvalidSchemaError',
-          error_message: unknownParserDoc.errorMessage,
-        });
-      }
+      if (unknownParserDoc.source === 'musa') {
+        // PAR-62 already auto-inserted this row into parser_requests the
+        // moment Musa's ingestion detected the unrecognized format — enrich
+        // it in place (bank name confirmed by the deal's user) rather than
+        // inserting a second row for the same failure.
+        if (deal?.id) {
+          await enrichParserRequest(deal.id, unknownParserDoc.docId, {
+            bank_name: parserRequestForm.bankName.trim(),
+            notes: parserRequestForm.notes.trim() || undefined,
+          }).catch(() => {/* best-effort — still show confirmation below */});
+        }
+      } else {
+        // Direct-upload path (existing behaviour): fresh pds_parser_requests row.
+        const sbClient = supabase;
+        if (sbClient) {
+          await (sbClient as any).from('pds_parser_requests').insert({
+            deal_id: deal?.id ?? null,
+            document_id: unknownParserDoc.docId,
+            original_filename: unknownParserDoc.fileName,
+            bank_name: parserRequestForm.bankName.trim(),
+            country: parserRequestForm.country,
+            account_type: parserRequestForm.accountType,
+            notes: parserRequestForm.notes.trim() || null,
+            error_type: 'InvalidSchemaError',
+            error_message: unknownParserDoc.errorMessage,
+          });
+        }
 
-      // 2. Send email notification (best-effort — don't block on failure)
-      fetch('/api/request-parser', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bank_name: parserRequestForm.bankName.trim(),
-          country: parserRequestForm.country,
-          account_type: parserRequestForm.accountType,
-          notes: parserRequestForm.notes.trim() || '',
-          deal_id: deal?.id ?? '',
-          document_id: unknownParserDoc.docId,
-          original_filename: unknownParserDoc.fileName,
-        }),
-      }).catch(() => {/* silently ignore email errors */});
+        // Email notification only for the direct path — Musa's row already
+        // fired its own notification at detection time (musa_file_processor.py).
+        fetch('/api/request-parser', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bank_name: parserRequestForm.bankName.trim(),
+            country: parserRequestForm.country,
+            account_type: parserRequestForm.accountType,
+            notes: parserRequestForm.notes.trim() || '',
+            deal_id: deal?.id ?? '',
+            document_id: unknownParserDoc.docId,
+            original_filename: unknownParserDoc.fileName,
+          }),
+        }).catch(() => {/* silently ignore email errors */});
+      }
 
       setParserRequestSubmitted(true);
     } catch {
-      setParserRequestSubmitted(true); // still show confirmation even if insert fails
+      setParserRequestSubmitted(true); // still show confirmation even if insert/enrich fails
     } finally {
       setParserRequestSubmitting(false);
     }
@@ -891,7 +1011,10 @@ function V1DealPageInner() {
               onRequestParser={setUnknownParserDoc}
               analysisState={analysisState}
               onBankDrop={handleBankDrop}
-              onRemoveStatement={(id) => setStatementQueue((prev) => prev.filter((q) => q.id !== id))}
+              onRemoveStatement={(id) => {
+                setStatementQueue((prev) => prev.filter((q) => q.id !== id));
+                if (deal) queryClient.invalidateQueries({ queryKey: dealDocumentsKey(deal.id) });
+              }}
               auditedFinancialsList={auditedFinancialsList}
               declarationType={declarationType}
               setDeclarationType={setDeclarationType}

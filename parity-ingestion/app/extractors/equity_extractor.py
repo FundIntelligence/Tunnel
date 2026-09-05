@@ -1155,7 +1155,7 @@ def _clean_clms_amount(raw: str) -> str:
     return cleaned
 
 
-def extract_equity_clms_pdf(file_path: str) -> ExtractionResult:
+def extract_equity_clms_pdf(source: Union[str, NormalizedDocument]) -> ExtractionResult:
     """Extract transactions from an Equity CLMS PDF statement.
 
     Uses coordinate-based word extraction.  Description words at
@@ -1166,13 +1166,22 @@ def extract_equity_clms_pdf(file_path: str) -> ExtractionResult:
       debit:   x0 < 460
       credit:  460 ≤ x0 < 520
       balance: x0 ≥ 520
+
+    `source` may be a raw path or an already-parsed `NormalizedDocument`
+    (PAR-216) -- when the router already parsed the file once for format
+    detection, reusing that same parse here (rather than a second
+    independent `pdfplumber.open()`) roughly halves both wall time and
+    peak memory on large statements. This was the actual root cause of a
+    real production OOM on a 451-page Equity CLMS file (2Gi container
+    limit, ~2076 MiB used) -- the file was being fully parsed twice.
     """
     transactions: List[RawTransaction] = []
     warnings: List[WarningItem] = []
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words()
+    with as_document(source) as doc:
+        file_path = doc.file_path
+        for page in doc.pages:
+            words = page.words
             if not words:
                 page.flush_cache()
                 continue

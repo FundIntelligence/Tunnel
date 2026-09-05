@@ -22,9 +22,10 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
+from fastapi import HTTPException
 
 from ..db.supabase_client import get_supabase
 from ..db.supabase_repositories import (
@@ -40,6 +41,7 @@ from ..db.supabase_repositories import (
 )
 from ..ingestion.service import IngestionService
 from .currency_utils import country_to_currency
+from .musa_deploy_config import API_BASE_URL, PARITY_FRONTEND_URL
 
 logger = logging.getLogger(__name__)
 
@@ -110,14 +112,24 @@ def _run_export(deal_id: str, created_by: str) -> dict:
 
     overrides = list(overrides_repo.list_overrides(deal_id))
 
+    # PAR-238: same fix as api.py's export() — read accrual figures from the
+    # confirmed pds_audited_financials record, not the disconnected
+    # deal.accrual_* fields (set once at deal-creation, never updated when
+    # financials are confirmed afterward). This MUSA-triggered path is a
+    # second, independent call site for run_pipeline() with the exact same
+    # bug, so it needs the identical fix — leaving it unfixed would mean
+    # MUSA-driven exports keep hitting NOT_RUN after the primary export path
+    # is fixed, which defeats the point of moving to a single source of truth.
+    from ..db.supabase_repositories import AuditedFinancialsRepo
+    confirmed_af = AuditedFinancialsRepo().get_latest_confirmed(deal_id)
     run, links, entities, txn_map = run_pipeline(
         deal_id=deal_id,
         raw_transactions=raw,
         overrides=overrides,
         accrual={
-            "accrual_revenue_cents": deal.get("accrual_revenue_cents"),
-            "accrual_period_start": deal.get("accrual_period_start"),
-            "accrual_period_end": deal.get("accrual_period_end"),
+            "accrual_revenue_cents": confirmed_af.get("turnover_cents") if confirmed_af else None,
+            "accrual_period_start": confirmed_af.get("financial_year_start") if confirmed_af else None,
+            "accrual_period_end": confirmed_af.get("financial_year_end") if confirmed_af else None,
         },
     )
 
@@ -184,12 +196,19 @@ async def _send_webhook(
     error_message: Optional[str] = None,
     created_at: Optional[str] = None,
     completed_at: Optional[str] = None,
+    is_retry: bool = False,
+    resend_count: int = 0,
 ) -> None:
     """
     POST the unified SessionResponse payload to Musa's webhook endpoint.
 
     Payload shape is IDENTICAL to GET /status response so Musa can use
-    the same deserialisation logic for both polling and push.
+    the same deserialisation logic for both polling and push, plus two
+    extra fields (PAR-174): is_retry / resend_count. Every call from
+    process_musa_session leaves is_retry at its False default — only a
+    manual admin resend (resend_webhook_for_session, below) passes True —
+    so Musa can unambiguously tell an original delivery from a replay and
+    never mistake a resend for a second, distinct event.
     """
     webhook_url = os.getenv("MUSA_WEBHOOK_URL")
     webhook_token = os.getenv("MUSA_WEBHOOK_AUTH_TOKEN")
@@ -210,24 +229,152 @@ async def _send_webhook(
         "error_message": error_message,
         "created_at": created_at,
         "completed_at": completed_at,
+        "is_retry": is_retry,
+        "resend_count": resend_count,
     }
     headers = {
-        "Authorization": f"Bearer {webhook_token}",
+        "x-api-key": webhook_token,
         "Content-Type": "application/json",
     }
+    status_code: Optional[int] = None
+    delivery_error: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(webhook_url, json=payload, headers=headers)
+        status_code = resp.status_code
         if resp.status_code == 200:
             logger.info("[MUSA] Webhook delivered session=%s", session_id)
         else:
+            delivery_error = f"non-200 status {resp.status_code}: {resp.text[:200]}"
             logger.error(
                 "[MUSA] Webhook non-200 session=%s status=%d body=%s",
                 session_id, resp.status_code, resp.text[:200],
             )
     except Exception as exc:
         # Never raise — Musa has status polling as fallback
+        delivery_error = str(exc)[:500]
         logger.error("[MUSA] Webhook exception session=%s: %s", session_id, exc)
+
+    # PAR-174: persist the outcome of this attempt so the admin UI can show
+    # *why* a webhook needs resending instead of only a log line no one
+    # sees. Best-effort — a failure here must not affect Musa's delivery
+    # (already sent above) or bubble up past this function.
+    try:
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        if status_code == 200:
+            # webhook_delivered_at (set below) is deliberately "most recent
+            # success" — every resend overwrites it, which is the behaviour the
+            # admin UI wants and which existing tests pin. The side effect is
+            # that the FIRST delivery time is destroyed by the first resend, so
+            # stamp it once into its own column here.
+            #
+            # The .is_(..., "null") filter IS the once-only guard: the first
+            # successful delivery matches and writes, every later one matches
+            # zero rows and is a no-op. Done as its own statement rather than
+            # reading the row first and deciding in Python — _send_webhook has
+            # no prior row state in scope on either call path, so that would
+            # mean an extra round-trip AND a read-then-write race. Runs before
+            # the main persist so the outcome write below stays the last word.
+            get_supabase().table("musa_sessions").update(
+                {"webhook_first_delivered_at": attempted_at}
+            ).eq("session_id", session_id).is_(
+                "webhook_first_delivered_at", "null"
+            ).execute()
+
+        update_fields = {
+            "webhook_last_status_code": status_code,
+            "webhook_last_attempted_at": attempted_at,
+            "webhook_last_error": delivery_error,
+        }
+        if status_code == 200:
+            update_fields["webhook_delivered_at"] = attempted_at
+        if is_retry:
+            update_fields["webhook_resend_count"] = resend_count
+        get_supabase().table("musa_sessions").update(update_fields).eq(
+            "session_id", session_id
+        ).execute()
+    except Exception:
+        logger.exception(
+            "[MUSA] Failed to persist webhook delivery status session=%s", session_id
+        )
+
+
+async def resend_webhook_for_session(session_id: str, base_url: Optional[str] = None) -> dict:
+    """
+    Manually re-deliver the webhook for an already-completed Musa session
+    (PAR-174 Phase 1 — admin-triggered only; no automatic retry/backoff
+    logic here, that's explicitly out of scope for this phase).
+
+    Resending a session whose webhook already succeeded is allowed, not
+    blocked. An admin choosing to resend is inherently a deliberate,
+    infrequent action (e.g. Musa reports losing the original payload), and
+    the is_retry/resend_count fields on the payload make every resend
+    unambiguously a replay on Musa's side regardless of the prior outcome
+    — that's what makes it safe to allow rather than a case to guard
+    against by blocking it. A session that never finished processing
+    (status="processing") IS blocked, since there is nothing coherent to
+    resend yet.
+    """
+    supabase = get_supabase()
+    result = (
+        supabase.table("musa_sessions")
+        .select("*")
+        .eq("session_id", session_id)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = rows[0]
+    status = session["status"]
+    if status == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="Session is still processing — nothing to resend yet",
+        )
+
+    resolved_base_url = base_url or API_BASE_URL
+    status_url = f"{resolved_base_url}/api/musa/sessions/{session_id}/status"
+
+    deal_id = session.get("deal_id")
+    pdf_url = None
+    if status == "complete" and deal_id:
+        pdf_url = f"{API_BASE_URL}/v1/deals/{deal_id}/snapshot/pdf"
+
+    resend_count = int(session.get("webhook_resend_count") or 0) + 1
+
+    await _send_webhook(
+        session_id=session_id,
+        venture_name=session["venture_name"],
+        venture_country=session.get("venture_country", ""),
+        status=status,
+        status_url=status_url,
+        pdf_url=pdf_url,
+        error_message=session.get("error_message"),
+        created_at=session.get("created_at"),
+        completed_at=session.get("completed_at"),
+        is_retry=True,
+        resend_count=resend_count,
+    )
+
+    refreshed = (
+        supabase.table("musa_sessions")
+        .select("webhook_last_status_code, webhook_delivered_at, webhook_resend_count")
+        .eq("session_id", session_id)
+        .execute()
+    )
+    refreshed_rows = refreshed.data or []
+    refreshed_row = refreshed_rows[0] if refreshed_rows else {}
+
+    return {
+        "session_id": session_id,
+        "status": status,
+        "is_retry": True,
+        "resend_count": refreshed_row.get("webhook_resend_count", resend_count),
+        "webhook_status_code": refreshed_row.get("webhook_last_status_code"),
+        "webhook_delivered": refreshed_row.get("webhook_delivered_at") is not None,
+    }
 
 
 def _persist_raw_document(
@@ -299,9 +446,30 @@ async def _record_unrecognized_document(
         logger.exception(
             "[MUSA] Failed to insert parser_requests row session=%s", session_id
         )
+
+    # PAR-242: pre-fill what's already resolvable at this exact point in the
+    # flow (the deal record) rather than asking anyone to retype it. Only the
+    # deal's own name/company_name is available here — no separate org/account
+    # table with a registration or contact email exists for a Musa-originated
+    # deal at this point (the deal's `created_by`/`user_id` links to `profiles`,
+    # but Musa-created deals frequently have no signed-in Parity user attached,
+    # so that lookup would silently return nothing for the common case; not
+    # guessed at). Best-effort: a lookup failure must not block the existing
+    # parser_requests insert/notify above.
+    deal_name: Optional[str] = None
+    try:
+        deal = DealsRepo().get_deal(deal_id)
+        if deal:
+            deal_name = deal.get("company_name") or deal.get("name")
+    except Exception:
+        logger.exception(
+            "[MUSA] Failed to look up deal for parser-request pre-fill deal_id=%s", deal_id
+        )
+
     await _notify_parser_request(
         session_id=session_id,
         deal_id=deal_id,
+        deal_name=deal_name,
         venture_country=venture_country,
         document_url=document_url,
         error_message=error_message,
@@ -314,6 +482,7 @@ async def _notify_parser_request(
     venture_country: str,
     document_url: Optional[str],
     error_message: str,
+    deal_name: Optional[str] = None,
 ) -> None:
     """
     Email the team that a Musa file failed with an unsupported/unparseable
@@ -323,11 +492,15 @@ async def _notify_parser_request(
     pds_parser_requests insert (this path already wrote to parser_requests
     directly, just above) and the email is the only thing left to do here.
 
+    deal_name (PAR-242): whatever was resolvable from the deal record at the
+    detection point (see caller) — passed through so the notification names
+    the actual deal, not just its opaque UUID. None when not resolvable;
+    the frontend/email template renders that as "—", not a guess.
+
     Best-effort only: this must never affect musa_sessions state or the
     webhook Musa actually depends on.
     """
-    frontend_url = os.getenv("PARITY_FRONTEND_URL", "https://parity-sme-staging.vercel.app")
-    notify_url = f"{frontend_url.rstrip('/')}/api/request-parser"
+    notify_url = f"{PARITY_FRONTEND_URL}/api/request-parser"
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -339,6 +512,7 @@ async def _notify_parser_request(
                     "country": venture_country,
                     "notes": error_message,
                     "deal_id": deal_id,
+                    "deal_name": deal_name,
                     "original_filename": document_url,
                 },
             )
@@ -380,6 +554,12 @@ async def process_musa_session(
         "[MUSA] Processing started session=%s deal=%s docs=%d",
         session_id, deal_id, len(documents),
     )
+
+    # PAR-200: declared before anything in the try below can raise, so the
+    # outer except (a genuine setup-phase failure, e.g. get_supabase()
+    # itself failing) can always reference it safely rather than risking a
+    # NameError masked as a "failed to persist" log line.
+    document_failures: List[Dict[str, Any]] = []
 
     try:
         supabase = get_supabase()
@@ -462,13 +642,73 @@ async def process_musa_session(
                     file_type=file_type,
                     deal_currency=deal_currency,
                 )
-                succeeded_count += 1
+
+                # PAR-200: process_document_background never raises on a
+                # genuine per-document parse failure — it catches every
+                # exception internally (CurrencyMismatchError,
+                # InvalidSchemaError, IngestionTimeoutError, and a trailing
+                # bare Exception) and records the real outcome on the
+                # document's own row via _update_failed(). Its return type
+                # is -> None either way, so a clean return here does NOT
+                # mean success. Query the row it just wrote instead of
+                # assuming one — this is the actual bug: succeeded_count
+                # used to increment unconditionally at this point.
+                doc_rows = docs_repo.select_eq("id", document_id)
+                doc_row = doc_rows[0] if doc_rows else {}
+                doc_status = doc_row.get("status")
+
+                if doc_status == "completed":
+                    succeeded_count += 1
+                else:
+                    doc_next_action = doc_row.get("next_action")
+                    doc_error_message = doc_row.get("error_message") or (
+                        f"Document ended in status={doc_status!r} with no "
+                        f"recorded error_message"
+                    )
+                    document_failures.append({
+                        "filename": file_name or url,
+                        "error_type": doc_row.get("error_type"),
+                        "error_message": doc_error_message,
+                        "next_action": doc_next_action,
+                    })
+                    # Same request_parser vs. everything-else split the old
+                    # except-block below used, now driven by the real
+                    # next_action _update_failed already computed (it
+                    # already distinguishes unsupported-format from
+                    # currency/CSV/timeout issues) instead of re-guessing
+                    # from exception text that was never reachable here.
+                    if doc_next_action == "request_parser":
+                        unrecognized_count += 1
+                        await _record_unrecognized_document(
+                            session_id=session_id,
+                            deal_id=deal_id,
+                            venture_country=venture_country,
+                            document_url=url,
+                            file_bytes=file_bytes,
+                            file_name=file_name,
+                            error_message=doc_error_message,
+                        )
+                    elif other_failure is None:
+                        other_failure = RuntimeError(doc_error_message)
 
             except Exception as doc_exc:
+                # Unlike the branch above, this except block catches a
+                # genuine exception from the orchestrator's OWN code around
+                # process_document_background (e.g. _download_file network
+                # errors, docs_repo.create_document failing) — not a parse
+                # failure, since that path never raises here (see above).
+                # Unreachable for parse/format failures; kept for these
+                # real, different failure modes, unchanged in behavior.
                 logger.warning(
                     "[MUSA] doc %d/%d failed session=%s url=%.60s: %s",
                     i + 1, len(documents), session_id, url, doc_exc,
                 )
+                document_failures.append({
+                    "filename": file_name or url,
+                    "error_type": doc_exc.__class__.__name__,
+                    "error_message": str(doc_exc),
+                    "next_action": None,
+                })
                 doc_error_str = str(doc_exc).lower()
                 if "no transactions" in doc_error_str or "unsupported" in doc_error_str:
                     unrecognized_count += 1
@@ -494,7 +734,20 @@ async def process_musa_session(
             # each already recorded above (parser_requests + sample +
             # notify). Defer the whole session to the SLA sweep exactly
             # like the single-document case (PAR-62) — no immediate
-            # failure webhook.
+            # failure webhook. status/completed_at deliberately untouched
+            # (still "processing") — that timing is PAR-62's design, not
+            # changed here. PAR-200: still write the real per-document
+            # detail now, purely additive, so the admin UI has something
+            # during the 24h window instead of nothing until force-close.
+            if document_failures:
+                try:
+                    supabase.table("musa_sessions").update(
+                        {"document_failures": document_failures}
+                    ).eq("session_id", session_id).execute()
+                except Exception:
+                    logger.exception(
+                        "[MUSA] Failed to persist document_failures session=%s", session_id
+                    )
             logger.info(
                 "[MUSA] session=%s all %d document(s) deferred to 24h SLA window",
                 session_id, len(documents),
@@ -518,11 +771,19 @@ async def process_musa_session(
             )
 
         supabase.table("musa_sessions").update(
-            {"status": "complete", "completed_at": completed_at, "error_message": partial_note}
+            {
+                "status": "complete",
+                "completed_at": completed_at,
+                "error_message": partial_note,
+                # PAR-200: real per-document reasons behind partial_note's
+                # count, not just the count itself. None (not []) when
+                # nothing failed, so a fully-successful session reads as
+                # "no failure detail" rather than "checked, found none".
+                "document_failures": document_failures or None,
+            }
         ).eq("session_id", session_id).execute()
 
-        base_url = os.getenv("API_BASE_URL", "https://parity-ingestion.onrender.com")
-        pdf_url = f"{base_url}/v1/deals/{deal_id}/snapshot/pdf"
+        pdf_url = f"{API_BASE_URL}/v1/deals/{deal_id}/snapshot/pdf"
 
         logger.info(
             "[MUSA] Session complete session=%s pdf_url=%s partial=%s",
@@ -570,6 +831,12 @@ async def process_musa_session(
                     "status": "failed",
                     "completed_at": completed_at,
                     "error_message": error_message,
+                    # PAR-200: real per-document reasons, if this failure
+                    # came from the loop (other_failure re-raised, or
+                    # request_parser-classified documents that still left
+                    # the whole batch at 0 successes). Empty/undefined for
+                    # a genuine setup-phase failure before the loop ran.
+                    "document_failures": document_failures or None,
                 }
             ).eq("session_id", session_id).execute()
         except Exception:

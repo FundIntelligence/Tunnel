@@ -1,9 +1,35 @@
+# CONFIRMED (2026-08-31, via `gcloud run services list`/`describe`):
+# parity-ingestion is a single shared Cloud Run service -- parity-backend
+# (staging) and parity-backend-prod both call it (via two different URL
+# spellings for the identical service/revision). There is no -staging/-prod
+# split for this service, unlike backend/'s separate cloudbuild-staging.yaml
+# / cloudbuild-prod.yaml. Any change here is accepted as affecting both
+# environments -- see PAR-216 and PAR-86 for the record of that decision.
+#
+# REGISTRY PATH FIX (2026-08-31, separate change from the timeout bump
+# below -- flagged distinctly on purpose, see PAR-86): the previous
+# `gcr.io/$PROJECT_ID/...` image path started failing on push
+# ("denied: gcr.io repo does not exist. Creating on push requires the
+# artifactregistry.repositories.createOnPush permission") even though it
+# had deployed successfully as recently as 2026-08-27 -- a live regression,
+# not something introduced by this change, most likely Google's ongoing
+# Container Registry -> Artifact Registry migration finally cutting off the
+# legacy gcr.io auto-create-on-push bridge for this project. Repointed at
+# the Artifact Registry Docker repo already provisioned for this service
+# (`parity-ingestion`, us-central1, created 2026-05-17, previously unused).
+#
+# TEMPORARY (PAR-216 follow-up, 2026-08-31): --timeout bumped 600 -> 900 to
+# unblock a large (451-page) Equity statement's ~159s local processing time
+# on production's more constrained resources. This is NOT a fix for PAR-216
+# (the real fix is eliminating the double-parse the ticket documents) --
+# revisit reverting this once that fix ships, since a fixed ingestion path
+# may not need the extra headroom at all.
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/parity-ingestion', '.']
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/parity-ingestion/parity-ingestion', '.']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/parity-ingestion']
+    args: ['push', 'us-central1-docker.pkg.dev/$PROJECT_ID/parity-ingestion/parity-ingestion']
 
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
@@ -11,13 +37,13 @@ steps:
       - run
       - deploy
       - parity-ingestion
-      - --image=gcr.io/$PROJECT_ID/parity-ingestion
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/parity-ingestion/parity-ingestion
       - --region=us-central1
       - --platform=managed
       - --memory=2Gi
       - --cpu=2
       - --allow-unauthenticated
-      - --timeout=600
+      - --timeout=900
       - --concurrency=10
       - --min-instances=0
       - --max-instances=3

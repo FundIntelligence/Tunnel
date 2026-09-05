@@ -138,6 +138,10 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
       if ((context as any)?.previous) queryClient.setQueryData(['needsReview', dealId], (context as any).previous)
       setError(err.message)
     },
+    // PAR-101: error is otherwise only ever set (validation branches, onError above),
+    // never cleared — so a stale "Reason note is required for 'Other'" banner from an
+    // earlier failed attempt survives every subsequent successful resolve indefinitely.
+    onSuccess: () => setError(''),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['needsReview', dealId] })
     },
@@ -242,7 +246,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
             <span style={{ fontSize: 11, color: 'var(--t2)' }}>Reason:</span>
             <select
               value={bulkReason}
-              onChange={(e) => setBulkReason(e.target.value as OverrideReasonCategory)}
+              onChange={(e) => { setBulkReason(e.target.value as OverrideReasonCategory); setError('') }}
               style={{ background: 'var(--s2)', border: `1px solid ${bulkReason ? 'var(--b1)' : 'var(--amber)'}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
             >
               <option value="">Select reason…</option>
@@ -260,7 +264,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
             <input
               type="text"
               value={bulkReasonNote}
-              onChange={(e) => setBulkReasonNote(e.target.value)}
+              onChange={(e) => { setBulkReasonNote(e.target.value); setError('') }}
               placeholder="Reason note (required for 'Other')"
               style={{ background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '5px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif" }}
             />
@@ -344,7 +348,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
               </div>
             )}
             {['DATE', 'DESCRIPTION', 'DR/CR', 'ROLE', 'AMOUNT'].map((h) => (
-              <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--b1)', letterSpacing: '0.1em' }}>{h}</span>
+              <span key={h} style={{ fontSize: 9, fontWeight: 700, color: 'var(--t2)', letterSpacing: '0.1em' }}>{h}</span>
             ))}
           </div>
         )}
@@ -364,6 +368,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                   setSelectedRole('supplier')
                   setSelectedReason('')
                   setReasonNote('')
+                  setError('')
                 }}
                 style={{
                   display: 'grid',
@@ -429,7 +434,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                     {OVERRIDE_REASON_OPTIONS.map((r) => (
                       <button
                         key={r.value}
-                        onClick={(e) => { e.stopPropagation(); setSelectedReason(r.value) }}
+                        onClick={(e) => { e.stopPropagation(); setSelectedReason(r.value); setError('') }}
                         style={{
                           padding: '5px 12px', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer',
                           background: selectedReason === r.value ? 'rgba(20,184,166,0.15)' : 'transparent',
@@ -446,7 +451,7 @@ function ReviewQueue({ dealId, analystInitials, onQueueUpdate }: Props) {
                     <input
                       type="text"
                       value={reasonNote}
-                      onChange={(e) => setReasonNote(e.target.value)}
+                      onChange={(e) => { setReasonNote(e.target.value); setError('') }}
                       onClick={(e) => e.stopPropagation()}
                       placeholder="Reason note (required for 'Other')"
                       style={{ width: '100%', boxSizing: 'border-box', background: 'var(--s2)', border: '1px solid var(--b1)', borderRadius: 4, padding: '6px 8px', fontSize: 11, color: 'var(--t1)', fontFamily: "'IBM Plex Sans', sans-serif", marginBottom: 12 }}

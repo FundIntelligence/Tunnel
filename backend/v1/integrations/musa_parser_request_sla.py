@@ -17,7 +17,6 @@ Runs hourly, started as a background asyncio task from main.py's lifespan
 """
 import asyncio
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +30,7 @@ from ..db.supabase_repositories import (
     RawTxRepo,
 )
 from ..ingestion.service import IngestionService
+from .musa_deploy_config import API_BASE_URL
 from .musa_file_processor import _run_export, _send_webhook
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def _parse_ts(value: str) -> datetime:
 
 
 def _base_url() -> str:
-    return os.getenv("API_BASE_URL", "https://parity-ingestion.onrender.com")
+    return API_BASE_URL
 
 
 def _get_musa_session(supabase, session_id: str) -> Optional[Dict[str, Any]]:
@@ -122,7 +122,7 @@ def _attempt_retry(supabase, row: Dict[str, Any]) -> bool:
         )
         _run_export(deal_id, _SERVICE_UUID)
     except Exception as exc:
-        logger.info(
+        logger.error(
             "[MUSA-SLA] Retry still failing request=%s deal=%s: %s",
             row.get("id"), deal_id, exc,
         )

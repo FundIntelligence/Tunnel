@@ -959,6 +959,43 @@ class TestParserRequestSlaSweep:
 # 6e. Partial-batch processing (PAR-61)
 # ===========================================================================
 
+class _FakeDocsRepo:
+    """
+    Minimal real-shaped stand-in for DocumentsRepo (PAR-200). The
+    orchestrator now queries the document's row via select_eq("id", ...)
+    right after process_document_background returns, to check its actual
+    resulting status — a bare MagicMock() silently "succeeds" at every
+    attribute/subscript access (MagicMock auto-configures magic methods
+    like __getitem__), which previously masked exactly this gap in tests.
+    This fake requires the row to genuinely exist and reflect whatever the
+    test's mocked process_document_background actually did.
+    """
+
+    def __init__(self):
+        self.rows: Dict[str, Dict[str, Any]] = {}
+
+    def create_document(self, row):
+        self.rows[row["id"]] = dict(row)
+        return row
+
+    def select_eq(self, column, value):
+        if column != "id":
+            return []
+        row = self.rows.get(value)
+        return [row] if row else []
+
+    def mark_completed(self, document_id):
+        self.rows[document_id]["status"] = "completed"
+
+    def mark_failed(self, document_id, *, error_type, error_message, next_action):
+        self.rows[document_id].update({
+            "status": "failed",
+            "error_type": error_type,
+            "error_message": error_message,
+            "next_action": next_action,
+        })
+
+
 class TestPartialBatchProcessing:
     def _mock_supabase(self):
         session_updates = []
@@ -996,16 +1033,24 @@ class TestPartialBatchProcessing:
         from v1.integrations.musa_file_processor import process_musa_session
 
         mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
 
         async def _fake_download(url, timeout=300):
             return b"raw-bytes"
 
         call_count = {"n": 0}
 
-        def _ingest_side_effect(*, file_name, **kwargs):
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
             call_count["n"] += 1
             if "bad" in file_name:
+                fake_docs_repo.mark_failed(
+                    document_id,
+                    error_type="InvalidSchemaError",
+                    error_message="Unsupported bank format — no recognisable transactions",
+                    next_action="request_parser",
+                )
                 raise ValueError("Unsupported bank format — no recognisable transactions")
+            fake_docs_repo.mark_completed(document_id)
             return None
 
         webhook_calls = []
@@ -1030,7 +1075,7 @@ class TestPartialBatchProcessing:
             AsyncMock(side_effect=_fake_download),
         ), patch(
             "v1.integrations.musa_file_processor.DocumentsRepo",
-            return_value=MagicMock(),
+            return_value=fake_docs_repo,
         ), patch(
             "v1.integrations.musa_file_processor.IngestionService.process_document_background",
             side_effect=_ingest_side_effect,
@@ -1190,6 +1235,278 @@ class TestPartialBatchProcessing:
         failed_updates = [u for u in session_updates if u.get("status") == "failed"]
         assert len(failed_updates) == 1
 
+
+# ===========================================================================
+# 6b. PAR-200: orchestrator consumes the REAL per-document outcome
+# ===========================================================================
+
+class TestOrchestratorConsumesRealDocumentOutcome:
+    """
+    PAR-200: process_document_background's real contract is `-> None` and it
+    NEVER raises for a genuine per-document parse failure -- it catches
+    everything internally (CurrencyMismatchError, InvalidSchemaError,
+    IngestionTimeoutError, and a trailing bare Exception) and records the
+    outcome on the document's own row via _update_failed(). These tests
+    simulate that REAL contract -- unlike TestPartialBatchProcessing above,
+    which mocks it as *raising*, a fictional premise that is exactly why the
+    real bug went uncaught by that test class. These fail against the
+    pre-fix orchestrator, which incremented succeeded_count unconditionally
+    right after the awaited call regardless of the document's real
+    resulting status.
+    """
+
+    def _mock_supabase(self):
+        session_updates = []
+        parser_request_inserts = []
+
+        def _fake_table(name):
+            tbl = MagicMock()
+            if name == "musa_sessions":
+                def _update(payload):
+                    session_updates.append(payload)
+                    return MagicMock(eq=MagicMock(
+                        return_value=MagicMock(execute=MagicMock(return_value=MagicMock()))
+                    ))
+                tbl.update.side_effect = _update
+            elif name == "parser_requests":
+                def _insert(row):
+                    parser_request_inserts.append(row)
+                    return MagicMock(execute=MagicMock(return_value=MagicMock()))
+                tbl.insert.side_effect = _insert
+            return tbl
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.side_effect = _fake_table
+        mock_supabase.storage.from_.return_value.upload.return_value = MagicMock()
+        return mock_supabase, session_updates, parser_request_inserts
+
+    def test_succeeded_count_reflects_real_status_not_clean_return(self, monkeypatch):
+        """
+        4 documents: 1 genuinely completes, 3 fail for 3 DIFFERENT real
+        reasons -- none of them ever raise. The pre-fix orchestrator would
+        have counted all 4 as succeeded_count and reported "4 of 4
+        processed successfully". The fix must report exactly 1 of 4, and
+        the two request_parser-classified failures must each produce their
+        own parser_requests row (PAR-125's previously-dead auto-request
+        path, confirmed reachable now that real failures are visible).
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import process_musa_session
+
+        mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
+
+        async def _fake_download(url, timeout=300):
+            return b"raw-bytes"
+
+        # Real per-document outcomes, applied to the fake repo exactly like
+        # the real process_document_background would -- write to the row,
+        # return None, never raise.
+        outcomes = {
+            "good.pdf": ("completed", None, None, None),
+            "unsupported_bank.pdf": (
+                "failed", "InvalidSchemaError",
+                "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+                "request_parser",
+            ),
+            "empty_statement.pdf": (
+                "failed", "InvalidSchemaError",
+                "No valid transactions extracted via parity-ingestion",
+                "request_parser",
+            ),
+            "wrong_currency.pdf": (
+                "failed", "CurrencyMismatchError",
+                "Statement currency USD does not match deal currency KES",
+                "fix_currency",
+            ),
+        }
+
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
+            status, error_type, error_message, next_action = outcomes[file_name]
+            if status == "completed":
+                fake_docs_repo.mark_completed(document_id)
+            else:
+                fake_docs_repo.mark_failed(
+                    document_id, error_type=error_type,
+                    error_message=error_message, next_action=next_action,
+                )
+            return None  # real contract: never raises
+
+        webhook_calls = []
+
+        async def _fake_send_webhook(**kwargs):
+            webhook_calls.append(kwargs)
+
+        documents = [{"url": f"https://example.com/signed/{name}"} for name in outcomes]
+
+        with patch(
+            "v1.integrations.musa_file_processor.get_supabase",
+            return_value=mock_supabase,
+        ), patch(
+            "v1.db.supabase_repositories.get_supabase",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._download_file",
+            AsyncMock(side_effect=_fake_download),
+        ), patch(
+            "v1.integrations.musa_file_processor.DocumentsRepo",
+            return_value=fake_docs_repo,
+        ), patch(
+            "v1.integrations.musa_file_processor.IngestionService.process_document_background",
+            side_effect=_ingest_side_effect,
+        ), patch(
+            "v1.integrations.musa_file_processor._run_export",
+            return_value={},
+        ), patch(
+            "v1.integrations.musa_file_processor._send_webhook",
+            AsyncMock(side_effect=_fake_send_webhook),
+        ), patch(
+            "v1.integrations.musa_file_processor._notify_parser_request",
+            AsyncMock(),
+        ):
+            asyncio.run(process_musa_session(
+                session_id="test-sid-real-outcome",
+                deal_id=str(uuid.uuid4()),
+                venture_name="Acme",
+                venture_country="Kenya",
+                documents=documents,
+                status_url="https://parity.io/status",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        complete_updates = [u for u in session_updates if u.get("status") == "complete"]
+        assert len(complete_updates) == 1, "session should complete (1 real success out of 4)"
+        assert "1 of 4 document(s) processed successfully" in (
+            complete_updates[0].get("error_message") or ""
+        ), complete_updates[0].get("error_message")
+
+        assert len(webhook_calls) == 1
+        assert webhook_calls[0]["status"] == "complete"
+
+        assert len(parser_request_inserts) == 2, (
+            "both request_parser-classified failures must each write their "
+            "own parser_requests row"
+        )
+        pr_messages = {row["error_message"] for row in parser_request_inserts}
+        assert pr_messages == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "No valid transactions extracted via parity-ingestion",
+        }, "parser_requests rows must carry the real, distinct per-document reasons"
+
+        doc_failures = complete_updates[0].get("document_failures")
+        assert doc_failures is not None and len(doc_failures) == 3, doc_failures
+        reasons = {f["error_message"] for f in doc_failures}
+        assert reasons == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "No valid transactions extracted via parity-ingestion",
+            "Statement currency USD does not match deal currency KES",
+        }, f"expected 3 distinct real reasons, got: {reasons}"
+        next_actions = {f["next_action"] for f in doc_failures}
+        assert next_actions == {"request_parser", "fix_currency"}
+
+    def test_all_documents_fail_for_distinct_reasons_session_gets_real_detail(self, monkeypatch):
+        """
+        The real-world shape from the June session (PAR-174/PAR-200): every
+        document fails, none raise, and the reasons are genuinely
+        different. Historically this collapsed into ONE generic
+        "No transactions for deal ... ingestion may have failed" message
+        with the real per-file reasons discarded. The fix must surface the
+        real, distinct reasons on the session record — additively, during
+        the 24h SLA window — even when nothing succeeds and PAR-62's
+        deferred-webhook timing stays unchanged.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import process_musa_session
+
+        mock_supabase, session_updates, parser_request_inserts = self._mock_supabase()
+        fake_docs_repo = _FakeDocsRepo()
+
+        async def _fake_download(url, timeout=300):
+            return b"raw-bytes"
+
+        outcomes = {
+            "not_a_bank_statement.pdf": (
+                "InvalidSchemaError",
+                "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+                "request_parser",
+            ),
+            "unsupported_bank.pdf": (
+                "InvalidSchemaError",
+                "415: Bank format not recognised by parity-ingestion.",
+                "request_parser",
+            ),
+            "empty_statement.pdf": (
+                "InvalidSchemaError",
+                "No valid transactions extracted via parity-ingestion",
+                "request_parser",
+            ),
+        }
+
+        def _ingest_side_effect(*, document_id, file_name, **kwargs):
+            error_type, error_message, next_action = outcomes[file_name]
+            fake_docs_repo.mark_failed(
+                document_id, error_type=error_type,
+                error_message=error_message, next_action=next_action,
+            )
+            return None
+
+        webhook_calls = []
+
+        async def _fake_send_webhook(**kwargs):
+            webhook_calls.append(kwargs)
+
+        documents = [{"url": f"https://example.com/signed/{name}"} for name in outcomes]
+
+        with patch(
+            "v1.integrations.musa_file_processor.get_supabase",
+            return_value=mock_supabase,
+        ), patch(
+            "v1.db.supabase_repositories.get_supabase",
+            return_value=MagicMock(),
+        ), patch(
+            "v1.integrations.musa_file_processor._download_file",
+            AsyncMock(side_effect=_fake_download),
+        ), patch(
+            "v1.integrations.musa_file_processor.DocumentsRepo",
+            return_value=fake_docs_repo,
+        ), patch(
+            "v1.integrations.musa_file_processor.IngestionService.process_document_background",
+            side_effect=_ingest_side_effect,
+        ), patch(
+            "v1.integrations.musa_file_processor._send_webhook",
+            AsyncMock(side_effect=_fake_send_webhook),
+        ), patch(
+            "v1.integrations.musa_file_processor._notify_parser_request",
+            AsyncMock(),
+        ):
+            asyncio.run(process_musa_session(
+                session_id="test-sid-all-fail-distinct",
+                deal_id=str(uuid.uuid4()),
+                venture_name="Acme",
+                venture_country="Kenya",
+                documents=documents,
+                status_url="https://parity.io/status",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        # All 3 are request_parser-classified -> deferred to the 24h SLA
+        # sweep, no immediate webhook or failed status (PAR-62, unchanged).
+        assert webhook_calls == []
+        assert not any(u.get("status") == "failed" for u in session_updates)
+        assert len(parser_request_inserts) == 3
+
+        detail_updates = [u for u in session_updates if u.get("document_failures")]
+        assert len(detail_updates) == 1
+        doc_failures = detail_updates[0]["document_failures"]
+        assert len(doc_failures) == 3
+        reasons = {f["error_message"] for f in doc_failures}
+        assert reasons == {
+            "415: Bank format not recognised. Supported formats: SCB, Co-op, ABSA",
+            "415: Bank format not recognised by parity-ingestion.",
+            "No valid transactions extracted via parity-ingestion",
+        }, f"expected 3 distinct real reasons, got: {reasons}"
 
 # ===========================================================================
 # 7. POST/GET shape parity (structural)
@@ -1371,3 +1688,386 @@ class TestParserRequestRetentionCleanup:
             asyncio.run(sla._force_close_expired(mock_supabase, expired_row))
 
         mock_supabase.storage.from_.return_value.remove.assert_not_called()
+
+
+# ===========================================================================
+# 8. Admin webhook resend (PAR-174 Phase 1)
+# ===========================================================================
+
+class TestAdminResendWebhookAuth:
+    """POST /api/musa/admin/sessions/{id}/resend-webhook auth gate."""
+
+    def test_no_credentials_returns_401(self, client):
+        resp = client.post("/api/musa/admin/sessions/some-sid/resend-webhook")
+        assert resp.status_code == 401
+
+    def test_musa_partner_key_is_rejected(self, client, monkeypatch):
+        # A valid Musa key must NOT satisfy the admin gate — Musa should not
+        # be able to self-trigger resends of its own webhooks.
+        monkeypatch.setattr("v1.integrations.auth.validate_api_key", lambda k, p: True)
+        monkeypatch.setattr("v1.integrations.musa_api.validate_scoped_api_key", lambda k, t: False)
+        resp = client.post(
+            "/api/musa/admin/sessions/some-sid/resend-webhook",
+            headers=VALID_HEADERS,
+        )
+        assert resp.status_code == 401
+
+    def test_admin_scoped_key_is_accepted(self, client, monkeypatch):
+        monkeypatch.setattr("v1.integrations.musa_api.validate_scoped_api_key", lambda k, t: t == "admin")
+
+        async def _fake_resend(session_id, base_url=None):
+            return {
+                "session_id": session_id,
+                "status": "complete",
+                "is_retry": True,
+                "resend_count": 1,
+                "webhook_status_code": 200,
+                "webhook_delivered": True,
+            }
+
+        monkeypatch.setattr("v1.integrations.musa_api.resend_webhook_for_session", _fake_resend)
+        resp = client.post(
+            "/api/musa/admin/sessions/some-sid/resend-webhook",
+            headers={"x-api-key": "admin-key"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_retry"] is True
+        assert body["resend_count"] == 1
+
+
+class TestResendWebhookForSession:
+    """Unit tests for musa_file_processor.resend_webhook_for_session."""
+
+    def _mock_supabase_for(self, session_row: Dict[str, Any], refreshed_row: Optional[Dict[str, Any]] = None):
+        mock_sb = MagicMock()
+        select_mock = mock_sb.table.return_value.select.return_value.eq.return_value.execute
+        # First select = session lookup, second select (post-send) = refreshed delivery columns.
+        select_mock.side_effect = [
+            MagicMock(data=[session_row]),
+            MagicMock(data=[refreshed_row or {}]),
+        ]
+        return mock_sb
+
+    def test_404_when_session_not_found(self, monkeypatch):
+        import asyncio
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with pytest.raises(Exception) as exc_info:
+            asyncio.run(resend_webhook_for_session("missing-sid"))
+        assert getattr(exc_info.value, "status_code", None) == 404
+
+    def test_409_when_session_still_processing(self, monkeypatch):
+        import asyncio
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-1", status="processing")
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[row])
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with pytest.raises(Exception) as exc_info:
+            asyncio.run(resend_webhook_for_session("sid-1"))
+        assert getattr(exc_info.value, "status_code", None) == 409
+
+    def test_completed_session_resend_marks_is_retry_and_increments_count(self, monkeypatch):
+        """A COMPLETE session with no prior resends → resend_count goes to 1,
+        and _send_webhook is called with is_retry=True."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-2", status="complete", deal_id="deal-2")
+        row["webhook_resend_count"] = 0
+        mock_sb = self._mock_supabase_for(
+            row,
+            refreshed_row={
+                "webhook_last_status_code": 200,
+                "webhook_delivered_at": "2026-01-01T00:00:00+00:00",
+                "webhook_resend_count": 1,
+            },
+        )
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        result = asyncio.run(resend_webhook_for_session("sid-2", base_url="https://api.example.com"))
+
+        assert fake_send.called
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["is_retry"] is True
+        assert call_kwargs["resend_count"] == 1
+
+        assert result["is_retry"] is True
+        assert result["resend_count"] == 1
+        assert result["webhook_delivered"] is True
+
+    def test_already_delivered_session_can_still_be_resent(self, monkeypatch):
+        """Decision (PAR-174): resending a session whose webhook already
+        succeeded is ALLOWED, not blocked — the is_retry/resend_count
+        fields make it safe on Musa's side, and an admin explicitly
+        choosing to resend is a deliberate action."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-3", status="complete", deal_id="deal-3")
+        row["webhook_resend_count"] = 2
+        row["webhook_delivered_at"] = "2026-01-01T00:00:00+00:00"  # already delivered once
+        mock_sb = self._mock_supabase_for(
+            row,
+            refreshed_row={
+                "webhook_last_status_code": 200,
+                "webhook_delivered_at": "2026-01-02T00:00:00+00:00",
+                "webhook_resend_count": 3,
+            },
+        )
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        result = asyncio.run(resend_webhook_for_session("sid-3"))
+
+        assert result["resend_count"] == 3  # continues counting from prior resends
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["is_retry"] is True
+        assert call_kwargs["resend_count"] == 3
+
+    def test_failed_session_resends_failed_status_without_pdf_url(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import resend_webhook_for_session
+
+        row = _fake_session_row("sid-4", status="failed", deal_id="deal-4", error_message="boom")
+        row["webhook_resend_count"] = 0
+        mock_sb = self._mock_supabase_for(row, refreshed_row={"webhook_resend_count": 1})
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+        fake_send = AsyncMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor._send_webhook", fake_send)
+
+        asyncio.run(resend_webhook_for_session("sid-4"))
+
+        call_kwargs = fake_send.call_args.kwargs
+        assert call_kwargs["status"] == "failed"
+        assert call_kwargs["pdf_url"] is None
+        assert call_kwargs["error_message"] == "boom"
+
+
+class TestSendWebhookIdempotencyFieldsAndPersistence:
+    def test_payload_includes_is_retry_and_resend_count(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=200)
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = mock_post
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sb = MagicMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id="sid-retry",
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="complete",
+                status_url="https://parity.io/status",
+                pdf_url="https://parity.io/pdf",
+                is_retry=True,
+                resend_count=2,
+            ))
+
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args.args[1]
+        assert payload["is_retry"] is True
+        assert payload["resend_count"] == 2
+
+        # Persistence: original-send calls (is_retry=False) must NOT touch
+        # webhook_resend_count; this retry call must.
+        update_call = mock_sb.table.return_value.update.call_args
+        update_fields = update_call.args[0]
+        assert update_fields["webhook_last_status_code"] == 200
+        assert update_fields["webhook_resend_count"] == 2
+        assert "webhook_delivered_at" in update_fields  # 200 → delivered timestamp set
+
+    def test_original_send_does_not_touch_resend_count(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=500, text="server error")
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = mock_post
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sb = MagicMock()
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: mock_sb)
+
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id="sid-original",
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="failed",
+                status_url="https://parity.io/status",
+                error_message="boom",
+            ))
+
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args.args[1]
+        assert payload["is_retry"] is False
+        assert payload["resend_count"] == 0
+
+        update_fields = mock_sb.table.return_value.update.call_args.args[0]
+        assert "webhook_resend_count" not in update_fields
+        assert update_fields["webhook_last_status_code"] == 500
+        assert "webhook_delivered_at" not in update_fields  # non-200 → not delivered
+
+    # -- PAR-174 follow-up: webhook_first_delivered_at ----------------------
+    #
+    # webhook_delivered_at intentionally tracks the MOST RECENT success (see
+    # test_payload_includes_is_retry_and_resend_count above, which pins that).
+    # webhook_first_delivered_at is the separate, write-once audit fact.
+
+    class _FakeSessionsTable:
+        """Minimal postgrest stand-in that actually honours .eq()/.is_().
+
+        The once-only behaviour is enforced by a DB-side filter, so asserting
+        on mock call internals alone would not prove it. This applies the
+        filters to a real dict row, so the test fails if the guard is dropped.
+        """
+
+        def __init__(self, row):
+            self.row = row
+            self._pending = {}
+            self._filters = []
+
+        def table(self, _name):
+            return self
+
+        def update(self, fields):
+            self._pending = dict(fields)
+            self._filters = []
+            return self
+
+        def eq(self, col, val):
+            self._filters.append(("eq", col, val))
+            return self
+
+        def is_(self, col, val):
+            self._filters.append(("is", col, val))
+            return self
+
+        def execute(self):
+            for kind, col, val in self._filters:
+                if kind == "eq" and self.row.get(col) != val:
+                    return self
+                if kind == "is" and val == "null" and self.row.get(col) is not None:
+                    return self
+            self.row.update(self._pending)
+            return self
+
+    def _run_send(self, monkeypatch, sb, status_code, session_id="sid-fd"):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from v1.integrations.musa_file_processor import _send_webhook
+
+        monkeypatch.setenv("MUSA_WEBHOOK_URL", "https://webhook.example.com")
+        monkeypatch.setenv("MUSA_WEBHOOK_AUTH_TOKEN", "tok_test")
+
+        mock_response = MagicMock(status_code=status_code, text="")
+        mock_client_instance = AsyncMock()
+        mock_client_instance.post = AsyncMock(return_value=mock_response)
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr("v1.integrations.musa_file_processor.get_supabase", lambda: sb)
+        with patch("v1.integrations.musa_file_processor.httpx.AsyncClient",
+                   return_value=mock_client_instance):
+            asyncio.run(_send_webhook(
+                session_id=session_id,
+                venture_name="Acme",
+                venture_country="Kenya",
+                status="complete",
+                status_url="https://parity.io/status",
+                pdf_url="https://parity.io/pdf",
+            ))
+
+    def test_first_success_stamps_first_delivered_at(self, monkeypatch):
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 200)
+
+        assert sb.row["webhook_first_delivered_at"] is not None
+        # First success: both columns describe the same moment.
+        assert sb.row["webhook_first_delivered_at"] == sb.row["webhook_delivered_at"]
+
+    def test_resend_advances_delivered_at_but_never_first_delivered_at(self, monkeypatch):
+        """The actual regression guard for PAR-174's audit-history gap."""
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 200)
+        first = sb.row["webhook_first_delivered_at"]
+        original_delivered = sb.row["webhook_delivered_at"]
+        assert first is not None
+
+        self._run_send(monkeypatch, sb, 200)
+
+        # webhook_delivered_at still moves — existing behaviour preserved.
+        assert sb.row["webhook_delivered_at"] != original_delivered
+        # ...but the original delivery time survives the resend. Without the
+        # null guard this would have been overwritten, which is exactly the
+        # data loss found on session 2847fbf0 on 2026-08-26.
+        assert sb.row["webhook_first_delivered_at"] == first
+
+    def test_failed_delivery_does_not_stamp_first_delivered_at(self, monkeypatch):
+        sb = self._FakeSessionsTable({
+            "session_id": "sid-fd",
+            "webhook_delivered_at": None,
+            "webhook_first_delivered_at": None,
+        })
+        self._run_send(monkeypatch, sb, 500)
+
+        assert sb.row["webhook_first_delivered_at"] is None
+        assert sb.row["webhook_delivered_at"] is None
+
+    def test_first_delivered_write_is_guarded_and_separate_from_outcome_write(self, monkeypatch):
+        """The once-only write must be its own null-filtered statement, and
+        must never leak into the main outcome update (which is unconditional
+        and would overwrite on every resend)."""
+        mock_sb = MagicMock()
+        self._run_send(monkeypatch, mock_sb, 200)
+
+        update_calls = mock_sb.table.return_value.update.call_args_list
+        assert len(update_calls) == 2
+        assert "webhook_first_delivered_at" in update_calls[0].args[0]
+        # The outcome write is last and must not carry the first-delivered key.
+        outcome_fields = update_calls[1].args[0]
+        assert "webhook_first_delivered_at" not in outcome_fields
+        assert outcome_fields["webhook_delivered_at"] is not None
+
+        is_call = mock_sb.table.return_value.update.return_value.eq.return_value.is_.call_args
+        assert is_call.args == ("webhook_first_delivered_at", "null")
