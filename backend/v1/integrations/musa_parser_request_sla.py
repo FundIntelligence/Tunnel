@@ -272,3 +272,91 @@ class ParserRequestSlaSweeper:
 
 # Global singleton — imported by main.py
 parser_request_sla_sweeper = ParserRequestSlaSweeper()
+
+
+# ---------------------------------------------------------------------------
+# Raw-document retention cleanup (PAR-248)
+# Decoupled from the 24h SLA force-close path so both policies can evolve
+# independently. Default: 4 days, configurable via PARSER_REQUEST_RETENTION_DAYS.
+# ---------------------------------------------------------------------------
+
+_RETENTION_DAYS = int(os.getenv("PARSER_REQUEST_RETENTION_DAYS", "4"))
+
+
+def _cleanup_expired_raw_documents(supabase) -> int:
+    """
+    Delete stored raw documents for parser_requests rows that are past the
+    retention window. Clears storage_path on the row after deleting the file
+    so the field accurately reflects whether a stored copy exists.
+
+    Only touches rows with status "expired" or "resolved" — pending rows are
+    still within the 24h SLA window and must not be cleaned up.
+
+    Returns the count of storage files deleted.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_RETENTION_DAYS)).isoformat()
+    try:
+        result = (
+            supabase.table("parser_requests")
+            .select("id, storage_path")
+            .in_("status", ["expired", "resolved"])
+            .lt("requested_at", cutoff)
+            .execute()
+        )
+    except Exception:
+        logger.exception("[MUSA-SLA] Retention cleanup: failed to query rows")
+        return 0
+
+    rows = [r for r in (result.data or []) if r.get("storage_path")]
+    deleted = 0
+    for row in rows:
+        storage_path = row["storage_path"]
+        try:
+            supabase.storage.from_("parser-requests").remove([storage_path])
+            supabase.table("parser_requests").update(
+                {"storage_path": None}
+            ).eq("id", row["id"]).execute()
+            deleted += 1
+        except Exception:
+            logger.warning(
+                "[MUSA-SLA] Retention cleanup: failed to delete %s", storage_path
+            )
+
+    if deleted:
+        logger.info("[MUSA-SLA] Retention cleanup deleted %d storage file(s)", deleted)
+    return deleted
+
+
+class ParserRequestRetentionSweeper:
+    """Daily cleanup of raw document storage beyond the retention window.
+
+    Runs on its own daily cadence, started from main.py's lifespan alongside
+    ParserRequestSlaSweeper. Deliberately separate so the retention policy
+    (how long we keep copies) is decoupled from the SLA policy (how long
+    engineers have to ship a parser).
+    """
+
+    def __init__(self, poll_interval: int = 86400):
+        self.poll_interval = poll_interval
+        self._running = False
+
+    async def start(self) -> None:
+        self._running = True
+        logger.info(
+            "[MUSA-SLA] Retention sweeper started (poll_interval=%ds, retention=%dd)",
+            self.poll_interval, _RETENTION_DAYS,
+        )
+        while self._running:
+            try:
+                await asyncio.to_thread(_cleanup_expired_raw_documents, get_supabase())
+            except Exception:
+                logger.exception("[MUSA-SLA] Retention sweep loop error")
+            await asyncio.sleep(self.poll_interval)
+
+    def stop(self) -> None:
+        self._running = False
+        logger.info("[MUSA-SLA] Retention sweeper stopped")
+
+
+# Global singleton — imported by main.py
+parser_request_retention_sweeper = ParserRequestRetentionSweeper()
