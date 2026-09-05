@@ -1697,8 +1697,11 @@ class TestParserRequestRetentionCleanup:
             return MagicMock()
 
         mock_supabase = MagicMock()
+        # The DB query filters by cutoff via .lt("requested_at", cutoff); only rows
+        # past the retention window are returned. The mock must reflect that — recent
+        # is 12h old, well within 4 days, so the DB would never return it.
         mock_supabase.table.return_value.select.return_value.in_.return_value.lt.return_value.execute.return_value = MagicMock(
-            data=[old_expired, old_resolved, recent]
+            data=[old_expired, old_resolved]
         )
         mock_supabase.storage.from_.return_value.remove.side_effect = _fake_remove
         mock_supabase.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock()
