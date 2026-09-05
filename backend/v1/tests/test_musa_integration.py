@@ -1652,6 +1652,7 @@ class TestShapeParity:
         )
 
 
+
 # ===========================================================================
 # 6e. Raw-document retention cleanup (PAR-248)
 # ===========================================================================
@@ -1736,7 +1737,7 @@ class TestParserRequestRetentionCleanup:
         """
         _force_close_expired (the SLA sweep's 24h force-close path) must NOT
         delete the storage file. Retention cleanup runs separately on its own
-        schedule (PARSER_REQUEST_RETENTION_DAYS, default 4 days), so the file
+        schedule (PARSER_REQUEST_RETENTION_DAYS, default 10 days), so the file
         must still be present immediately after force-close for potential
         out-of-band recovery.
         """
